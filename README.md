@@ -1,145 +1,96 @@
 Mypixels
 ========
 
-A terminal emulator. The current implementation is **Rust** (wgpu + glyphon +
-winit + alacritty_terminal, with an egui layer for the config panel, font
-dialog and tab switcher) and lives at the root of this repo:
+A tabbed terminal emulator written in Rust: `alacritty_terminal`
+drives the emulation and pty, `glyphon` renders on `wgpu` in a
+`winit` window, and an `egui` layer draws the tab strip, config
+panel, font dialog and tab switcher.
+
+This is a from-scratch rewrite of the original Python/GTK/VTE
+terminal of the same name, kept unchanged at
+[`legacy/mypixels`](legacy/mypixels) (a single script,
+GPL-3.0-or-later) as the behavioural reference this rewrite
+reproduces, down to the Alt-held tab switcher.
+
+Design principles, carried over from the original:
+
+* screen space effectivity - no menus or status lines that can't be
+  hidden or take up too much space
+* all keyboard operation
+
+Building
+========
 
     cargo build --release        # target/release/mypixels
     cargo test                   # unit tests, no display needed
+
+Headless UI smoke tests:
+
     MYPIXELS_BIN=$PWD/target/release/mypixels xvfb-run -a python3 tests/preview_smoke.py
 
-Config is `$XDG_CONFIG_HOME/mypixels/config.yml` (the legacy `~/.mypixels`
-is still read until an XDG file exists). Themes are discovered in
-`~/.config/mypixels/themes`, `~/.local/share/mypixels/themes` and the XDG
-data dirs; see `themes/README.md`. `mypixels` run twice joins the existing
-session (D-Bus); `-n` opens another window of it, `-s` runs standalone.
+Usage
+=====
 
-The original Python/GTK/VTE implementation — the behavioural reference this
-rewrite reproduces, down to the Alt-held tab switcher — is kept unchanged in
-[`legacy/mypixels`](legacy/mypixels). Its README follows verbatim.
+    usage: mypixels [options] [command args...]
+      -n, --new-window   open a new window instead of joining the session
+      -s, --standalone   run a private instance: never join or host a session
 
-![Alt text](https://cloud.githubusercontent.com/assets/1075171/14241115/1e141884-fa4a-11e5-8724-95decd9ed17d.png "Screenshot")
+Without flags, a mypixels window already running on this display is
+found over D-Bus and asked to open a tab for the command, in the
+current directory; typed inside a window, the tab opens in that same
+window. With no session to answer - or with `-n` - this process
+becomes a window of the session.
 
-Mypixels is a very simple terminal emulator written in python using python gtk bindings and python vte bindings.
+`mypixels last [n] [--copy]` prints (or clipboard-copies) the output
+of the last n commands from the running session's memory pool - a
+query, not a launch.
 
-Main design principles:
+Features
+========
 
-* screen space effectivity (no menus/status lines that can't be hidden or take up too much space).
-* ease of use
-* all keyboard control (the second this readme is written, even tabs can't be switched using mouse).
-
-Some cool features:
-
-* Term tab colorization - mark your terms with a certain colour so it can be easily found
-* entanglement of terms - write in numerous terms at once
-* all-keyboard operation
-
-Installation
-============
-
-You will need python2. Also install python bindings for gtk, vte and pango. Install python-yaml. That should be it.
+* Tab switcher with live previews - hold Alt: each tab is a scaled,
+  live view of its own terminal; arrows move the selection.
+* Entanglement - one command, many tabs: toggle a tab into the group
+  (Alt+Shift+*) and keystrokes land in all of them.
+* Tab colorization - mark a tab with a colour so it can be easily
+  found (Alt+Shift+{ / }).
+* All keyboard - Alt+Left/Right/Up/Down/Home/End move between tabs,
+  Ctrl+Alt+Z new tab, Ctrl+Alt+X close tab, Ctrl+Shift+R reloads the
+  config, Ctrl+Shift+C/V copy and paste (the GTK bindings),
+  Shift+Insert pastes the primary selection.
+* Kitty graphics protocol - PNG images (`icat`) render as textured
+  quads in the grid and scrollback.
+* Kitty keyboard protocol - full disambiguation, with real key
+  releases.
+* Command observability - with the shell integration scripts (OSC
+  133 marks) every command is captured with its output, exit status
+  and location: Alt+Shift+H opens the history panel, and
+  `mypixels last` / Ctrl+Shift+L read the last output from the shell.
+* MCP endpoint - a read-only Model Context Protocol server on a
+  per-display unix socket: LLM tooling lists the session's windows
+  and tabs and reads captured command output without a shell.
+* Config panel and font dialog (Alt+Shift+C); the file reloads live.
 
 Configuration
 =============
 
-All config values can be changed via ~/.mypixels file (Yaml). Example:
+Config is `$XDG_CONFIG_HOME/mypixels/config.yml` (the legacy
+`~/.mypixels` is read until an XDG file exists). Every key is
+editable in the config panel; key bindings are rebindable under
+`bindings:`.
 
-```
-background_color: '#101010'
-bg_tint_color: '#101010'
-default_tab_title: ''
-focus_new_tabs: true
-foreground_color: '#BBB'
-hide_single_tab: true
-multiline_tabs: true
-palette: '#2E2E34343636:#CCCC00000000:#4E4E9A9A0606:#C4C4A0A00000:#34346565A4A4:#757550507B7B:#060698209A9A:#D3D3D7D7CFCF:#555557575353:#EFEF29292929:#8A8AE2E23434:#FCFCE9E94F4F:#72729F9FCFCF:#ADAD7F7FA8A8:#3434E2E2E2E2:#EEEEEEEEECEC'
-scrollback_lines: 1000
-tab_color_bg: '#101010'
-tab_color_bg_selected: '#303020'
-tab_color_fg: '#888'
-tab_color_fg_selected: '#fff'
-tab_title_max_length: 16
-tab_title_short_current: 32
-tablist_background: '#101010'
-tablist_font: Share Tech 10
-#tablist_font: Envy Core R 8
-tablist_top: true
-term_font: Terminus 10
-term_opacity: 0.10
-```
+Themes are YAML colour sets, discovered in this repo's `themes/`,
+`~/.config/mypixels/themes`, `~/.local/share/mypixels/themes` and
+the XDG data dirs; see [themes/README.md](themes/README.md).
 
+For command capture, source the matching
+`scripts/shell_integration.{bash,zsh,fish}` from your shell rc.
 
-Keyboard shortcuts
-==================
+Layout
+======
 
-* M-Left - Prev. tab
-* M-SHIFT-f - Prev. tab
-* M-Right - Next tab
-* M-SHIFT-b - Next. tab
-* M-Home - Switch to first tab
-* M-End - Switch to last tab
-* M-0 - M-9 - Switch to Nth tab
-
-* M-Shift-Left - Move tab left
-* M-Shift-Right - Move tab right
-* M-Shift-Home - Move tab to begining
-* M-Shift-End - Move tab to end
-
-* C-M-Z - Open a new tab
-* C-M-X - Close current tab
-
-* M-SHIFT-[ - Next color for current tab
-* M-SHIFT-] - Prev color for current tab
-* C-SHIFT-v - Toggle tab bar visibility
-* M-SHIFT-[Keypad +] - Enlarge font
-* M-SHIFT-[Keypad -] - Shrink font
-
-* M-SHIFT-[Keypad *] - Toggle tab entanglement for current tab
-
-* M-SHIFT-n - Set a custom tab name
-
-* M-SHIFT-s - Search for the given text
-* M-SHIFT-a - Skip to previous instance of the search
-* M-SHIFT-d - Skip to next instance of the search
-
-Keyboard shortcuts are configurable. Example config:
-
-```
-bindings:
-  close_tab: !!python/tuple
-  - CONTROL+ALT+x
-  - CONTROL+ALT+q
-  enlarge_font: MOD1+SHIFT+KP_Add
-  first_tab: MOD1+Home
-  goto_tab_0: MOD1+_1
-  goto_tab_1: MOD1+_2
-  goto_tab_2: MOD1+_3
-  goto_tab_3: MOD1+_4
-  goto_tab_4: MOD1+_5
-  goto_tab_5: MOD1+_6
-  goto_tab_6: MOD1+_7
-  goto_tab_7: MOD1+_8
-  goto_tab_8: MOD1+_9
-  goto_tab_9: MOD1+_0
-  last_tab: MOD1+End
-  move_first_tab: MOD1+SHIFT+Home
-  move_last_tab: MOD1+SHIFT+End
-  move_next_tab: MOD1+SHIFT+Right
-  move_prev_tab: MOD1+SHIFT+Left
-  new_tab: !!python/tuple
-  - CONTROL+ALT+z
-  - CONTROL+SHIFT+t
-  next_color: MOD1+SHIFT+braceright
-  next_tab: !!python/tuple
-  - MOD1+Right
-  - MOD1+SHIFT+b
-  prev_color: MOD1+SHIFT+braceleft
-  prev_tab: !!python/tuple
-  - MOD1+Left
-  - MOD1+SHIFT+f
-  rename_tab: MOD1+SHIFT+n
-  shrink_font: MOD1+SHIFT+KP_Subtract
-  toggle_entangle: MOD1+SHIFT+KP_Multiply
-  toggle_hide_tabs: CONTROL+SHIFT+v
-```
+* `src/` - the terminal (Rust)
+* `scripts/` - shell integration, test harnesses
+* `tests/` - unit and headless UI smoke tests
+* `themes/` - bundled themes
+* `legacy/mypixels` - the original Python/GTK/VTE implementation
