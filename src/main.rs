@@ -4166,32 +4166,6 @@ impl App {
                     )
                     .expect("window"),
             );
-            // The window may have landed on a monitor with a different factor
-            // than the primary (or the backend still reports 1.0 before the
-            // first configure); the first frame must already be right.
-            let sf = window.scale_factor() as f32;
-            if sf != self.scale {
-                self.set_scale(sf);
-                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
-                    (self.cols as f32 * self.cell_w).round() as u32,
-                    (self.rows as f32 * self.cell_h + self.tab_h).round() as u32,
-                ));
-            }
-            // Never keep a window larger than its monitor (the configured
-            // size is usually the whole screen; nested/test displays are
-            // smaller).
-            if !self.config.default_maximize {
-                if let Some(monitor) = window.current_monitor() {
-                    let ms = monitor.size();
-                    let ws = window.inner_size();
-                    if ws.width > ms.width || ws.height > ms.height {
-                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
-                            ws.width.min(ms.width),
-                            ws.height.min(ms.height),
-                        ));
-                    }
-                }
-            }
             // The window joins the session list before its GPU: init_gpu and
             // the egui init it performs fill in the new Win's fields, and
             // everything in between already speaks wins[cur].
@@ -4234,6 +4208,32 @@ impl App {
             });
             // The newest window is the one the user just asked for.
             self.cur = self.wins.len() - 1;
+            // The window may have landed on a monitor with a different factor
+            // than the primary (or the backend still reports 1.0 before the
+            // first configure); the first frame must already be right.
+            let sf = window.scale_factor() as f32;
+            if sf != self.scale {
+                self.set_scale(sf);
+                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                    (self.cols as f32 * self.cell_w).round() as u32,
+                    (self.rows as f32 * self.cell_h + self.tab_h).round() as u32,
+                ));
+            }
+            // Never keep a window larger than its monitor (the configured
+            // size is usually the whole screen; nested/test displays are
+            // smaller).
+            if !self.config.default_maximize {
+                if let Some(monitor) = window.current_monitor() {
+                    let ms = monitor.size();
+                    let ws = window.inner_size();
+                    if ws.width > ms.width || ws.height > ms.height {
+                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                            ws.width.min(ms.width),
+                            ws.height.min(ms.height),
+                        ));
+                    }
+                }
+            }
             self.init_gpu(event_loop, &window);
             let slot = Arc::clone(&self.window_slot);
             if self.theme_watcher.is_none() {
