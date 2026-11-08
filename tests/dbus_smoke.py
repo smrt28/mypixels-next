@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Daemon-mode smoke: the second mypixels hands its command to the running
-session over D-Bus instead of opening a second window; --standalone hosts
+session over D-Bus; the default opens a window, --new-tab opens a tab, and --standalone hosts
 nothing and joins nothing.
 
 Run inside a private bus and display:
@@ -38,6 +38,8 @@ def env_for(h, keys):
     env = dict(os.environ, HOME=str(h), MYPIXELS_KEYS=str(h / keys),
                HISTFILE=str(h / '.history'), RUST_LOG='info')
     env.pop('MYPIXELS_CONFIG', None)
+    env.pop('WAYLAND_DISPLAY', None)
+    env.pop('MYPIXELS_WINDOW', None)
     return env
 
 
@@ -72,13 +74,13 @@ def main():
             return 1
         print('PASS: first instance registered the display session')
 
-        # 2. A plain second run forwards itself and exits quickly.
+        # 2. An explicit new-tab client forwards itself and exits quickly.
         hb = home('client', 'keys')
         t0 = time.time()
         # The command touches a marker file on arrival: relative path, so it
         # lands wherever the session actually started the tab. cwd correctness
         # is proved in bytes, not in titles.
-        b = sp.run([str(BIN), 'sh', '-c', 'touch daemon-marker; exec sh'],
+        b = sp.run([str(BIN), '--new-tab', 'sh', '-c', 'touch daemon-marker; exec sh'],
                    env=env_for(hb, 'keys'), cwd=str(hb),
                    capture_output=True, timeout=10)
         if b.returncode != 0 or time.time() - t0 > 8:
@@ -101,16 +103,17 @@ def main():
                 return 1
         print('PASS: remote tab ran in the client cwd')
 
-        # 4. `mypixels -n` asks the LIVE session for a window: same process,
+        # 4. A default launch asks the LIVE session for a window: same process,
         # second window, tab running the command in the caller's directory.
         hd = home('window2', 'keys')
         before = (ha / 'app.log').stat().st_size
-        d = sp.run([str(BIN), '-n', 'sh', '-c', 'touch window-marker; exec sh'],
+        d = sp.run([str(BIN), 'sh', '-c', 'touch window-marker; exec sh'],
                    env=env_for(hd, 'keys'), cwd=str(hd),
                    capture_output=True, timeout=10)
         if d.returncode != 0:
-            print(f'FAIL: -n client exited {d.returncode}: {d.stderr.decode()[:200]}')
+            print(f'FAIL: default window client exited {d.returncode}: {d.stderr.decode()[:200]}')
             return 1
+        assert b'found running instance' in d.stdout and b'requesting a new window' in d.stdout, d.stdout
         if not wait_for(ha / 'app.log', 'opened a remote window'):
             print('FAIL: session A never opened the requested window')
             return 1
@@ -120,7 +123,7 @@ def main():
         if not (hd / 'window-marker').exists():
             print('FAIL: the new window ran its tab somewhere else than asked')
             return 1
-        print('PASS: -n opened a second window inside the session')
+        print('PASS: default launch opened a second window inside the session')
 
         # 5. --standalone hosts nothing: no registration, still a terminal.
         hc = home('solo', 'keys')

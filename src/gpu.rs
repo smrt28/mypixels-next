@@ -309,18 +309,13 @@ pub struct Gpu {
     /// When each preview was last rebuilt, for the per-tab throttle, and the
     /// rotating cursor that decides who goes next when there is a backlog.
     pub prev_last: Vec<Instant>,
-    pub prev_rr: usize,
     prev_sampler: wgpu::Sampler,
     prev_bgl: wgpu::BindGroupLayout,
     prev_pipeline: wgpu::RenderPipeline,
     /// Backing for `prev_viewport` (a glyphon Cache is a uniform buffer).
     prev_cache: Cache,
     previews: Vec<Option<PreviewSlot>>,
-    /// Staging for `readback_preview`: a small texture in the surface format
-    /// (the sample destination) plus a mappable buffer, reused across tabs
-    /// and rebuilt only when the thumbnail size changes, and the quad that
-    /// fills it.
-    prev_stage: Option<(wgpu::Texture, wgpu::TextureView, wgpu::Buffer, (u32, u32))>,
+    /// Reused box-filter quad for GPU-resident thumbnail updates.
     prev_stage_quad: Option<wgpu::Buffer>,
     /// Viewport over the offscreen targets, so the same `TextRenderer` can draw
     /// into them: same format, so no second atlas is needed.
@@ -722,10 +717,8 @@ impl Gpu {
             alpha_ok,
             prev_bufs: Vec::new(),
             prev_sigs: Vec::new(),
-            prev_stage: None,
             prev_stage_quad: None,
             prev_last: Vec::new(),
-            prev_rr: 0,
             prev_sampler,
             prev_bgl,
             prev_pipeline,
@@ -899,67 +892,25 @@ impl Gpu {
         }
     }
 
-    /// Make room for `n` tabs rendering at `size`, and create tab `idx`'s
-    /// texture. Textures are window-sized, so a tile can sample the whole window
-    /// and the tab strip comes with it -- a picture of the window, not of a grid.
-    /// Read a tab's offscreen preview back to the CPU as a straight RGBA image
-    /// the size of `thumb`, taking the terminal area of the texture (below
-    /// `top`, so the tab strip is not in it). The downscale keeps the region's
-    /// own aspect, which is what the caller should request.
-    ///
-    /// wgpu 30 has no scaling texture copy, so the downscale is the tile
-    /// pipeline itself (a 4x4 box sample of exactly the source region a
-    /// destination pixel covers) rendered into a small staging texture, then a
-    /// plain copy to a mappable buffer. This is a blocking stall (`poll`)
-    /// on one small transfer, so the caller must throttle it.
-    pub fn readback_preview(
-        &mut self,
-        idx: usize,
-        top: u32,
-        thumb: (u32, u32),
-    ) -> Option<Vec<u8>> {
+    /// Downsample directly into a persistent GPU thumbnail. The box filter
+    /// preserves terminal glyphs without a blocking CPU readback/upload cycle.
+    pub fn thumbnail(
+        &mut self, idx: usize, top: u32, thumb: (u32, u32), existing: Option<&wgpu::Texture>,
+    ) -> Option<wgpu::Texture> {
         let (w, h) = (self.config.width, self.config.height);
         let (tw, th) = thumb;
-        if w == 0 || h <= top || tw == 0 || th == 0 {
-            return None;
-        }
+        if w == 0 || h <= top || tw == 0 || th == 0 { return None; }
         let slot = self.previews.get(idx)?.as_ref()?;
-        let bpp = self
-            .config
-            .format
-            .block_copy_size(None)
-            .unwrap_or(4) as u64;
-        let row_bytes = (tw as u64 * bpp) as usize;
-        let bytes_per_row = ((tw as u64) * bpp).next_multiple_of(256);
-        let fits = self.prev_stage.as_ref().is_some_and(|s| s.3 == (tw, th));
-        if !fits {
-            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("preview readback"),
-                size: wgpu::Extent3d {
-                    width: tw,
-                    height: th,
-                    depth_or_array_layers: 1,
-                },
+        let target = existing.filter(|t| t.width() == tw && t.height() == th).cloned().unwrap_or_else(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("terminal thumbnail"),
+                size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
                 dimension: wgpu::TextureDimension::D2,
                 format: self.config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                mip_level_count: 1,
-                sample_count: 1,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("preview readback"),
-                size: (bytes_per_row * th as u64).next_multiple_of(4096),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.prev_stage = Some((tex, view, buf, (tw, th)));
-        }
-        let stage = self.prev_stage.as_ref().unwrap().0.clone();
-        let sbuf = self.prev_stage.as_ref().unwrap().2.clone();
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                mip_level_count: 1, sample_count: 1, view_formats: &[],
+            })
+        });
         // The quad samples the terminal area of the texture (below `top`; the
         // tab strip would be in the frame otherwise): the UV range is
         // offset to start there. Clip space is y-up, texture space y-down.
@@ -1009,7 +960,7 @@ impl Gpu {
             }));
         }
         let quad_buf = self.prev_stage_quad.as_ref().unwrap();
-        let sview = &self.prev_stage.as_ref().unwrap().1;
+        let sview = target.create_view(&wgpu::TextureViewDescriptor::default());
         {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("preview readback"),
@@ -1020,7 +971,7 @@ impl Gpu {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("preview readback"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: sview,
+                        view: &sview,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -1041,29 +992,31 @@ impl Gpu {
                 pass.set_vertex_buffer(0, quad_buf.slice(..));
                 pass.draw(0..6, 0..1);
             }
-            enc.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &stage,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &sbuf,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row as u32),
-                        rows_per_image: Some(th),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: tw,
-                    height: th,
-                    depth_or_array_layers: 1,
-                },
-            );
             self.queue.submit([enc.finish()]);
         }
+        Some(target)
+    }
+
+    /// Explicit copy-as-image capture. Only this user-requested export waits
+    /// for a CPU transfer; interactive previews remain entirely on the GPU.
+    pub fn readback_preview(&mut self, idx: usize, top: u32, thumb: (u32, u32)) -> Option<Vec<u8>> {
+        let stage = self.thumbnail(idx, top, thumb, None)?;
+        let (tw, th) = thumb;
+        let bpp = self.config.format.block_copy_size(None).unwrap_or(4) as u64;
+        let row_bytes = (tw as u64 * bpp) as usize;
+        let bytes_per_row = (tw as u64 * bpp).next_multiple_of(256);
+        let sbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image export readback"), size: bytes_per_row * th as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &stage, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &sbuf, layout: wgpu::TexelCopyBufferLayout { offset: 0,
+                bytes_per_row: Some(bytes_per_row as u32), rows_per_image: Some(th) } },
+            wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
         let map_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         sbuf.slice(..).map_async(wgpu::MapMode::Read, {
             let map_ok = std::sync::Arc::clone(&map_ok);

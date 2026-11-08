@@ -87,7 +87,8 @@ settings remain passive for Tab, typing, Enter, Escape, and arrow keys, includin
 after clicking panel buttons. It also checks explicit editor focus and global
 shortcuts. Set `MYPIXELS_BIN=target/release/mypixels` to check the release build.
 
-`xvfb-run -a python3 tests/tab_bar_smoke.py` checks the egui strip's add,
+`xvfb-run -a python3 tests/tab_bar_smoke.py` checks the application menu's
+actions, toggle/click-away/Escape dismissal, keyboard ownership, and the egui strip's add,
 selection, close and close-cancel behavior, drag reordering, 20-tab overflow,
 middle-click close, and native detach into another window. It leaves visual
 artifacts in `/tmp/mypixels-tab-bar-*`.

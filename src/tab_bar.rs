@@ -2,8 +2,15 @@
 //! native drag-to-reorder and cross-window drops keep using physical positions.
 use crate::ui_style::{self, Icon};
 
+const MENU_WIDTH: f32 = 42.0;
+
+pub(crate) fn menu_button_rect(height: f32) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(3.0, 3.0), egui::pos2(MENU_WIDTH - 3.0, height - 3.0))
+}
+
 pub(crate) struct TabFace {
     pub id: usize,
+    pub preview: Option<(egui::TextureId, (u32, u32))>,
     pub title: String,
     pub tooltip: String,
     pub group: Option<egui::Color32>,
@@ -12,6 +19,7 @@ pub(crate) struct TabFace {
 }
 
 pub(crate) struct Geometry {
+    pub menu_clicked: bool,
     pub tabs: Vec<egui::Rect>,
     pub close: Vec<egui::Rect>,
     pub add: egui::Rect,
@@ -19,7 +27,7 @@ pub(crate) struct Geometry {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Self { tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
+        Self { menu_clicked: false, tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
     }
 }
 
@@ -30,6 +38,7 @@ pub(crate) fn show(
     tabs: &[TabFace],
     active: usize,
     clock: Option<&str>,
+    menu_open: bool,
     cfg: &crate::config::Config,
 ) -> Geometry {
     let chrome = ui_style::TabStyle::new(root, cfg);
@@ -52,18 +61,20 @@ pub(crate) fn show(
             let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
             p.rect_filled(bar, 0.0, colors.bg);
             p.hline(bar.x_range(), height - 0.5, egui::Stroke::new(1.0, colors.border));
-            let brand_width = if width >= 700.0 { 108.0 } else { 30.0 };
-            ui_style::icon(p, Icon::Terminal, egui::pos2(15.0, height * 0.5), colors.muted);
-            if brand_width > 30.0 {
-                ui_style::text(
-                    ui,
-                    egui::Rect::from_min_max(egui::pos2(30.0, 0.0), egui::pos2(104.0, height)),
-                    "mypixels",
-                    colors.fg,
-                    13.0,
-                    true,
-                );
+            let brand_width = MENU_WIDTH;
+            let menu = menu_button_rect(height);
+            let response = ui.interact(menu, egui::Id::unique("app_menu_button"), egui::Sense::click());
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "mypixels menu"));
+            if menu_open || response.hovered() {
+                colors.surface(p, menu, 4.0, menu_open, response.hovered());
             }
+            let color = if menu_open || response.hovered() { colors.accent } else { colors.muted };
+            ui_style::icon(p, Icon::Terminal, egui::pos2(15.0, height * 0.5), color);
+            let center = egui::pos2(30.0, height * 0.5);
+            p.add(egui::Shape::line(vec![center + egui::vec2(-3.0, -1.5), center + egui::vec2(0.0, 1.5),
+                center + egui::vec2(3.0, -1.5)], egui::Stroke::new(1.0, color)));
+            geometry.menu_clicked = response.clicked();
+            response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
             p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };
             if clock_width > 0.0 {
@@ -109,13 +120,19 @@ pub(crate) fn show(
                     ui.spacing_mut().item_spacing = egui::vec2(gap, 0.0);
                     ui.spacing_mut().interact_size.y = body_height;
                     ui.horizontal(|ui| {
+                        let content_origin = ui.max_rect().min.to_vec2();
+                        let mut selection = None;
                         for (index, tab) in tabs.iter().enumerate() {
                             // Pointer actions stay in the window controller. This egui
                             // widget provides layout, hover, clipping and tooltip behavior.
                             let (rect, response) =
                                 ui.allocate_exact_size(egui::vec2(widths[index], body_height), egui::Sense::hover());
+                            let target = rect;
+                            let rect = ui_style::animated_rect(ui.ctx(), egui::Id::unique("tab_motion").with((tab.id, width.to_bits())), rect.translate(-content_origin)).translate(content_origin);
                             let selected = index == active;
-                            chrome.tab(ui.painter(), rect, selected, response.hovered());
+                            let weight = ui_style::transition(ui.ctx(), egui::Id::unique("tab_selected_fill").with(tab.id), selected);
+                            chrome.tab(ui.painter(), rect, weight, response.hovered());
+                            if selected { selection = Some(rect); }
                             if tab.attention > 0.0 {
                                 ui.painter().rect_filled(
                                     rect.shrink(1.0),
@@ -168,12 +185,34 @@ pub(crate) fn show(
                                     if close_hover { colors.accent } else { colors.muted },
                                 );
                             }
-                            geometry.tabs[index] = rect.intersect(viewport);
-                            geometry.close[index] = close.intersect(viewport);
-                            response.on_hover_text(&tab.tooltip).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Native drag hit targets follow layout, so moving
+                            // neighbors do not retrigger a swap mid-animation.
+                            geometry.tabs[index] = target.intersect(viewport);
+                            geometry.close[index] = egui::Rect::from_center_size(
+                                egui::pos2(target.right() - 13.0, target.center().y), egui::vec2(20.0, body_height))
+                                .intersect(viewport);
+                            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let mut tooltip = egui::Tooltip::for_enabled(&response);
+                            tooltip.popup = tooltip.popup.frame(colors.menu_frame());
+                            tooltip.show(|ui| {
+                                colors.apply_controls(ui);
+                                ui.label(&tab.tooltip);
+                                if let Some((_, (w, h))) = tab.preview {
+                                    let width = (w as f32).min((ui.ctx().content_rect().width() - 48.0).max(80.0));
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, width * h as f32 / w.max(1) as f32), egui::Sense::hover());
+                                    ui_style::preview_image(ui, rect, tab.preview, &colors);
+                                }
+                            });
                             if selected && follow {
-                                ui.scroll_to_rect(rect, None);
+                                ui.scroll_to_rect(target, None);
                             }
+                        }
+                        if let Some(rect) = selection {
+                            let id = egui::Id::unique("tab_selection_motion")
+                                .with((content_origin.x.to_bits(), width.to_bits(), height.to_bits()));
+                            let rect = ui_style::animated_rect_in(ui.ctx(), id, rect, viewport);
+                            ui.painter().rect_stroke(rect, 5.0,
+                                egui::Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
                         }
                     });
                 });
@@ -206,6 +245,7 @@ mod tests {
             let tabs: Vec<_> = (0..40)
                 .map(|id| TabFace {
                     id,
+                    preview: None,
                     title: format!("long terminal name {id} 界"),
                     tooltip: String::new(),
                     group: None,
@@ -223,7 +263,7 @@ mod tests {
                         },
                         |ui| {
                             geometry =
-                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), &cfg);
+                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, &cfg);
                         },
                     );
                     output.textures_delta.clear();

@@ -23,6 +23,7 @@ default_maximize: false
 term_opacity: 0
 hide_single_tab: false
 tab_overview_opacity: 0.65
+tab_overview_scale: 0.25
 background_color: '#122e2e'
 ''')
 fixture = work / 'fixture.py'
@@ -74,7 +75,10 @@ try:
     w, h = map(int, re.search(r'surf=(\d+)x(\d+)', info).groups())
     strip = round(float(re.search(r'strip = ([0-9.]+)px', info).group(1)))
     live = screenshot('live')
-    source_box = (0, strip, w, h)
+    # Use the fixture's painted frame, excluding the unused partial terminal
+    # row/column at the surface edges. The thumbnail still includes that padding.
+    source_box = yellow_box(live)
+    assert source_box, 'live terminal frame missing'
     with keys.open('w') as writer:
         writer.write('switcher\n')
     time.sleep(1)
@@ -86,9 +90,9 @@ try:
         thumb_box = (thumb_box[0], thumb_box[1] + strip, thumb_box[2], thumb_box[3] + strip)
     assert thumb_box, 'preview frame missing'
     width, height = thumb_box[2] - thumb_box[0], thumb_box[3] - thumb_box[1]
-    # Preview sizing follows the responsive modal, which reserves its own margins.
-    columns = max(1, min(4, int((min(w * .84, 1400) - 36 + 14) / 220)))
-    expected_width = min(300, (min(w * .84, 1400) - 36 - 14 * (columns - 1)) / columns - 16)
+    # The requested preview scale is 25% of the terminal width, capped
+    # only when one card would exceed the responsive panel.
+    expected_width = min(w * .25, min(w * .84, 1400) - 36 - 16)
     assert abs(width - expected_width) <= 3, thumb_box
     source = live.crop(source_box)
     assert abs(width / height - source.width / source.height) < .04, (source_box, thumb_box)

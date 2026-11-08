@@ -32,14 +32,16 @@ Usage
 =====
 
     usage: mypixels [options] [command args...]
-      -n, --new-window   open a new window instead of joining the session
+      -n, --new-window   open a new window in the running instance (default)
+      -t, --new-tab      add a tab to the originating or first session window
       -s, --standalone   run a private instance: never join or host a session
 
-Without flags, a mypixels window already running on this display is
-found over D-Bus and asked to open a tab for the command, in the
-current directory; typed inside a window, the tab opens in that same
-window. With no session to answer - or with `-n` - this process
-becomes a window of the session.
+Without flags, mypixels finds the running instance on this display over D-Bus
+and asks it to open a new window for the command in the current directory.
+It prints the instance and requested action to stdout before sending the request.
+Use `-t` / `--new-tab` to add a tab to the originating window (or the first
+session window when launched elsewhere). If no session answers, it starts a
+new instance. `-n` remains an explicit spelling of the default window action.
 
 `mypixels last [n] [--copy]` prints (or clipboard-copies) the output
 of the last n commands from the running session's memory pool - a
@@ -48,8 +50,9 @@ query, not a launch.
 Features
 ========
 
-* Tab switcher with live previews - hold Alt: each tab is a scaled,
-  live view of its own terminal; arrows move the selection.
+* Tab switcher with cached GPU previews - hold Alt: each tab is a scaled,
+  live view of its own terminal; arrows move the selection. Hover a tab for
+  its preview. Selection and reordering animate in both the strip and switcher.
 * Entanglement - one command, many tabs: toggle a tab into the group
   (Alt+Shift+*) and keystrokes land in all of them.
 * Tab colorization - mark a tab with a colour so it can be easily
@@ -73,6 +76,10 @@ Features
 
 Configuration
 =============
+
+The terminal icon at the left of the tab bar opens the application menu:
+New window, Settings, Keyboard shortcuts, and About. Shortcut labels and the
+keyboard reference reflect your current configured bindings.
 
 Config is `$XDG_CONFIG_HOME/mypixels/config.yml` (the legacy
 `~/.mypixels` is read until an XDG file exists). Every key is

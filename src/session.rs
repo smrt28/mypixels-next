@@ -304,7 +304,7 @@ async fn remote_open_async(
             &[name],
         )
         .await;
-    match owner {
+    let owner = match owner {
         // Nobody owns the name: an ordinary fresh start, not an incident.
         Err(zbus::Error::MethodError(name, _, _))
             if name.as_str() == "org.freedesktop.DBus.Error.NameHasNoOwner" =>
@@ -312,8 +312,13 @@ async fn remote_open_async(
             return Ok(false);
         }
         Err(e) => return Err(e),
-        Ok(_) => {}
-    }
+        Ok(reply) => reply.body().deserialize::<String>()?,
+    };
+    println!("mypixels: found running instance {name} ({owner}); requesting {}{}",
+        if new_window { "a new window" } else { "a new tab" },
+        cwd.as_ref().map(|dir| format!(" in {dir:?}")).unwrap_or_default());
+    // Make the attempted action visible even if the following call stalls.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     let cwd = cwd.unwrap_or_default();
     let reply = if new_window {
         conn.call_method(Some(name), PATH, Some(IFACE), "NewWindow", &(cwd, argv)).await?

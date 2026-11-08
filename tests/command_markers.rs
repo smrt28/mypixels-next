@@ -65,3 +65,14 @@ fn stale_or_missing_input_anchors_do_not_capture_unrelated_text() {
     let stream = b"\x1b]133;A\x07$ \x1b]133;B\x07old input\r\n\x1b]133;D;0\x07\x1b]133;C\x07";
     assert!(commands(stream, 80).last().unwrap().2.is_none());
 }
+
+#[test]
+fn empty_input_is_distinct_from_an_unavailable_command() {
+    for input in ["", " ", "   \t", "\u{2003}"] {
+        for newline in ["", "\r\n"] {
+            let stream = format!("\x1b]133;A\x07$ \x1b]133;B\x07{input}{newline}\x1b]133;C\x07");
+            let marks = commands(stream.as_bytes(), 80);
+            assert_eq!(marks.last().unwrap().2.as_deref(), Some(""), "input={input:?}, newline={newline:?}");
+        }
+    }
+}

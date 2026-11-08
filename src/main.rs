@@ -262,16 +262,16 @@ struct OverviewState {
 // App
 // ---------------------------------------------------------------------------
 
-/// One read-back, uploaded switcher thumbnail: the egui texture, the pixel
-/// size it was read at, the preview content signature it matches, and when it
-/// was last read (for the throttle).
+/// A persistent GPU thumbnail shared by switcher cards and tab hover previews.
+/// Identity follows the tab across reordering; closed tabs release their texture.
 #[derive(Clone)]
 struct SwThumb {
-    handle: egui::TextureHandle,
+    tab_id: usize,
+    handle: egui::TextureId,
+    texture: wgpu::Texture,
     size: (u32, u32),
     pixels: (u32, u32),
     sig: u64,
-    last: std::time::Instant,
 }
 
 /// Everything that lives "in a window": the surface and its GPU, this
@@ -313,8 +313,10 @@ struct Win {
     /// Alt-held visual switcher (only ever the focused window's; the Alt
     /// key itself is a global modifier).
     overview: Option<OverviewState>,
-    sw_thumbs: Vec<Option<SwThumb>>,
+    sw_thumbs: Vec<SwThumb>,
     thumb_rr: usize,
+    preview_next: Instant,
+    repaint_at: Option<Instant>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
     autoscroll_next: Option<Instant>,
     /// One-shot: the next frame renders the active tab through the preview
@@ -1104,7 +1106,7 @@ impl App {
 
     /// Resize terminal grid of all tabs to fit the current surface size.
     fn sync_term_size(&mut self) {
-        let (w, h) = match self.wins[self.cur].gpu.as_ref() {
+        let (w, h) = match self.wins.get(self.cur).and_then(|w| w.gpu.as_ref()) {
             Some(g) => (g.config.width, g.config.height),
             None => return,
         };
@@ -1221,7 +1223,8 @@ impl App {
         self.cell_w = cell_w;
         self.cell_h = cell_h;
 
-        if let Some(gpu) = &mut self.wins[self.cur].gpu {
+        // Native scaling can rebuild metrics before the first window exists.
+        if let Some(gpu) = self.wins.get_mut(self.cur).and_then(|w| w.gpu.as_mut()) {
             gpu.pool = (0..MAX_RUNS)
                 .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh)))
                 .collect();
@@ -1571,9 +1574,7 @@ impl App {
             }
         }
         let t_start = Instant::now();
-        let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
-            return;
-        };
+        if self.wins[self.cur].tabs.get(self.wins[self.cur].active).is_none() { return; }
         // The active tab is "focused" iff the window has input focus
         // (covers tab switching, which produces no Focused event).
         {
@@ -1608,12 +1609,33 @@ impl App {
         } else {
             None
         };
-        let ov_frames: Vec<FrameData> = if self.wins[self.cur].overview.is_some() {
-            self.wins[self.cur].tabs.iter().map(|t| self.build_frame(t, true)).collect()
-        } else {
-            Vec::new()
-        };
-        let frame = self.build_frame(tab, blink);
+        let preview_hover = (self.wins[self.cur].overview.is_none() && self.show_tab_strip() && self.wins[self.cur].tab_drag.is_none()
+            && self.wins[self.cur].pointer.1 >= 0.0 && self.wins[self.cur].pointer.1 < self.tab_h)
+            .then_some(self.wins[self.cur].hover_tab).filter(|&i| i < self.wins[self.cur].tabs.len());
+        let n = self.wins[self.cur].tabs.len();
+        let mut preview_order = Vec::with_capacity(n);
+        if let Some(i) = preview_hover { preview_order.push(i); }
+        let active = self.wins[self.cur].active;
+        if !preview_order.contains(&active) { preview_order.push(active); }
+        for k in 0..n {
+            let i = (self.wins[self.cur].thumb_rr + k) % n;
+            if !preview_order.contains(&i) { preview_order.push(i); }
+        }
+        // Build at most three candidate frames, then render at most two.
+        // Idle snapshots run at most five times a second, driven by existing
+        // terminal redraws; cold caches and visible previews take priority.
+        let now = Instant::now();
+        let due = self.wins[self.cur].overview.is_some() || preview_hover.is_some()
+            || self.wins[self.cur].sw_thumbs.len() < n || now >= self.wins[self.cur].preview_next;
+        preview_order.truncate(3);
+        if due {
+            self.wins[self.cur].preview_next = now + std::time::Duration::from_millis(200);
+            self.wins[self.cur].thumb_rr = (self.wins[self.cur].thumb_rr + 1) % n.max(1);
+        } else { preview_order.clear(); }
+        let ov_frames: Vec<Option<FrameData>> = (0..n).map(|i| {
+            preview_order.contains(&i).then(|| self.build_frame(&self.wins[self.cur].tabs[i], false))
+        }).collect();
+        let frame = self.build_frame(&self.wins[self.cur].tabs[self.wins[self.cur].active], blink);
         self.bg = saved_bg;
         let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
@@ -1646,6 +1668,8 @@ impl App {
         let tab_faces: Vec<tab_bar::TabFace> = if show_strip {
             self.wins[self.cur].tabs.iter().enumerate().map(|(i, tab)| tab_bar::TabFace {
                 id: tab.id,
+                preview: self.wins[self.cur].sw_thumbs.iter().find(|thumb| thumb.tab_id == tab.id)
+                    .map(|thumb| (thumb.handle, thumb.size)),
                 title: tab_title(tab, i == self.wins[self.cur].active, self.config.tab_title_max_length,
                     self.config.tab_title_short_current, &self.config.tab_shorten_str),
                 tooltip: format!("{}\n{}", tab.display_title(), tab.current_dir().unwrap_or_default()),
@@ -1686,9 +1710,8 @@ impl App {
                     let cwd_line = t.current_dir().filter(|c| c != &title);
                     let thumb = self.wins[self.cur].
                         sw_thumbs
-                        .get(i)
-                        .and_then(|t| t.as_ref())
-                        .map(|t| (t.handle.clone(), t.size));
+                        .iter().find(|thumb| thumb.tab_id == t.id)
+                        .map(|thumb| (thumb.handle, thumb.size));
                     let status = self.sem_blocks.get(&t.id)
                         .and_then(|blocks| blocks.iter().rev().find(|b| b.is_history_command()))
                         .map(|b| if !b.done { egui_ui::SwitcherStatus::Running }
@@ -1697,6 +1720,7 @@ impl App {
                             else { egui_ui::SwitcherStatus::Completed })
                         .unwrap_or_default();
                     egui_ui::SwitcherCard {
+                        id: t.id,
                         status,
                         title,
                         active: i == self.wins[self.cur].active,
@@ -1740,7 +1764,29 @@ impl App {
                 let full = ctx.run_ui(raw, |ui| {
                     if show_strip {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
-                            &tab_faces, self.wins[self.cur].active, clock.as_deref(), &self.config);
+                            &tab_faces, self.wins[self.cur].active, clock.as_deref(),
+                            egui.ui_state.menu_open && egui.ui_state.menu_app, &self.config);
+                        if strip_geometry.menu_clicked {
+                            let st = &mut egui.ui_state;
+                            if st.menu_open && st.menu_app {
+                                st.menu_open = false;
+                                egui_ui::release_focus(&ctx);
+                            } else {
+                                st.menu_items = vec![
+                                    ("New window".into(), "new_window".into(), true),
+                                    ("Settings…".into(), "show_config".into(), true),
+                                    ("Keyboard shortcuts".into(), "show_shortcuts".into(), true),
+                                    ("About mypixels".into(), "show_about".into(), true),
+                                ];
+                                st.menu_seps = vec![1, 2];
+                                st.menu_pos = [3.0, self.tab_h / ctx.pixels_per_point()];
+                                st.menu_app = true;
+                                st.menu_open = true;
+                                st.menu_out = None;
+                                st.menu_age = 0;
+                            }
+                            ctx.request_repaint();
+                        }
                     }
                     let mut config_open = egui.ui_state.panel_is(egui_ui::RightPanel::Settings);
                     let ev = egui_ui::config_window(
@@ -1770,7 +1816,8 @@ impl App {
                     }
                     egui_ui::rename_box(ui, &mut egui.ui_state);
                     egui_ui::move_pick_box(ui, &mut egui.ui_state);
-                    egui_ui::ctx_menu(ui, &mut egui.ui_state);
+                    egui_ui::ctx_menu(ui, &mut egui.ui_state, &self.config);
+                    egui_ui::app_info(ui, &mut egui.ui_state, &self.config);
                     if !sw_open && egui.ui_state.panel_is(egui_ui::RightPanel::History) {
                         // Status dots wear the palette's own green and red
                         // (the fixed pair only when no palette is set).
@@ -1805,13 +1852,14 @@ impl App {
                     }
                 });
                 egui.ui_state.release_passive_focus(&ctx, &full.platform_output);
-                // New windows/areas need a sizing pass before they can
-                // paint. Forward THIS pass's immediate repaint request;
-                // checking only the previous pass can strand a new menu.
-                if full.viewport_output.get(&egui::ViewportId::ROOT)
-                    .is_some_and(|output| output.repaint_delay.is_zero())
-                {
-                    window.request_redraw();
+                // egui owns animation/tooltip timing. Preserve delayed
+                // deadlines as well as immediate animation repaint requests.
+                if preview_hover.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+                if let Some(output) = full.viewport_output.get(&egui::ViewportId::ROOT) {
+                    let delay = if preview_hover.is_some() { output.repaint_delay.min(std::time::Duration::from_millis(100)) }
+                        else { output.repaint_delay };
+                    self.wins[self.cur].repaint_at = Instant::now().checked_add(delay);
+                    if delay.is_zero() { window.request_redraw(); }
                 }
                 // A panel/popup that closed this frame must surrender
                 // keyboard focus; a vanished TextEdit does not do it alone,
@@ -1855,7 +1903,8 @@ impl App {
                 let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
                     || egui.ui_state.rename_open
                     || egui.ui_state.move_open
-                    || egui.ui_state.menu_open;
+                    || egui.ui_state.menu_open
+                    || egui.ui_state.info_page.is_some();
                 egui_ui::release_focus_if_closed(&ctx, egui.ui_state.right_panel != egui_ui::RightPanel::Closed, popup_open, &mut egui.open_prev);
                 full_output = Some(full);
             }
@@ -2125,37 +2174,20 @@ impl App {
         }
 
         let t_text = t_start.elapsed();
-        // Every tile shows a real render, and no tab is rebuilt every frame. A
-        // preview is refreshed when its content changed *and* its own throttle has
-        // expired -- 60ms for the tile you are on, 200ms for the rest -- with at
-        // most two rebuilt per frame so eight busy tabs cannot turn one redraw into
-        // a 60ms hitch. A throttled tile keeps showing its previous frame, which is
-        // plenty for a thumbnail. A tab that has never been drawn ignores the cap,
-        // so opening the overlay fills the whole grid in one go.
-        // The egui switcher's card thumbnails read these offscreen preview
-        // frames back as textures (readback_preview), so every open switcher
-        // keeps them warm.
+        // Refresh changed preview content in bounded batches, whether the
+        // switcher is visible or its shared hover/idle cache is being warmed.
         let mut jobs: Vec<gpu::PreviewJob> = Vec::new();
-        if sw_open {
-            if let Some(ov) = &self.wins[self.cur].overview {
+        {
             let n = self.wins[self.cur].tabs.len();
-            let sel = ov.selected.min(n.saturating_sub(1));
+            let sel = preview_hover.unwrap_or(self.wins[self.cur].active).min(n.saturating_sub(1));
             gpu.ensure_previews(n, (w, h));
             let now = Instant::now();
             // Selected tab first, then every other tab exactly once, from a
             // rotating cursor so a backlog drains in order and nothing starves.
-            let mut order: Vec<usize> = Vec::with_capacity(n);
-            order.push(sel);
-            for k in 0..n {
-                let i = (gpu.prev_rr + k) % n;
-                if i != sel {
-                    order.push(i);
-                }
-            }
-            gpu.prev_rr = (gpu.prev_rr + 1) % n.max(1);
+            let order = preview_order.clone();
             let mut built = 0usize;
             for i in order {
-                let Some(fd) = ov_frames.get(i) else {
+                let Some(fd) = ov_frames.get(i).and_then(Option::as_ref) else {
                     continue;
                 };
                 let sig = frame_sig(fd, self.cell_w);
@@ -2167,7 +2199,7 @@ impl App {
                 let throttled = held != 0
                     && now.duration_since(gpu.prev_last[i])
                         < std::time::Duration::from_millis(gate);
-                if throttled || (held != 0 && built >= 2) {
+                if throttled || built >= 2 {
                     continue;
                 }
                 let metrics = gpu.pool[0].metrics();
@@ -2205,7 +2237,6 @@ impl App {
                 });
                 built += 1;
             }
-            }
         }
         // One-shot screenshot: shape the captured frame into the preview
         // slot and queue the offscreen render. The readback happens after
@@ -2216,7 +2247,7 @@ impl App {
             let a = self.wins[self.cur].active;
             if a < self.wins[self.cur].tabs.len() {
                 gpu.ensure_previews(a + 1, (w, h));
-                if let Some(fd) = ov_frames.get(a).or(shot_frame.as_ref()) {
+                if let Some(fd) = ov_frames.get(a).and_then(Option::as_ref).or(shot_frame.as_ref()) {
                     let metrics = gpu.pool[0].metrics();
                     let buffers = &mut gpu.prev_bufs[a];
                     let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
@@ -2363,89 +2394,49 @@ impl App {
             }
         }
 
-        // The egui switcher's live thumbnails: read the freshly rendered
-        // preview textures back for a few tabs per frame (same 60/200ms
-        // throttling and two-per-frame cap as the preview jobs) and upload
-        // them to egui. The thumbnail takes the terminal area of the texture
-        // at its own aspect, so a card shows the tab without letterboxing.
-        // A card click may have closed the overlay earlier in this draw.
-        // Skip readbacks without returning: the moved-out GPU must be restored.
-        if let (true, Some(ov), Some(ctx)) = (
-            sw_open,
-            self.wins[self.cur].overview,
-            self.wins[self.cur].egui.as_ref().map(|e| e.ctx.clone()),
-        ) {
-            let n = self.wins[self.cur].tabs.len();
-            let sel = ov.selected.min(n.saturating_sub(1));
+        // Downsample rendered previews on the GPU; egui samples the same
+        // persistent textures. No map_async, CPU wait, or re-upload is needed.
+        if self.wins[self.cur].egui.is_some() {
+            let ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
+            // Renderer registrations must be freed along with closed/moved tabs.
+            let mut thumbs = std::mem::take(&mut self.wins[self.cur].sw_thumbs);
+            let renderer = &mut self.wins[self.cur].egui.as_mut().unwrap().renderer;
+            thumbs.retain(|thumb| {
+                let keep = ids.contains(&thumb.tab_id);
+                if !keep { renderer.free_texture(&thumb.handle); }
+                keep
+            });
             let term_h = ((h as f32) - strip_h).max(1.0);
-            // The point size (egui space) follows `tab_overview_scale`: the
-            // tab's frame shrunk by that factor, capped so four fit across
-            // the window, the terminal's own aspect kept.
-            let (ptw, pth) = egui_ui::thumbnail_size(
-                (w as f32) / self.scale.max(1.0),
-                (w as f32) / term_h,
-                self.config.tab_overview_scale,
-            );
-            // The egui context runs at the display's pixels-per-point, so
-            // read the preview back at full pixel density -- a texture at
-            // point size would be upscaled and look soft.
-            let tw = (ptw * self.scale).round().max(1.0) as u32;
-            let th = (pth * self.scale).round().max(1.0) as u32;
-            let mut order: Vec<usize> = vec![sel];
-            for k in 0..n {
-                let i = (self.wins[self.cur].thumb_rr + k) % n;
-                if i != sel {
-                    order.push(i);
-                }
-            }
-            self.wins[self.cur].thumb_rr = (self.wins[self.cur].thumb_rr + 1).rem_euclid(n.max(1));
-            let now = Instant::now();
-            let mut done = 0;
-            for i in order {
-                if done >= 2 {
-                    break;
-                }
-                // Nothing to read back until the jobs block has rendered this
-                // tab (signature 0 = never), and an unchanged screen does not
-                // need a new readback.
+            let (ptw, pth) = egui_ui::thumbnail_size(w as f32 / self.scale.max(1.0), w as f32 / term_h,
+                self.config.tab_overview_scale);
+            let (tw, th) = ((ptw * self.scale).round().max(1.0) as u32, (pth * self.scale).round().max(1.0) as u32);
+            let mut updated = 0;
+            for &i in &preview_order {
+                if updated >= 2 { break; }
                 let sig = gpu.prev_sigs.get(i).copied().unwrap_or(0);
-                if sig == 0 {
-                    continue;
-                }
-                let interval =
-                    std::time::Duration::from_millis(if i == sel { 60 } else { 200 });
-                let stale = self.wins[self.cur].
-                    sw_thumbs
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .is_none_or(|t| {
-                        t.pixels != (tw, th)
-                            || (t.sig != sig && now.duration_since(t.last) >= interval)
-                    });
-                if !stale {
-                    continue;
-                }
-                let Some(rgba) = gpu.readback_preview(i, strip_h as u32, (tw, th)) else {
-                    continue;
+                if sig == 0 || ov_frames.get(i).and_then(Option::as_ref).is_none_or(|fd| frame_sig(fd, self.cell_w) != sig) { continue; }
+                let id = ids[i];
+                let old = thumbs.iter().position(|t| t.tab_id == id);
+                if old.is_some_and(|at| thumbs[at].pixels == (tw, th) && thumbs[at].sig == sig) { continue; }
+                let old_texture = old.map(|at| &thumbs[at].texture);
+                let Some(texture) = gpu.thumbnail(i, strip_h as u32, (tw, th), old_texture) else { continue; };
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let handle = if let Some(at) = old {
+                    let handle = thumbs[at].handle;
+                    renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &view, wgpu::FilterMode::Linear, handle);
+                    handle
+                } else {
+                    renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear)
                 };
-                let handle = ctx.load_texture(
-                    format!("switcher-preview-{i}"),
-                    egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba),
-                    egui::TextureOptions::LINEAR,
-                );
-                if self.wins[self.cur].sw_thumbs.len() < n {
-                    self.wins[self.cur].sw_thumbs.resize(n, None);
-                }
-                self.wins[self.cur].sw_thumbs[i] = Some(SwThumb {
-                    handle,
-                    // Point size for the layout (the texture is pixel-dense).
-                    size: (ptw.round() as u32, pth.round() as u32),
-                    pixels: (tw, th),
-                    sig,
-                    last: now,
-                });
-                done += 1;
+                let thumb = SwThumb { tab_id: id, handle, texture, size: (ptw.round() as u32, pth.round() as u32),
+                    pixels: (tw, th), sig };
+                if let Some(at) = old { thumbs[at] = thumb; } else { thumbs.push(thumb); }
+                updated += 1;
             }
+            // Fill cold caches promptly in bounded batches, before the next
+            // interaction. Once warm, terminal activity drives refreshes.
+            if thumbs.len() < n || updated > 0 { window.request_redraw(); }
+            self.wins[self.cur].sw_thumbs = thumbs;
         }
         self.wins[self.cur].gpu = Some(gpu);
 
@@ -2993,6 +2984,7 @@ impl App {
                     b.started_at.get_or_insert(when);
                     if let Some(command) = command {
                         b.cmd_line = command;
+                        b.command_captured = true;
                     }
                 }
             }
@@ -3365,7 +3357,7 @@ impl App {
         //      it (through egui's own dismissal), and no key may also reach
         //      the shell underneath - the shell must not act on the very
         //      keystroke that dismisses a menu.
-        if self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open) {
+        if self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.info_page.is_some() || egui::Popup::is_any_open(&e.ctx)) {
             return;
         }
         // 1. The switcher claims only its own keys (arrows, Home/End, digits
@@ -3478,7 +3470,6 @@ impl App {
         if self.wins[self.cur].overview.as_ref().map(|o| o.mode) == Some(OverviewMode::Switcher) {
             self.wins[self.cur].overview = None;
             self.switcher_open.store(false, Ordering::SeqCst);
-            self.wins[self.cur].sw_thumbs.clear();
         }
         if let Some(w) = &self.wins[self.cur].window {
             w.request_redraw();
@@ -3635,7 +3626,7 @@ impl App {
                         let st = &mut egui.ui_state;
                         st.move_items = items;
                         st.move_targets = targets;
-                        st.move_pos = [12.0, self.tab_h + 6.0];
+                        st.move_pos = [12.0, self.tab_h / egui.ctx.pixels_per_point() + 6.0];
                         st.move_open = true;
                         st.move_out = None;
                     }
@@ -3733,6 +3724,20 @@ impl App {
             },
             "config_reload" => {
                 self.reload_config();
+            },
+            "show_shortcuts" | "show_about" => {
+                self.close_switcher();
+                *self.switcher_alt_at.lock().unwrap() = None;
+                self.switcher_show_req.store(false, Ordering::SeqCst);
+                if let Some(e) = self.wins[self.cur].egui.as_mut() {
+                    e.ui_state.info_page = Some(if action == "show_shortcuts" {
+                        egui_ui::InfoPage::Shortcuts
+                    } else {
+                        egui_ui::InfoPage::About
+                    });
+                    egui_ui::release_focus(&e.ctx);
+                }
+                if let Some(w) = &self.wins[self.cur].window { w.request_redraw(); }
             },
             "show_config" => {
                 self.close_switcher();
@@ -3860,7 +3865,7 @@ impl App {
                 let title =
                     self.wins[self.cur].tabs.get(self.wins[self.cur].active).map(|t| t.display_title()).unwrap_or_default();
                 if let Some(egui) = self.wins[self.cur].egui.as_mut() {
-                    let y = self.tab_h + 6.0;
+                    let y = self.tab_h / egui.ctx.pixels_per_point() + 6.0;
                     let st = &mut egui.ui_state;
                     st.rename_draft = title;
                     st.rename_seed = true;
@@ -4035,6 +4040,16 @@ fn leading_flags() -> Vec<String> {
     std::env::args().skip(1).take_while(|a| a.starts_with('-')).collect()
 }
 
+/// A launcher joins the existing process with a new window by default.
+/// The last explicit window/tab flag wins, matching command-line order.
+fn opens_new_window(flags: &[String]) -> bool {
+    flags.iter().rev().find_map(|flag| match flag.as_str() {
+        "--new-tab" | "-t" => Some(false),
+        "--new-window" | "-n" => Some(true),
+        _ => None,
+    }).unwrap_or(true)
+}
+
 fn positional_terms() -> Vec<String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().position(|a| !a.starts_with('-')) {
@@ -4197,6 +4212,8 @@ impl App {
                 overview: None,
                 sw_thumbs: Vec::new(),
                 thumb_rr: 0,
+                preview_next: Instant::now(),
+                repaint_at: None,
                 autoscroll_next: None,
                 shot: false,
                 tab_drag: None,
@@ -4448,13 +4465,18 @@ pub struct CommandBlock {
     /// Input copied at the C mark, before the command's output can erase
     /// it. Available while running as well as after completion.
     pub cmd_line: String,
+    /// B marks input-aware integration; C may capture an explicitly empty line.
+    pub input_marked: bool,
+    pub command_captured: bool,
     /// Captured output's line count, for the history panel's details.
     pub line_count: usize,
 }
 
 impl CommandBlock {
     pub fn is_history_command(&self) -> bool {
-        self.executing || self.done
+        (self.executing || self.done)
+            && (!self.input_marked || self.executing)
+            && (!self.command_captured || !self.cmd_line.trim().is_empty())
     }
 
     /// Stored size for budget accounting: the compressed form when the
@@ -4487,7 +4509,7 @@ impl CommandBlock {
 /// integrations retain the legacy first-line fallback.
 fn finish_block(b: &mut CommandBlock) {
     b.line_count = b.text.lines().count();
-    if b.cmd_line.is_empty() {
+    if !b.command_captured && b.cmd_line.is_empty() {
         b.cmd_line = b.text.lines().next().unwrap_or_default().trim_end().to_string();
     }
     // The compression decision is unchanged: blocks too small to be worth
@@ -4600,6 +4622,8 @@ fn apply_sem_mark(
                 truncated_head: false,
                 truncated_tail: false,
                 cmd_line: String::new(),
+                input_marked: false,
+                command_captured: false,
                 line_count: 0,
                 started_at: None,
                 finished_at: None,
@@ -4607,6 +4631,12 @@ fn apply_sem_mark(
             });
             while blocks.len() > 512 {
                 blocks.pop_front();
+            }
+        },
+        // An input-aware shell may emit D without C for a blank Enter.
+        1 => {
+            if let Some(b) = blocks.iter_mut().rev().find(|b| !b.done) {
+                b.input_marked = true;
             }
         },
         // C starts execution; A only opened a prompt awaiting input.
@@ -4625,7 +4655,6 @@ fn apply_sem_mark(
                 b.done = true;
             }
         },
-        // B (prompt end) carries no position the v1 UI needs.
         _ => {},
     }
 }
@@ -5008,7 +5037,7 @@ fn lettered_f(fin: u8, mcode: u8) -> Vec<u8> {
     if mcode > 1 {
         vec![0x1b, b'[', b'1', b';', b'0' + mcode, fin]
     } else {
-        vec![0x1b, b'[', b'O', fin]
+        vec![0x1b, b'O', fin]
     }
 }
 
@@ -5050,6 +5079,16 @@ impl ApplicationHandler for App {
         self.drain_resets();
         self.drain_cell_sizes();
         self.drain_test_keys(event_loop);
+        let now = Instant::now();
+        for win in &mut self.wins {
+            if win.repaint_at.is_some_and(|at| at <= now) {
+                win.repaint_at = None;
+                if let Some(window) = &win.window { window.request_redraw(); }
+            }
+        }
+        let next = self.wins.iter().filter_map(|w| w.repaint_at).min();
+        event_loop.set_control_flow(next.map_or(winit::event_loop::ControlFlow::Wait,
+            winit::event_loop::ControlFlow::WaitUntil));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -5079,17 +5118,19 @@ impl ApplicationHandler for App {
         // State and pointer events still reach egui regardless of keyboard ownership.
         let egui_consumed = route_to_egui && self.wins[self.cur].egui.as_mut()
             .is_some_and(|e| e.on_event(&window, &event));
-        // A move and click can arrive before the next UI pass. With only
-        // a sidebar open, use the actual event position so crossing its
-        // edge neither swallows a terminal click nor leaks a panel click.
+        // A move and click can arrive before the next UI pass. Use the
+        // actual event position for passive sidebars, and give native input
+        // back immediately when the last interactive surface closed: egui
+        // can still report the previous popup's stale pointer ownership.
         let egui_consumed = match &event {
             WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
                 if self.wins[self.cur].overview.is_none() => {
                 self.wins[self.cur].egui.as_ref().filter(|e| {
                     let st = &e.ui_state;
-                    (st.right_panel != egui_ui::RightPanel::Closed) && !st.menu_open && !st.move_open
-                        && !st.rename_open && !st.font_popup.as_ref().is_some_and(|p| p.open)
+                    !st.menu_open && !st.move_open
+                        && !st.rename_open && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx) && !st.font_popup.as_ref().is_some_and(|p| p.open)
                 }).map(|e| {
+                    if e.ui_state.right_panel == egui_ui::RightPanel::Closed { return false; }
                     let (x, y) = match &event {
                         WindowEvent::CursorMoved { position, .. } => (position.x as f32, position.y as f32),
                         _ => self.wins[self.cur].pointer,
@@ -5109,7 +5150,7 @@ impl ApplicationHandler for App {
         };
         let strip_pointer = pointer_at.is_some_and(|(_, y)| self.show_tab_strip() && y >= 0.0 && y < self.tab_h)
             && self.wins[self.cur].overview.is_none()
-            && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.rename_open);
+            && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.info_page.is_some() || egui::Popup::is_any_open(&e.ctx) || e.ui_state.rename_open);
         let egui_consumed = if pointer_at.is_some() && (strip_pointer || self.wins[self.cur].tab_drag.is_some()
             || self.wins[self.cur].tab_close_press.is_some()) { false } else { egui_consumed };
         // An event egui claimed was claimed *for* a visual change -- hover,
@@ -5351,9 +5392,10 @@ impl ApplicationHandler for App {
                     let (mx, my) = self.wins[self.cur].pointer;
                     if let Some(egui) = self.wins[self.cur].egui.as_mut() {
                         let st = &mut egui.ui_state;
+                        st.menu_app = false;
                         st.menu_items = rows;
                         st.menu_seps = seps;
-                        st.menu_pos = [mx, my];
+                        st.menu_pos = egui_ui::popup_position((mx, my), egui.ctx.pixels_per_point());
                         st.menu_open = true;
                         st.menu_out = None;
                         st.menu_age = 0;
@@ -5838,29 +5880,26 @@ fn main() {
     log::info!("mypixels build {}", build_stamp());
     let flags = leading_flags();
     if flags.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "usage: mypixels [options] [command args...]\n\n\
-Options:\n  \
-  -n, --new-window   open a new window instead of joining the session\n  \
-  -s, --standalone   run a private instance: never join or host a session\n  \
-  -h, --help         show this text\n\n\
+        println!(r#"usage: mypixels [options] [command args...]
+
+Options:
+  -n, --new-window   open a new window in the running instance (default)
+  -t, --new-tab      open a tab in the originating or first session window
+  -s, --standalone   run a private instance: never join or host a session
+  -h, --help         show this text
+
   mypixels last [n] [--copy]
-                   show (or clipboard-copy) the last n commands' output\
-                   from the running session's memory pool\
-\
-Without flags, a mypixels window already running on this display is found\n\
-over D-Bus and asked to open a tab for this command, in this directory.\n\
-Typed inside a window, the tab opens in that same window. With no session\n\
-to answer -- or with -n -- this process becomes a window of the session."
-        );
+                   show (or clipboard-copy) the last n commands' output
+                   from the running session's memory pool
+
+Without flags, find the running instance on this display over D-Bus and
+request a new window for this command in the current directory. The client
+prints the instance and requested action to stdout before sending it.
+Use --new-tab to add a tab instead. If no session answers, start a new instance."#);
         return;
     }
-    // Daemon mode, client half: if the window this command was typed in (or,
-    // outside any terminal, the session itself) is reachable, hand it the
-    // command and exit. Anything the bus cannot answer -- no bus, no such
-    // window, a session too old to speak this protocol -- means "become a
-    // window yourself", never "lose the command". -n skips asking entirely:
-    // an explicit second window.
+    // Forward new-window requests (or explicit --new-tab requests) to the
+    // live session. Missing/incompatible sessions fall back to starting here.
     // `mypixels last [n] [--copy]`: the running session's memory pool of
     // command output, queried, not launched. Intercepted before the
     // open-a-tab path below, or "last" would spawn a program named last.
@@ -5895,7 +5934,7 @@ to answer -- or with -n -- this process becomes a window of the session."
     }
     let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
     if !standalone {
-        let new_window = flags.iter().any(|a| a == "--new-window" || a == "-n");
+        let new_window = opens_new_window(&flags);
         let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
         if session::remote_open(cwd, positional_terms(), new_window) {
             return;
@@ -6053,6 +6092,27 @@ mod mouse_report_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launches_default_to_windows_with_explicit_tab_override() {
+        for (flags, window) in [
+            (vec![], true), (vec!["-n"], true), (vec!["--new-window"], true),
+            (vec!["--new-tab"], false), (vec!["-t"], false),
+            (vec!["-n", "-t"], false), (vec!["-t", "-n"], true),
+        ] {
+            assert_eq!(opens_new_window(&flags.into_iter().map(String::from).collect::<Vec<_>>()), window);
+        }
+    }
+
+    #[test]
+    fn function_keys_use_ss3_without_an_extra_csi_prefix() {
+        for (key, final_byte) in [(NamedKey::F1, b'P'), (NamedKey::F2, b'Q'), (NamedKey::F3, b'R'), (NamedKey::F4, b'S')] {
+            assert_eq!(key_bytes(&Key::Named(key.clone()), ModifiersState::empty(), false),
+                Some(vec![0x1b, b'O', final_byte]));
+            assert_eq!(key_bytes(&Key::Named(key), ModifiersState::CONTROL, false),
+                Some(vec![0x1b, b'[', b'1', b';', b'5', final_byte]));
+        }
+    }
 
     #[test]
     fn autoscroll_direction_follows_the_wheel_sign() {
@@ -6292,6 +6352,38 @@ mod sem_tests {
         assert!(blocks[0].done);
         assert_eq!(blocks[0].cmd_line, "printf hello", "finishing output must keep the captured input");
         assert_eq!(blocks.iter().filter(|b| b.is_history_command()).count(), 1);
+    }
+
+    #[test]
+    fn blank_input_never_becomes_prompt_text_in_history() {
+        for command in ["", "  ", "\t\n", "\u{2003}"] {
+            let mut blocks = VecDeque::new();
+            apply_sem_mark(&mut blocks, 0, None, 0, 0, false, 1);
+            apply_sem_mark(&mut blocks, 1, None, 0, 0, false, 1);
+            apply_sem_mark(&mut blocks, 2, None, 1, 1, false, 1);
+            let b = &mut blocks[0];
+            b.cmd_line = command.into();
+            b.command_captured = true;
+            assert!(!b.is_history_command(), "blank running command should be hidden");
+            apply_sem_mark(&mut blocks, 3, Some(0), 1, 1, false, 1);
+            let b = &mut blocks[0];
+            b.text = "$ \n".into();
+            super::finish_block(b);
+            assert_eq!(b.cmd_line, command, "prompt must not replace captured blank input");
+            assert!(!b.is_history_command(), "blank completed command should be hidden");
+        }
+        // Bash can emit A/B/D without C when Enter runs no command.
+        let mut blocks = VecDeque::new();
+        for code in [0, 1, 3] { apply_sem_mark(&mut blocks, code, Some(0), 0, 0, false, 1); }
+        blocks[0].text = "$ \n".into();
+        super::finish_block(&mut blocks[0]);
+        assert!(!blocks[0].is_history_command());
+        // Older integrations that emit only A/D keep their fallback.
+        let mut blocks = VecDeque::new();
+        for code in [0, 3] { apply_sem_mark(&mut blocks, code, Some(0), 0, 0, false, 1); }
+        blocks[0].text = "$ echo hello\nhello".into();
+        super::finish_block(&mut blocks[0]);
+        assert!(blocks[0].is_history_command());
     }
 
     #[test]

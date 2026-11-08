@@ -743,6 +743,28 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// Human-readable form of the effective binding, shared by menus and help.
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mods.control_key() { parts.push("Ctrl".to_string()); }
+        if self.mods.alt_key() { parts.push("Alt".to_string()); }
+        if self.mods.shift_key() { parts.push("Shift".to_string()); }
+        parts.push(match &self.key {
+            BoundKey::Char(c) => match c.as_str() {
+                "\r" => "Enter".into(),
+                _ => c.to_uppercase(),
+            },
+            BoundKey::Named(key) => match key {
+                NamedKey::ArrowLeft => "Left".into(),
+                NamedKey::ArrowRight => "Right".into(),
+                NamedKey::ArrowUp => "Up".into(),
+                NamedKey::ArrowDown => "Down".into(),
+                _ => format!("{key:?}"),
+            },
+        });
+        parts.join("+")
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('+').collect();
         let (mod_strs, key_str) = parts.split_at(parts.len().saturating_sub(1));
@@ -860,6 +882,19 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binding_labels_use_readable_modifiers_and_keys() {
+        for (spec, expected) in [
+            ("CONTROL+SHIFT+n", "Ctrl+Shift+N"),
+            ("MOD1+SHIFT+c", "Alt+Shift+C"),
+            ("MOD1+_1", "Alt+1"),
+            ("CONTROL+ALT+Left", "Ctrl+Alt+Left"),
+            ("SHIFT+KP_Enter", "Shift+Enter"),
+        ] {
+            assert_eq!(super::Binding::parse(spec).unwrap().label(), expected);
+        }
+    }
+
     #[test]
     fn user_config_chords_probe() {
         let cfg = Config::load();

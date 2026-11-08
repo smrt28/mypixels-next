@@ -1233,8 +1233,11 @@ impl<T: EventListener> Handler for Term<T> {
         let command = if code == 2 && !alt {
             self.shell_input_start.take().and_then(|start| {
                 let base = self.grid.scrolled_out().saturating_sub(self.grid.history_size());
-                if start.0 < base || start >= (row, col) || start.1 >= self.columns() {
+                if start.0 < base || start > (row, col) || start.1 >= self.columns() {
                     return None;
+                }
+                if start == (row, col) {
+                    return Some(String::new());
                 }
                 let end = if col == 0 {
                     (row.checked_sub(1)?, self.columns() - 1)
@@ -1245,7 +1248,9 @@ impl<T: EventListener> Handler for Term<T> {
                     Point::new(Line((r - base) as i32 - self.grid.history_size() as i32), Column(c))
                 };
                 let text = self.bounds_to_string(point(start), point(end));
-                Some(text.trim_end().to_owned()).filter(|s| !s.is_empty())
+                // An empty captured line is different from an unavailable
+                // input anchor: callers must not replace it with the prompt.
+                Some(text.trim_end().to_owned())
             })
         } else {
             None

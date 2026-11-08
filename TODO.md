@@ -1,5 +1,21 @@
 # Rust rewrite priorities
 
+## Current UI and interaction fixes
+
+- [x] Replace tab-bar branding with a compact application menu.
+- [x] Share themed menu surfaces/action rows across app, terminal context, and history overflow menus.
+- [x] Filter blank/whitespace commands without substituting prompt text.
+- [x] Correct popup coordinates at 2× scaling; verify native scaled startup.
+- [x] Finish cached GPU previews, tab-hover previews, and selection/reorder animations using shared egui animation helpers; verify image quality and behavior.
+- [x] Fix F2 reaching terminal applications (including Codex) as `Q` instead of a function key.
+- [x] Default a new `mypixels` invocation to a new window in the existing instance.
+- [x] Print the selected existing instance and requested new-window action to stdout.
+- [x] Resolve a right-click popup dismissal regression that can pass Escape through to the terminal.
+- [x] Animate tab-bar selection, state fills, and reordering through the same shared helpers as the switcher.
+
+Validation: debug build; `cargo test --offline` (137 passed, one isolated-Wayland test ignored); live menu/hover/reorder/keyboard checks; native 2× popup placement; GPU image comparison; private D-Bus default-window and stdout checks.
+
+
 Scope: preserve the **Alt-held visual tab switcher**. The unused standalone
 `Alt+O` overview is retired; legacy overview bindings are ignored.
 

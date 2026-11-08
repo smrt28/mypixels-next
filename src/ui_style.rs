@@ -14,6 +14,23 @@ pub(crate) struct TermStyle {
 }
 
 impl TermStyle {
+    /// Shared popup surface for application, context and overflow menus.
+    pub(crate) fn menu_frame(&self) -> egui::Frame {
+        egui::Frame::new()
+            .fill(self.bg)
+            .stroke(egui::Stroke::new(1.0, self.border))
+            .corner_radius(9.0)
+            .inner_margin(6.0)
+    }
+
+    pub(crate) fn menu_contents<R>(&self, ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        ui.scope(|ui| {
+            self.apply_controls(ui);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+            contents(ui)
+        }).inner
+    }
+
     pub(crate) fn new(ui: &egui::Ui, ok: egui::Color32, err: egui::Color32) -> Self {
         let v = ui.visuals();
         let dark = v.text_color().intensity() > v.window_fill.intensity();
@@ -78,6 +95,104 @@ impl TermStyle {
             self.ok
         }
     }
+}
+
+/// Shared action treatment: unframed at rest, accent outline on hover/focus,
+/// muted disabled state, optional vector icon and right-aligned shortcut.
+pub(crate) fn action_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    label: &str,
+    shortcut: &str,
+    glyph: Option<Icon>,
+    enabled: bool,
+    c: &TermStyle,
+) -> egui::Response {
+    let response = ui.interact(rect, id, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    let highlight = enabled && (response.hovered() || response.has_focus());
+    if highlight {
+        ui.painter().rect(rect, 5.0, c.bg.lerp_to_gamma(c.accent, 0.14),
+            egui::Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
+    }
+    let color = if !enabled { c.bg.lerp_to_gamma(c.muted, 0.65) } else if highlight { c.accent } else { c.fg };
+    if let Some(glyph) = glyph {
+        icon(ui.painter(), glyph, egui::pos2(rect.left() + 18.0, rect.center().y), color);
+    }
+    let shortcut_width = if shortcut.is_empty() { 0.0 } else {
+        (ui.painter().layout_no_wrap(shortcut.to_string(), egui::FontId::monospace(12.0), c.muted).size().x + 20.0)
+            .min(rect.width() * 0.52)
+    };
+    text(ui, rect.with_min_x(rect.left() + if glyph.is_some() { 39.0 } else { 10.0 })
+        .with_max_x(rect.right() - shortcut_width - 10.0), label, color, 13.0, false);
+    if !shortcut.is_empty() {
+        text(ui, rect.with_min_x(rect.right() - shortcut_width).with_max_x(rect.right() - 10.0),
+            shortcut, if enabled { c.muted } else { color }, 12.0, false);
+    }
+    if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response }
+}
+
+pub(crate) fn menu_item(
+    ui: &mut egui::Ui, label: &str, shortcut: &str, glyph: Option<Icon>, enabled: bool, colors: &TermStyle,
+) -> egui::Response {
+    let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 32.0));
+    action_row(ui, rect, id, label, shortcut, glyph, enabled, colors)
+}
+
+pub(crate) fn menu_separator(ui: &mut egui::Ui, colors: &TermStyle) {
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 10.0));
+    ui.painter().hline(rect.shrink2(egui::vec2(8.0, 0.0)).x_range(), rect.center().y,
+        egui::Stroke::new(1.0, colors.border));
+}
+
+/// Shared motion policy. egui owns interpolation, interruption and repainting;
+/// components supply only stable identities and target states/geometry.
+pub(crate) const MOTION_SECONDS: f32 = 0.16;
+
+pub(crate) fn transition(ctx: &egui::Context, id: egui::Id, target: bool) -> f32 {
+    ctx.animate_bool_with_time_and_easing(id, target, MOTION_SECONDS, egui::emath::easing::cubic_out)
+}
+
+pub(crate) fn animated_rect(ctx: &egui::Context, id: egui::Id, target: egui::Rect) -> egui::Rect {
+    let now = ctx.input(|i| i.time);
+    let reset = ctx.data_mut(|data| {
+        let old = data.get_temp::<f64>(id);
+        data.insert_temp(id, now);
+        old.is_none_or(|seen| now - seen > 0.3)
+    });
+    let duration = if reset { 0.0 } else { MOTION_SECONDS };
+    let x = ctx.animate_value_with_time(id.with("x"), target.left(), duration);
+    let y = ctx.animate_value_with_time(id.with("y"), target.top(), duration);
+    let width = ctx.animate_value_with_time(id.with("width"), target.width(), duration);
+    let height = ctx.animate_value_with_time(id.with("height"), target.height(), duration);
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
+}
+
+/// Keep an animated selection visible when a scroll viewport changes.
+pub(crate) fn animated_rect_in(ctx: &egui::Context, id: egui::Id, target: egui::Rect, viewport: egui::Rect) -> egui::Rect {
+    let rect = animated_rect(ctx, id, target);
+    let min = egui::pos2(
+        rect.left().clamp(viewport.left(), (viewport.right() - rect.width()).max(viewport.left())),
+        rect.top().clamp(viewport.top(), (viewport.bottom() - rect.height()).max(viewport.top())),
+    );
+    egui::Rect::from_min_size(min, rect.size()).intersect(viewport)
+}
+
+/// Shared bitmap well for switcher and hover previews; always keeps aspect.
+pub(crate) fn preview_image(ui: &egui::Ui, rect: egui::Rect, image: Option<(egui::TextureId, (u32, u32))>, c: &TermStyle) {
+    ui.painter().rect_filled(rect, 7.0, c.bg);
+    if let Some((texture, (w, h))) = image {
+        let native = egui::vec2(w.max(1) as f32, h.max(1) as f32);
+        let scale = (rect.width() / native.x).min(rect.height() / native.y);
+        let size = native * scale;
+        egui::Image::new(egui::load::SizedTexture::new(texture, native))
+            .fit_to_exact_size(size).corner_radius(7.0)
+            .paint_at(ui, egui::Rect::from_center_size(rect.center(), size));
+    } else {
+        text(ui, rect.shrink(10.0), "Preparing preview…", c.muted, 12.0, false);
+    }
+    ui.painter().rect_stroke(rect, 7.0, egui::Stroke::new(1.0, c.border), egui::StrokeKind::Inside);
 }
 
 /// A single-line galley with an ellipsis, so long commands never move the
@@ -453,16 +568,13 @@ impl TabStyle {
         }
     }
 
-    pub fn tab(&self, p: &egui::Painter, rect: egui::Rect, selected: bool, hovered: bool) {
-        let background = if selected { self.selected_background } else { self.background };
+    pub fn tab(&self, p: &egui::Painter, rect: egui::Rect, selected: f32, hovered: bool) {
+        let background = self.background.lerp_to_gamma(self.selected_background, selected);
         p.rect(
             rect,
             5.0,
             if hovered { background.lerp_to_gamma(self.base.fg, 0.035) } else { background },
-            egui::Stroke::new(
-                if selected { 1.5 } else { 1.0 },
-                if selected { self.base.accent } else { self.base.border },
-            ),
+            egui::Stroke::new(1.0, self.base.border),
             egui::StrokeKind::Inside,
         );
     }
@@ -527,4 +639,35 @@ pub(crate) fn toggle(ui: &mut egui::Ui, label: &str, v: &mut bool) -> bool {
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
     changed
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    fn positions(ctx: &egui::Context, time: f64, swapped: bool) -> (f32, f32) {
+        let mut result = (0.0, 0.0);
+        let mut full = ctx.run_ui(egui::RawInput { time: Some(time), ..Default::default() }, |ui| {
+            let target = |x| egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(80.0, 40.0));
+            result.0 = animated_rect(ui.ctx(), egui::Id::unique("first_tab"), target(if swapped { 100.0 } else { 0.0 })).left();
+            result.1 = animated_rect(ui.ctx(), egui::Id::unique("second_tab"), target(if swapped { 0.0 } else { 100.0 })).left();
+        });
+        full.textures_delta.clear();
+        result
+    }
+
+    #[test]
+    fn stable_id_motion_interpolates_and_retargets_without_jumping() {
+        let ctx = egui::Context::default();
+        assert_eq!(positions(&ctx, 0.0, false), (0.0, 100.0));
+        positions(&ctx, 0.016, true);
+        let middle = positions(&ctx, 0.08, true);
+        assert!(middle.0 > 0.0 && middle.0 < 100.0);
+        assert!(middle.1 > 0.0 && middle.1 < 100.0);
+        let retargeted = positions(&ctx, 0.09, false);
+        assert!(retargeted.0 > 0.0 && retargeted.0 < 100.0);
+        assert_eq!(positions(&ctx, 0.28, false), (0.0, 100.0));
+        // A surface absent for a while opens at the correct current layout.
+        assert_eq!(positions(&ctx, 1.0, true), (100.0, 0.0));
+    }
 }

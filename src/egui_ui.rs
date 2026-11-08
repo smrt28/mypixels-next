@@ -95,10 +95,12 @@ pub struct UiState {
     /// still open. Same shape as `rename_out` for the same reason: the
     /// app must learn about dismissal, not only about choice.
     pub move_out: Option<Option<usize>>,
-    /// The right-click context menu. Rows are (label, action, enabled);
+    /// The context or application menu. Rows are (label, action, enabled);
     /// `menu_seps` are the indices a separator goes BEFORE. Actions are the
     /// app's own `do_action` names, so the menu adds no new machinery.
     pub menu_open: bool,
+    pub menu_app: bool,
+    pub info_page: Option<InfoPage>,
     pub menu_items: Vec<(String, String, bool)>,
     pub menu_seps: Vec<usize>,
     pub menu_pos: [f32; 2],
@@ -127,11 +129,17 @@ pub enum RightPanel {
     Settings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InfoPage {
+    Shortcuts,
+    About,
+}
+
 impl UiState {
     /// Sidebars are passive until an editor is explicitly focused. Merely
     /// opening a panel or clicking one of its buttons never claims typing.
     pub fn owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        self.rename_open || self.menu_open || self.move_open
+        self.rename_open || self.menu_open || self.move_open || self.info_page.is_some() || egui::Popup::is_any_open(ctx)
             || (self.right_panel != RightPanel::Closed && ctx.memory(|m| m.focused())
                 .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some()))
     }
@@ -143,7 +151,7 @@ impl UiState {
         let pending_editor = focus != self.sidebar_focus
             && focus.is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some());
         self.sidebar_focus = focus;
-        if self.right_panel != RightPanel::Closed && !self.rename_open && !self.menu_open && !self.move_open
+        if self.right_panel != RightPanel::Closed && !self.rename_open && !self.menu_open && !self.move_open && self.info_page.is_none() && !egui::Popup::is_any_open(ctx)
             && output.ime.is_none() {
             // DragValue and history search request edit focus after layout;
             // allow the next frame to render their editor before deciding.
@@ -226,6 +234,7 @@ impl HistoryRow {
 /// What the filter chip and the search box keep visible. Pure, so the
 /// panel's behaviour is testable without a window.
 pub fn history_visible(row: &HistoryRow, filter: HistoryFilter, query: &str) -> bool {
+    if row.cmd.trim().is_empty() { return false; }
     match filter {
         HistoryFilter::All => {}
         HistoryFilter::Success => {
@@ -249,17 +258,19 @@ pub fn history_visible(row: &HistoryRow, filter: HistoryFilter, query: &str) -> 
 /// Same open/click-away/Escape contract as the rename box and the window
 /// picker -- the three small popups should behave identically or they lie
 /// about being the same kind of thing.
-pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState) {
+pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState, cfg: &crate::config::Config) {
     if !st.menu_open {
         st.menu_out = None;
         return;
     }
     let ctx = ui.ctx();
     let pos = egui::pos2(st.menu_pos[0], st.menu_pos[1]);
+    let colors = TermStyle::new(ui, ui.visuals().text_color(), ui.visuals().error_fg_color);
     let mut out: Option<Option<String>> = None;
     let mut area = egui::Rect::NOTHING;
     egui::Window::new("ctx_menu")
-        .id(egui::Id::new("ctx_menu_box"))
+        .id(egui::Id::unique("ctx_menu_box"))
+        .frame(colors.menu_frame())
         .fade_in(false)
         .fade_out(false)
         .title_bar(false)
@@ -268,32 +279,79 @@ pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState) {
         .fixed_pos(pos)
         .constrain(true)
         .show(&ctx, |ui| {
-            ui.set_width(210.0);
-            for (i, (label, action, enabled)) in st.menu_items.iter().enumerate() {
-                if st.menu_seps.contains(&i) {
-                    ui.separator();
-                }
-                let resp = ui.add_enabled(*enabled, egui::Button::new(label).min_size(egui::vec2(198.0, 0.0)));
-                if resp.clicked() {
-                    out = Some(Some(action.clone()));
-                }
-            }
+            ui.set_width(300.0_f32.min((ctx.content_rect().width() - 24.0).max(80.0)));
+            colors.menu_contents(ui, |ui| {
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 28.0).max(32.0)).show(ui, |ui| {
+                    for (i, (label, action, enabled)) in st.menu_items.iter().enumerate() {
+                        if st.menu_seps.contains(&i) { crate::ui_style::menu_separator(ui, &colors); }
+                        let shortcut = cfg.bindings.iter().find(|(name, _)| name == action)
+                            .map(|(_, keys)| keys.iter().map(|b| b.label()).collect::<Vec<_>>().join(" / "))
+                            .unwrap_or_default();
+                        if crate::ui_style::menu_item(ui, label, &shortcut, None, *enabled, &colors).clicked() {
+                            out = Some(Some(action.clone()));
+                        }
+                    }
+                });
+            });
             area = ui.response().rect;
         });
-    // One frame of grace: the opening press (and any key in the same batch)
-    // arrives in the input state of the first frame that draws the menu.
+    // Ignore the opening pointer press, including repeated sizing passes.
+    // Escape is never the opening gesture and must dismiss immediately.
     if out.is_none()
-        && st.menu_age >= 2
         && ctx.input(|i| {
             i.key_pressed(egui::Key::Escape)
-                || (i.pointer.any_pressed()
-                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(4.0).contains(p)))
+                || (st.menu_age >= 2 && i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(4.0).contains(p)
+                        // The anchor toggles on release; closing on press
+                        // would make that release reopen the application menu.
+                        && !(st.menu_app && crate::tab_bar::menu_button_rect(st.panel_top).contains(p))))
         })
     {
         out = Some(None);
     }
+    if st.menu_age < 2 { ctx.request_repaint(); }
     st.menu_age += 1;
     st.menu_out = out;
+}
+
+/// Application information stays in the window and never sends keys to the PTY.
+pub fn app_info(ui: &egui::Ui, st: &mut UiState, cfg: &crate::config::Config) {
+    let Some(page) = st.info_page else { return; };
+    let colors = TermStyle::new(ui, ui.visuals().text_color(), ui.visuals().error_fg_color);
+    let response = egui::Modal::new(egui::Id::unique("app_info")).frame(colors.menu_frame()).show(ui.ctx(), |ui| {
+        colors.apply_controls(ui);
+        ui.set_width((ui.ctx().content_rect().width() - 48.0).clamp(100.0, 560.0));
+        ui.heading(if page == InfoPage::Shortcuts { "Keyboard shortcuts" } else { "About mypixels" });
+        ui.separator();
+        if page == InfoPage::Shortcuts {
+            ui.label("Your current keybindings");
+            egui::ScrollArea::both().max_height((ui.ctx().content_rect().height() - 160.0).max(60.0)).show(ui, |ui| {
+                egui::Grid::new("shortcut_reference").striped(true).spacing([24.0, 8.0]).show(ui, |ui| {
+                    for (action, bindings) in &cfg.bindings {
+                        let label = if let Some(index) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
+                            format!("Switch to tab {}", index + 1)
+                        } else {
+                            let words = action.replace('_', " ");
+                            words.get(..1).map_or_else(|| words.clone(), |first| format!("{}{}", first.to_uppercase(), &words[1..]))
+                        };
+                        ui.label(label);
+                        ui.monospace(bindings.iter().map(|b| b.label()).collect::<Vec<_>>().join(" / "));
+                        ui.end_row();
+                    }
+                });
+            });
+        } else {
+            ui.label(format!("mypixels {}", env!("CARGO_PKG_VERSION")));
+            ui.label("A compact, GPU-rendered terminal emulator.");
+        }
+        ui.separator();
+        ui.button("Close").clicked()
+    });
+    if response.inner || response.should_close() {
+        st.info_page = None;
+        release_focus(ui.ctx());
+        ui.ctx().request_repaint();
+    }
 }
 
 /// The window picker for "send tab to window": one small frameless list,
@@ -344,6 +402,11 @@ pub fn move_pick_box(ui: &egui::Ui, st: &mut UiState) {
 pub fn panel_pointer_input(ctx: &egui::Context, at: egui::Pos2) -> bool {
     ctx.egui_is_using_pointer()
         || ctx.layer_id_at(at).is_some_and(|layer| layer.order != egui::Order::Background)
+}
+
+/// winit pointer coordinates are physical pixels; egui popup anchors are points.
+pub fn popup_position(pointer: (f32, f32), pixels_per_point: f32) -> [f32; 2] {
+    [pointer.0 / pixels_per_point, pointer.1 / pixels_per_point]
 }
 
 /// The history sidebar uses its own compact layout, while retaining the
@@ -416,10 +479,15 @@ pub fn history_panel(ui: &mut egui::Ui, st: &mut UiState, ok: egui::Color32, err
                 let more = icon_button(ui, more_rect, Icon::More, "History options", &colors);
                 egui::Popup::from_toggle_button_response(&more)
                     .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                    .frame(colors.menu_frame())
                     .show(|ui| {
-                        if ui.button("Close history").clicked() {
-                            st.close_panel(RightPanel::History);
-                        }
+                        ui.set_width(180.0);
+                        colors.menu_contents(ui, |ui| {
+                            if crate::ui_style::menu_item(ui, "Close history", "", Some(Icon::Dismiss), true, &colors).clicked() {
+                                st.close_panel(RightPanel::History);
+                                ui.close();
+                            }
+                        });
                     });
                 ui.add_space(16.0);
                 if st.history_search_open {
@@ -712,31 +780,8 @@ fn history_details(ui: &mut egui::Ui, row: &HistoryRow, c: &TermStyle) -> Option
             egui::pos2(rect.left() + 7.0, divider + 42.0 + i as f32 * 37.0),
             egui::vec2(rect.width() - 14.0, 34.0),
         );
-        let response = ui.interact(
-            button,
-            ui.scope_id().with(("history_action", name)),
-            if enabled { egui::Sense::click() } else { egui::Sense::hover() },
-        );
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
-        let highlight = enabled && (response.hovered() || response.has_focus());
-        if highlight {
-            ui.painter().rect(
-                button,
-                5.0,
-                c.bg.lerp_to_gamma(c.accent, 0.14),
-                egui::Stroke::new(1.0, c.accent),
-                egui::StrokeKind::Inside,
-            );
-        }
-        let color = if !enabled {
-            c.bg.lerp_to_gamma(c.muted, 0.65)
-        } else if highlight {
-            c.accent
-        } else {
-            c.fg
-        };
-        draw_icon(ui.painter(), icon, egui::pos2(button.left() + 18.0, button.center().y), color);
-        text(ui, button.with_min_x(button.left() + 39.0), label, color, 14.0, false);
+        let response = crate::ui_style::action_row(ui, button,
+            ui.scope_id().with(("history_action", name)), label, "", Some(icon), enabled, c);
         if response.clicked() && enabled {
             action = Some(name);
         }
@@ -998,7 +1043,11 @@ impl Egui {
     /// event (config window open and under the pointer / focused) and the
     /// app should not handle it.
     pub fn on_event(&mut self, window: &winit::window::Window, event: &winit::event::WindowEvent) -> bool {
-        self.state.on_window_event(window, event).consumed
+        let response = self.state.on_window_event(window, event);
+        // Unfocused menus still need a frame to process Escape. Repainting
+        // and claiming terminal input are independent egui responses.
+        if response.repaint { window.request_redraw(); }
+        response.consumed
     }
 
     /// The card the pointer clicked on the previous frame, if any.
@@ -1019,6 +1068,7 @@ pub enum SwitcherStatus {
 }
 
 pub struct SwitcherCard {
+    pub id: usize,
     pub status: SwitcherStatus,
     pub title: String,
     /// The tab that is actually active (marked, like the strip does).
@@ -1027,10 +1077,10 @@ pub struct SwitcherCard {
     pub marker: bool,
     /// Working directory shown in the card tooltip.
     pub cwd: Option<String>,
-    /// A readback of the tab's live frame: the texture plus its pixel size.
+    /// The cached GPU image plus its display size in logical points.
     /// The size follows the terminal area's own aspect, so the image needs
     /// no letterboxing or cropping.
-    pub thumb: Option<(egui::TextureHandle, (u32, u32))>,
+    pub thumb: Option<(egui::TextureId, (u32, u32))>,
 }
 
 const CARD_GAP: f32 = 14.0;
@@ -1207,11 +1257,14 @@ pub fn switcher_screen(
                         .max_height(viewport_h)
                         .show(ui, |ui| {
                             let inset = ((ui.available_width() - grid_w) * 0.5).max(0.0);
+                            let mut selection = None;
+                            let mut scroll_origin_y = 0.0_f32;
                             for row in 0..rows {
                                 let (row_rect, _) = ui.allocate_exact_size(
                                     egui::vec2(ui.available_width(), card_size.y),
                                     egui::Sense::hover(),
                                 );
+                                if row == 0 { scroll_origin_y = row_rect.top(); }
                                 for col in 0..cols {
                                     let i = row * cols + col;
                                     if i >= cards.len() {
@@ -1221,17 +1274,32 @@ pub fn switcher_screen(
                                         row_rect.min + egui::vec2(inset + col as f32 * (card_size.x + CARD_GAP), 0.0),
                                         card_size,
                                     );
+                                    let logical_rect = rect;
+                                    let local = egui::Rect::from_min_size(egui::pos2(
+                                        col as f32 * (card_size.x + CARD_GAP), row as f32 * (card_size.y + CARD_GAP)), card_size);
+                                    let motion = crate::ui_style::animated_rect(ui.ctx(),
+                                        egui::Id::unique("switcher_card_motion").with((cards[i].id, cols, preview.x.to_bits())), local);
+                                    let rect = rect.translate(motion.min - local.min);
                                     let response = switcher_card(ui, rect, i, &cards[i], i == selected, &colors);
+                                    if i == selected { selection = Some(rect); }
                                     if response.clicked() {
                                         *pick = Some(i);
                                     }
                                     if i == selected && follow_selection {
-                                        ui.scroll_to_rect(rect, None);
+                                        ui.scroll_to_rect(logical_rect, None);
                                     }
                                 }
                                 if row + 1 < rows {
                                     ui.add_space(CARD_GAP);
                                 }
+                            }
+                            if let Some(rect) = selection {
+                                // Scrolling follows selection immediately; only
+                                // motion within the current viewport is tweened.
+                                let id = egui::Id::unique("switcher_selection_motion").with((scroll_origin_y.to_bits(), screen.width().to_bits(), screen.height().to_bits()));
+                                let rect = crate::ui_style::animated_rect_in(ui.ctx(), id, rect, ui.clip_rect().shrink(1.0));
+                                ui.painter().rect_stroke(rect, 11.0,
+                                    egui::Stroke::new(2.5, colors.accent), egui::StrokeKind::Inside);
                             }
                         });
                     ui.add_space(18.0);
@@ -1280,9 +1348,11 @@ fn switcher_card(
     selected: bool,
     c: &TermStyle,
 ) -> egui::Response {
-    let response = ui.interact(rect, egui::Id::unique("switcher_card").with(index), egui::Sense::click());
+    let response = ui.interact(rect, egui::Id::unique("switcher_card").with(card.id), egui::Sense::click());
     let p = ui.painter();
-    c.card_surface(p, rect, selected, response.hovered());
+    c.card_surface(p, rect, false, response.hovered());
+    let weight = crate::ui_style::transition(ui.ctx(), egui::Id::unique("switcher_selected_fill").with(card.id), selected);
+    if weight > 0.0 { p.rect_filled(rect.shrink(1.0), 11.0, c.accent.gamma_multiply(weight * 0.08)); }
     let badge = egui::Rect::from_min_size(rect.min + egui::vec2(14.0, 9.0), egui::vec2(28.0, 24.0));
     c.number_badge(p, badge, index + 1, selected, 16.0);
     let (status, color) = match card.status {
@@ -1322,20 +1392,7 @@ fn switcher_card(
         rect.min + egui::vec2(CARD_PAD, CARD_HEADER),
         rect.max - egui::vec2(CARD_PAD, CARD_PAD),
     );
-    p.rect(well, 7.0, c.bg, egui::Stroke::NONE, egui::StrokeKind::Inside);
-    if let Some((texture, (w, h))) = &card.thumb {
-        let native = egui::vec2(*w as f32, *h as f32);
-        let scale = (well.width() / native.x).min(well.height() / native.y).min(1.0);
-        let size = native * scale;
-        let image = egui::Rect::from_center_size(well.center(), size);
-        egui::Image::new(egui::load::SizedTexture::from(texture))
-            .fit_to_exact_size(size)
-            .corner_radius(7.0)
-            .paint_at(ui, image);
-    } else {
-        text(ui, well.shrink(10.0), "Preparing preview…", c.muted, 12.0, false);
-    }
-    p.rect_stroke(well, 7.0, egui::Stroke::new(1.0, c.border), egui::StrokeKind::Inside);
+    crate::ui_style::preview_image(ui, well, card.thumb, c);
     response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!(
         "{}\n{}\n{status}",
         card.title,
@@ -1992,6 +2049,101 @@ fn checkbox_row(ui: &mut egui::Ui, label: &str, v: &mut bool, ev: &mut ConfigEve
 mod regression {
     use super::*;
 
+    #[test]
+    fn popup_anchors_convert_physical_pixels_once() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            assert_eq!(popup_position((120.0 * scale, 80.0 * scale), scale), [120.0, 80.0]);
+        }
+    }
+
+    #[test]
+    fn escape_dismisses_a_menu_even_before_its_second_frame() {
+        let ctx = Context::default();
+        let cfg = crate::config::Config::default();
+        let mut st = UiState { menu_open: true, menu_age: 0,
+            menu_items: vec![("New window".into(), "new_window".into(), true)], ..Default::default() };
+        let mut full = ctx.run_ui(egui::RawInput {
+            events: vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None,
+                pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+            ..Default::default()
+        }, |ui| ctx_menu(ui, &mut st, &cfg));
+        full.textures_delta.clear();
+        assert_eq!(st.menu_out, Some(None));
+    }
+
+    #[test]
+    fn context_and_app_menus_use_shared_surface_at_each_scale() {
+        for dark in [false, true] {
+            for scale in [1.0, 2.0] {
+                for app in [false, true] {
+                    let ctx = Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    let cfg = crate::config::Config::default();
+                    let mut st = UiState { menu_open: true, menu_app: app,
+                        menu_pos: popup_position((120.0 * scale, 80.0 * scale), scale),
+                        menu_items: vec![("New window".into(), "new_window".into(), true)],
+                        ..Default::default() };
+                    for frame in 0..3 {
+                        let mut colors = None;
+                        let mut full = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0))),
+                            ..Default::default()
+                        }, |ui| {
+                            colors = Some(TermStyle::new(ui, ui.visuals().text_color(), ui.visuals().error_fg_color));
+                            ctx_menu(ui, &mut st, &cfg);
+                        });
+                        full.textures_delta.clear();
+                        if frame == 0 { continue; } // egui's initial sizing pass is invisible.
+                        let c = colors.unwrap();
+                        let surface = full.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(r) if r.fill == c.bg && r.stroke.color == c.border => Some(r),
+                            _ => None,
+                        }).expect("shared popup surface missing");
+                        assert!((surface.rect.left() - 120.0).abs() <= 1.0);
+                        assert!((surface.rect.top() - 80.0).abs() <= 1.0);
+                        assert_eq!(surface.corner_radius, egui::CornerRadius::same(9));
+                        full.textures_delta.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_filters_reject_blank_commands() {
+        for cmd in ["", "  ", "\t\n", "\u{2003}"] {
+            let row = HistoryRow { seq: 1, cmd: cmd.into(), exit: Some(0), done: true,
+                alt_seen: false, lines: 0, time: String::new(), duration: String::new() };
+            for filter in [HistoryFilter::All, HistoryFilter::Success, HistoryFilter::Error] {
+                assert!(!history_visible(&row, filter, ""));
+            }
+        }
+    }
+
+    #[test]
+    fn application_info_owns_keyboard_and_escape_restores_terminal_input() {
+        for page in [InfoPage::Shortcuts, InfoPage::About] {
+            let ctx = Context::default();
+            let cfg = crate::config::Config::default();
+            let mut st = UiState { info_page: Some(page), ..Default::default() };
+            assert!(st.owns_keyboard(&ctx));
+            for escape in [false, false, true] {
+                let mut full = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 300.0))),
+                    events: if escape { vec![egui::Event::Key {
+                        key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }] } else { vec![] },
+                    ..Default::default()
+                }, |ui| app_info(ui, &mut st, &cfg));
+                full.textures_delta.clear();
+            }
+            assert!(st.info_page.is_none());
+            assert!(!st.owns_keyboard(&ctx));
+        }
+    }
+
     /// One layout pass of the config panel at a given screen size.
     fn pass(ctx: &Context, w: f32, h: f32, open: bool) -> egui::FullOutput {
         let mut st = UiState::default();
@@ -2212,16 +2364,18 @@ mod regression {
             let tex = ctx.load_texture("preview", egui::ColorImage::new(
                 [tw as usize, th as usize], vec![egui::Color32::BLACK; (tw * th) as usize]), egui::TextureOptions::LINEAR);
             let cards: Vec<SwitcherCard> = (0..8).map(|i| SwitcherCard {
+                id: i,
                 title: format!("a much longer tab title number {i}"),
                 status: SwitcherStatus::Unknown,
                 active: i == 1,
                 marker: false,
                 cwd: Some("~/projects".into()),
-                thumb: Some((tex.clone(), (tw, th))),
+                thumb: Some((tex.id(), (tw, th))),
             }).collect();
             for selected in [7, 0, 7] {
                 let mut output = None;
-                for _ in 0..5 {
+                // Check final card containment after the shared transition settles.
+                for _ in 0..20 {
                     let mut full = ctx.run_ui(egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
                         ..Default::default()
