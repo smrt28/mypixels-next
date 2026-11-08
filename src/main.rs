@@ -336,6 +336,11 @@ struct Win {
     /// Tab cell ringing a red pulse after a BEL arrived unseen (drain_bell_pings).
     bell_pulse: Option<(usize, Instant)>,
     focused: bool,
+    /// Bumped whenever anything that can change the visible frame happens
+    /// (input, PTY output, blink, theme, tabs). Compared against the last
+    /// presented key to skip redundant presents that would otherwise feed the
+    /// compositor's configure->commit->configure loop.
+    frame_gen: u64,
 }
 
 struct App {
@@ -841,6 +846,7 @@ impl App {
         .min(win.tabs.len());
         win.tabs.insert(pos, tab);
         win.active = pos;
+        win.frame_gen = win.frame_gen.wrapping_add(1);
     }
 
     /// Handle what other mypixels processes asked of this session.
@@ -1093,6 +1099,7 @@ impl App {
         self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
         // Stable ids: find the id of the tab being removed
         self.wins[self.cur].tabs.remove(idx);
+        self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
         if self.wins[self.cur].tabs.is_empty() {
             // The last tab closes its WINDOW, not the application: a second
             // window must survive closing all of the first one's tabs.
@@ -1180,6 +1187,7 @@ impl App {
                 let font_changed = config.term_font != self.config.term_font || config.tablist_font != self.config.tablist_font;
                 self.config = config;
                 self.apply_config(font_changed);
+                self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
                 if let Some(watcher) = &self.theme_watcher { watcher.set_paths(self.config.theme_files.clone()); }
                 if let Some(window) = &self.wins[self.cur].window { window.request_redraw(); }
                 log::info!("configuration and colors reloaded");
@@ -2349,6 +2357,34 @@ impl App {
             }
             draws
         };
+        // Present-dedup key, computed before `egui_frame` takes the mutable
+        // borrows of `self.wins` and `full_output`. An identical frame with no
+        // live animation is not committed; skipping the commit starves the
+        // compositor's configure->commit->configure loop that would otherwise
+        // spin this window at vsync while idle.
+        let mut key: u64 = 0xcbf29ce484222325 ^ self.wins[self.cur].frame_gen.wrapping_mul(0x100000001b3);
+        for run in &frame.runs {
+            for b in run.text.as_bytes() {
+                key ^= *b as u64;
+                key = key.wrapping_mul(0x100000001b3);
+            }
+        }
+        if let Some((cx, cy)) = frame.cursor {
+            key = key.wrapping_add((cx as u64).wrapping_mul(0x100000001b3)).wrapping_add(cy as u64);
+        }
+        key = key.wrapping_add(if blink { 0x9e3779b97f4a7c15 } else { 0 });
+        for c in self.fg.iter().chain(self.bg.iter()) {
+            key ^= c.to_bits() as u64;
+            key = key.wrapping_mul(0x100000001b3);
+        }
+        // A live effect (bell, ripple, notice, switcher, egui animation) must
+        // keep presenting even when the key is stable, or it would freeze.
+        let force_present = bell_k > 0.0
+            || self.ripple.is_some()
+            || self.wins[self.cur].notice.is_some()
+            || self.wins[self.cur].overview.is_some()
+            || full_output.as_ref().is_some_and(|o| o.viewport_output.get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.repaint_delay < std::time::Duration::MAX));
         let egui_frame = match (full_output.as_mut(), self.wins[self.cur].egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
@@ -2369,7 +2405,7 @@ impl App {
             },
             _ => None,
         };
-        gpu.render_frame(&mut self.font_system, areas, jobs, window, egui_frame);
+        gpu.render_frame(&mut self.font_system, areas, jobs, window, egui_frame, key, force_present);
 
         // Finish the screenshot: read the offscreen frame (already rendered
         // this pass) at full resolution and hand a PNG to the clipboard.
@@ -2447,7 +2483,12 @@ impl App {
             // schedules its own redraw: a tab whose thumbnail cannot be built
             // (empty screen, signature 0) would otherwise keep `thumbs.len()`
             // below `n` and spin the loop at vsync forever.
-            if updated > 0 { window.request_redraw(); }
+            if updated > 0 {
+                // A new thumbnail changes the tab strip, so the last presented
+                // frame is stale.
+                self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
+                window.request_redraw();
+            }
             self.wins[self.cur].sw_thumbs = thumbs;
         }
         self.wins[self.cur].gpu = Some(gpu);
@@ -4234,6 +4275,7 @@ impl App {
                 notice: None,
                 bell_pulse: None,
                 focused: true,
+                frame_gen: 0,
             });
             // The newest window is the one the user just asked for.
             self.cur = self.wins.len() - 1;
@@ -5115,6 +5157,12 @@ impl ApplicationHandler for App {
         let Some(window) = self.wins[self.cur].window.clone() else {
             return;
         };
+        // Any real input invalidates the last presented frame. RedrawRequested
+        // is excluded: it is the compositor's echo, not a change, and bumping
+        // on it would defeat the present-dedup.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
+        }
         // Decide ownership BEFORE enqueueing the key. egui-winit always
         // consumes Tab and queues it for focus traversal, even with no editor
         // focused. Passing it through after enqueueing would let one Tab both

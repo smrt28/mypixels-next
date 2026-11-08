@@ -280,6 +280,10 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// Signature of the last frame actually presented. A redraw whose key
+    /// matches this and has no live animation is not committed, which breaks
+    /// the compositor's configure->commit->configure feedback loop.
+    pub present_key: u64,
     /// True when the compositor will blend our alpha with whatever is behind the
     /// window, which is the only situation where a translucent terminal
     /// background is possible at all.
@@ -705,6 +709,7 @@ impl Gpu {
             queue,
             surface,
             config,
+            present_key: 0,
             rect_pipeline,
             rect_buffer,
             viewport,
@@ -1120,6 +1125,8 @@ impl Gpu {
         previews: Vec<PreviewJob>,
         window: &Window,
         mut egui: Option<crate::egui_ui::EguiFrame<'_>>,
+        frame_key: u64,
+        force_present: bool,
     ) {
         let (w, h) = (self.config.width, self.config.height);
         let size = self.prev_size;
@@ -1302,12 +1309,20 @@ impl Gpu {
         for cb in egui_updates.into_iter().flatten() {
             self.queue.submit(Some(cb));
         }
-        // Wayland uses this to request the compositor's next frame callback.
-        // Without it a busy PTY can drive redraws as fast as the CPU can submit
-        // them, even when those frames can never be displayed.
-        window.pre_present_notify();
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame_tex);
+        // A redraw whose frame is identical to the last one presented, with no
+        // live animation, is not committed. Skipping the commit starves the
+        // compositor's configure->commit->configure feedback loop, which would
+        // otherwise spin this window at vsync while idle.
+        let present = force_present || frame_key != self.present_key;
+        if present {
+            // Wayland uses this to request the compositor's next frame callback.
+            // Without it a busy PTY can drive redraws as fast as the CPU can
+            // submit them, even when those frames can never be displayed.
+            window.pre_present_notify();
+            self.present_key = frame_key;
+            self.queue.submit(Some(encoder.finish()));
+            self.queue.present(frame_tex);
+        }
         let _ = (w, h);
     }
 
