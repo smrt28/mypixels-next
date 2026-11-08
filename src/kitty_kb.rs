@@ -350,12 +350,11 @@ pub fn encode(i: &Input) -> Option<Vec<u8>> {
             }
         },
         Key::Named(n) => {
-            // Keys with no legacy form: CSI u whenever they can be sent.
+            // Keys with no legacy form (F13-F24, lock, media): the spec
+            // allows ignoring them, and parsers without the PUA table (pi)
+            // print the codepoint as text - so they ride only on
+            // report-all-keys, where the app asked for everything.
             if let Some(cp) = named_u(n.clone()) {
-                if i.release && i.flags & EVENT_TYPES == 0 {
-                    return Some(Vec::new());
-                }
-                // Modifier keys report only under report-all-keys.
                 let is_modifier = matches!(
                     n,
                     NamedKey::Shift
@@ -365,7 +364,14 @@ pub fn encode(i: &Input) -> Option<Vec<u8>> {
                         | NamedKey::Hyper
                         | NamedKey::Meta
                 );
-                if is_modifier && i.flags & ALL_KEYS == 0 {
+                if i.flags & ALL_KEYS == 0 {
+                    return if is_modifier || i.release {
+                        Some(Vec::new())
+                    } else {
+                        None
+                    };
+                }
+                if i.release && i.flags & EVENT_TYPES == 0 {
                     return Some(Vec::new());
                 }
                 return Some(csi_u(cp, m, &ev, "", None));
@@ -617,5 +623,23 @@ mod tests {
         i.physical = PhysicalKey::Code(KeyCode::Numpad4);
         i.location = KeyLocation::Numpad;
         assert_eq!(s(&encode(&i).unwrap()), "ESC[57403u");
+    }
+
+    #[test]
+    fn no_legacy_form_keys_stay_silent_without_all_keys() {
+        // pi pushes flags 7 (no all-keys); a PUA codepoint there becomes
+        // visible text in the prompt, so lock keys must be pure silence,
+        // press and release alike.
+        let caps = Key::Named(NamedKey::CapsLock);
+        assert!(encode(&mk(&caps, None, 7)).is_none());
+        let mut caps_rel = mk(&caps, None, 7);
+        caps_rel.release = true;
+        assert_eq!(encode(&caps_rel).unwrap(), Vec::<u8>::new());
+        let num = Key::Named(NamedKey::NumLock);
+        assert!(encode(&mk(&num, None, 1)).is_none());
+        let f13 = Key::Named(NamedKey::F13);
+        assert!(encode(&mk(&f13, None, 0)).is_none());
+        // Under report-all-keys the app asked for everything and gets it.
+        assert_eq!(s(&encode(&mk(&caps, None, 8)).unwrap()), "ESC[57358u");
     }
 }

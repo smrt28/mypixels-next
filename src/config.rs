@@ -110,6 +110,9 @@ pub struct Config {
     /// single factor is the whole setting.
     pub tab_overview_scale: f32,
     pub focus_new_tabs: bool,
+    /// Where a new tab lands: `next` (right of the current tab, the
+    /// default), `end` (after the last tab) or `first` (at the start).
+    pub new_tab_position: String,
     pub hide_single_tab: bool,
     /// OSC 133 semantic shell integration: fold the shell's prompt/command
     /// marks into navigable command blocks (scripts/shell_integration.*).
@@ -241,6 +244,7 @@ impl Default for Config {
             tab_overview_delay_ms: 500,
             tab_overview_scale: 0.25,
             focus_new_tabs: true,
+            new_tab_position: "next".to_string(),
             hide_single_tab: false,
             osc133: true,
             kitty_compatible: true,
@@ -397,6 +401,7 @@ impl Config {
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
             ("tab_overview_scale".into(), self.tab_overview_scale.to_string()),
             ("focus_new_tabs".into(), self.focus_new_tabs.to_string()),
+            ("new_tab_position".into(), str_(&self.new_tab_position)),
             ("hide_single_tab".into(), self.hide_single_tab.to_string()),
             ("osc133".into(), self.osc133.to_string()),
             ("kitty_compatible".into(), self.kitty_compatible.to_string()),
@@ -645,6 +650,15 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "focus_new_tabs" => {
                     if let Some(b) = val.as_bool() {
                         cfg.focus_new_tabs = b;
+                    }
+                },
+                "new_tab_position" => {
+                    if let Some(s) = val.as_str() {
+                        if matches!(s, "next" | "end" | "first") {
+                            cfg.new_tab_position = s.to_string();
+                        } else {
+                            eprintln!("bad new_tab_position value: {s:?} (expected next, end or first)");
+                        }
                     }
                 },
                 "hide_single_tab" => {

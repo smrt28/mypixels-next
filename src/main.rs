@@ -830,8 +830,16 @@ impl App {
             // because 0 in the environment means "standalone, stay out".
             self.cur as u32 + 1,
         );
-        self.wins[self.cur].tabs.push(tab);
-        self.wins[self.cur].active = self.wins[self.cur].tabs.len() - 1;
+        // Placement is a setting: `next` (default) lands the tab right of
+        // the current one, `end` after the last, `first` at the start.
+        let win = &mut self.wins[self.cur];
+        let pos = match self.config.new_tab_position.as_str() {
+            "end" => win.tabs.len(),
+            "first" => 0,
+            _ => win.active + 1,
+        };
+        win.tabs.insert(pos, tab);
+        win.active = pos;
     }
 
     /// Handle what other mypixels processes asked of this session.

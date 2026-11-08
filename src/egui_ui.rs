@@ -1554,6 +1554,22 @@ pub fn config_window(
                                     checkbox_row(ui, "Multiline tabs", &mut cfg.multiline_tabs, &mut ev);
                                     checkbox_row(ui, "Hide single tab", &mut cfg.hide_single_tab, &mut ev);
                                     checkbox_row(ui, "Focus new tabs", &mut cfg.focus_new_tabs, &mut ev);
+                                    row(ui, "New tab position", |ui| {
+                                        let mut chosen = cfg.new_tab_position.clone();
+                                        egui::ComboBox::from_id_salt("new_tab_position")
+                                            .popup_style((**ui.style()).clone().into())
+                                            .width(140.0)
+                                            .selected_text(&cfg.new_tab_position)
+                                            .show_ui(ui, |ui| {
+                                                for name in ["next", "end", "first"] {
+                                                    ui.selectable_value(&mut chosen, name.to_string(), name);
+                                                }
+                                            });
+                                        if chosen != cfg.new_tab_position {
+                                            cfg.new_tab_position = chosen;
+                                            ev.apply = true;
+                                        }
+                                    });
                                     checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, &mut ev);
                                 });
                             });
