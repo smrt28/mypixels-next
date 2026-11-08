@@ -1,7 +1,7 @@
 foreground_color: '#f8f6f2'
 background_color: '#141413'
 cursor_color: '#fade3e'
-selection_color: '#ff9eb8'
+selection_color: '#aeee00'
 accent_color: '#ff9eb8'
 # Palette, by name from the badwolf theme:
 #   blackestgravel  taffy    lime     dale's pale  tardis   dress   salt watertaffy  brightgravel
