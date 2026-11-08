@@ -48,6 +48,7 @@ pub struct SpikeListener {
     /// (tab_id, time) of every BEL, for the app to turn into "a window you
     /// are not looking at has news": attention + tab-strip pulse.
     pub bells: Arc<Mutex<Vec<(usize, std::time::Instant)>>>,
+    pub notifications: Arc<Mutex<Vec<crate::notifications::Raw>>>,
     /// Complete APC strings as dispatched: (tab_id, bytes, abs line, col).
     /// The Kitty graphics protocol arrives this way; interpretation is the
     /// application's `kitty::TabKitty` state machine's job.
@@ -110,6 +111,14 @@ impl EventListener for SpikeListener {
                     tab_id: self.tab_id, code, exit, line, row, col, alt, command,
                     when: std::time::SystemTime::now(),
                 });
+                self.notify_window();
+            },
+            Event::Notification { protocol, data } => {
+                let mut queue = self.notifications.lock().unwrap();
+                if queue.len() < 64 {
+                    queue.push(crate::notifications::Raw { tab_id: self.tab_id, protocol, data });
+                }
+                drop(queue);
                 self.notify_window();
             },
             Event::Bell => {
@@ -195,6 +204,7 @@ impl Tab {
             last_activity: Arc::clone(&shared.last_activity),
             bell: Arc::clone(&shared.bell),
             bells: Arc::clone(&shared.bells),
+            notifications: Arc::clone(&shared.notifications),
             sems: Arc::clone(&shared.sems),
             apcs: Arc::clone(&shared.apcs),
             pty_writes: Arc::clone(&shared.pty_writes),

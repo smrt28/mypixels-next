@@ -8,6 +8,7 @@ use glyphon::{Buffer, Cache, ColorMode, FontSystem, Metrics, Resolution, SwashCa
 use winit::window::Window;
 
 use crate::MAX_RUNS;
+use crate::{damage::Damage, TerminalStyle};
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -136,10 +137,22 @@ struct PreviewSlot {
     bind: wgpu::BindGroup,
 }
 
+/// Decorations are application state, outside Alacritty's damage tracker.
+#[derive(Default)]
+pub struct TerminalOverlays {
+    pub selection: Vec<(usize, usize, usize)>,
+    pub cursor: Option<(u32, u32)>,
+    pub underline: Option<(f32, f32, f32)>,
+    pub notice: Option<String>,
+    pub images: Vec<ImageQuad>,
+}
+
 /// An offscreen frame to render this frame: which tab's target to draw into,
 /// the rects and terminal runs for it.
 pub struct PreviewJob {
     pub idx: usize,
+    pub scissors: Vec<[u32; 4]>,
+    pub images: Vec<ImageQuad>,
     pub bounds: glyphon::TextBounds,
     pub text: Vec<PreviewText>,
     pub rects: Vec<RectVertex>,
@@ -184,6 +197,8 @@ pub struct PrevVertex {
     pos: [f32; 2],
     uv: [f32; 2],
     half: [f32; 2],
+    /// Thumbnail backdrop; alpha zero selects an exact live-frame copy.
+    backdrop: [f32; 4],
 }
 
 const PREV_VS_WGSL: &str = r#"
@@ -191,12 +206,14 @@ struct VSOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) half: vec2<f32>,
+    @location(2) backdrop: vec4<f32>,
 };
 @vertex
 fn vs(@location(0) pos: vec2<f32>,
       @location(1) uv: vec2<f32>,
-      @location(2) half: vec2<f32>) -> VSOut {
-    return VSOut(vec4<f32>(pos, 0.0, 1.0), uv, half);
+      @location(2) half: vec2<f32>,
+      @location(3) backdrop: vec4<f32>) -> VSOut {
+    return VSOut(vec4<f32>(pos, 0.0, 1.0), uv, half, backdrop);
 }
 "#;
 
@@ -207,12 +224,16 @@ struct VSIn {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) half: vec2<f32>,
+    @location(2) backdrop: vec4<f32>,
 };
 // 4x4 box filter. Bilinear alone samples one texel in eight at this ratio and
 // aliases worse than the colour blocks it replaces, so every destination pixel
 // averages the whole source region it covers.
 @fragment
 fn fs(i: VSIn) -> @location(0) vec4<f32> {
+    if (all(i.half == vec2<f32>(0.0))) {
+        return textureSampleLevel(tex, samp, i.uv, 0.0);
+    }
     var acc = vec4<f32>(0.0);
     for (var y: i32 = 0; y < 4; y = y + 1) {
         for (var x: i32 = 0; x < 4; x = x + 1) {
@@ -220,7 +241,9 @@ fn fs(i: VSIn) -> @location(0) vec4<f32> {
             acc = acc + textureSampleLevel(tex, samp, i.uv + f * i.half * vec2<f32>(2.0, 2.0), 0.0);
         }
     }
-    return acc / 16.0;
+    let color = acc / 16.0;
+    // Tab textures retain their window alpha; thumbnails are opaque pictures.
+    return vec4<f32>(color.rgb + (1.0 - color.a) * i.backdrop.rgb, 1.0);
 }
 "#;
 
@@ -228,6 +251,7 @@ fn fs(i: VSIn) -> @location(0) vec4<f32> {
 /// the UV sub-rect it shows (the visible part after viewport clipping), and
 /// the texture cache key (tab, image id, generation). The caller builds
 /// these from its graphics state; nothing below `Gpu` knows the protocol.
+#[derive(Clone, PartialEq)]
 pub struct ImageQuad {
     pub key: (u32, u32, u32),
     pub dst: [f32; 4],
@@ -280,10 +304,12 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
-    /// Signature of the last frame actually presented. A redraw whose key
-    /// matches this and has no live animation is not committed, which breaks
-    /// the compositor's configure->commit->configure feedback loop.
-    pub present_key: u64,
+    /// UI generation last presented; terminal changes use damage instead.
+    present_generation: Option<u64>,
+    present_terminal: Option<(usize, u64)>,
+    clear_pipeline: wgpu::RenderPipeline,
+    clear_buffer: wgpu::Buffer,
+    composite_quad: wgpu::Buffer,
     /// True when the compositor will blend our alpha with whatever is behind the
     /// window, which is the only situation where a translucent terminal
     /// background is possible at all.
@@ -297,42 +323,32 @@ pub struct Gpu {
     pub rects: Vec<RectVertex>,
     /// Pooled cosmic_text buffers for terminal runs (stable addresses).
     pub pool: Vec<Buffer>,
-    /// Per-slot signature of what each pooled buffer currently holds. Lets an
-    /// unchanged run skip shaping, which is the single most expensive thing a
-    /// frame does (see `run_sig`).
-    pub slot_sig: Vec<u64>,
     /// Single buffer for terminal notices (terminal font metrics).
     pub prompt_buf: Buffer,
-    // --- Overview previews: real terminal frames, sampled down -------------
-    /// Each tab has its own run buffers, using the live terminal's metrics
-    /// and shaping path. They cannot alias the window's buffers.
+    // --- Retained terminal targets, shared by live display and previews ----
+    /// Scratch buffers for background damage batches. The active terminal
+    /// uses the window pool; both rasterize into these same per-tab targets.
     pub prev_bufs: Vec<Vec<Buffer>>,
-    /// Shaped content signature per preview buffer, so an unchanged screen is
-    /// only re-drawn, never re-shaped.
-    pub prev_sigs: Vec<u64>,
-    /// When each preview was last rebuilt, for the per-tab throttle, and the
-    /// rotating cursor that decides who goes next when there is a backlog.
+    /// Damage queues survive throttled background preparation.
+    pub prev_damage: Vec<Damage>,
+    pub prev_revision: Vec<u64>,
+    pub prev_styles: Vec<Option<TerminalStyle>>,
+    pub overlays: Vec<TerminalOverlays>,
     pub prev_last: Vec<Instant>,
+    tab_ids: Vec<usize>,
+    next_revision: u64,
     prev_sampler: wgpu::Sampler,
     prev_bgl: wgpu::BindGroupLayout,
     prev_pipeline: wgpu::RenderPipeline,
-    /// Backing for `prev_viewport` (a glyphon Cache is a uniform buffer).
-    prev_cache: Cache,
     previews: Vec<Option<PreviewSlot>>,
     /// Reused box-filter quad for GPU-resident thumbnail updates.
     prev_stage_quad: Option<wgpu::Buffer>,
-    /// Viewport over the offscreen targets, so the same `TextRenderer` can draw
-    /// into them: same format, so no second atlas is needed.
-    prev_viewport: Option<Viewport>,
     prev_size: (u32, u32),
     // --- Kitty images ------------------------------------------------------
     img_pipeline: wgpu::RenderPipeline,
     img_buffer: wgpu::Buffer,
     img_cache: std::collections::HashMap<(u32, u32, u32), ImgSlot>,
-    /// Images to paint in the next frame; the caller rebuilds this every
-    /// frame from its graphics state (placements are few and cheap to
-    /// re-derive, and staleness would mean images frozen mid-scroll).
-    pub images: Vec<ImageQuad>,
+
 }
 
 pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -511,6 +527,11 @@ impl Gpu {
                             shader_location: 2,
                             format: wgpu::VertexFormat::Float32x2,
                         },
+                        wgpu::VertexAttribute {
+                            offset: 24,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
                     ],
                 })],
             },
@@ -538,7 +559,6 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
-        let prev_cache = Cache::new(&device);
         let cache = Cache::new(&device);
         // ColorMode::Web passes the text color through as-is. Accurate would
         // apply an sRGB->linear conversion in the shader, which would mismatch
@@ -632,6 +652,21 @@ impl Gpu {
             })
         };
         let rect_buffer = make_rect_buffer(&device, "rects");
+        // Replacement blending is essential: transparent clears must erase the
+        // old glyphs and alpha rather than blend repeatedly into retained pixels.
+        let clear_pipeline = make_rect_pipeline("damage clear", None);
+        let clear_buffer = make_rect_buffer(&device, "damage clear");
+        queue.write_buffer(&clear_buffer, 0, bytemuck::cast_slice(&rect_vertices(
+            0.0, 0.0, 1.0, 1.0, [0.0; 4], 0.0, 1.0, 1.0,
+        )));
+        let composite_quad = make_rect_buffer(&device, "terminal composite");
+        let vertex = |pos, uv| PrevVertex { pos, uv, half: [0.0; 2], backdrop: [0.0; 4] };
+        let quad = [
+            vertex([-1.0, 1.0], [0.0, 0.0]), vertex([1.0, 1.0], [1.0, 0.0]),
+            vertex([1.0, -1.0], [1.0, 1.0]), vertex([-1.0, 1.0], [0.0, 0.0]),
+            vertex([1.0, -1.0], [1.0, 1.0]), vertex([-1.0, -1.0], [0.0, 1.0]),
+        ];
+        queue.write_buffer(&composite_quad, 0, bytemuck::cast_slice(&quad));
 
         let pool: Vec<Buffer> = (0..MAX_RUNS)
             .map(|_| Buffer::new(font_system, Metrics::new(font_px, font_lh)))
@@ -709,7 +744,9 @@ impl Gpu {
             queue,
             surface,
             config,
-            present_key: 0,
+            present_generation: None,
+            present_terminal: None,
+            clear_pipeline, clear_buffer, composite_quad,
             rect_pipeline,
             rect_buffer,
             viewport,
@@ -718,23 +755,24 @@ impl Gpu {
             text_renderer,
             rects: Vec::with_capacity(1024),
             pool,
-            slot_sig: vec![0u64; MAX_RUNS],
             alpha_ok,
             prev_bufs: Vec::new(),
-            prev_sigs: Vec::new(),
+            prev_damage: Vec::new(),
+            prev_revision: Vec::new(),
+            prev_styles: Vec::new(),
+            overlays: Vec::new(),
+            tab_ids: Vec::new(),
+            next_revision: 0,
             prev_stage_quad: None,
             prev_last: Vec::new(),
             prev_sampler,
             prev_bgl,
             prev_pipeline,
-            prev_cache,
             previews: Vec::new(),
-            prev_viewport: None,
             prev_size: (0, 0),
             img_pipeline,
             img_buffer,
             img_cache: std::collections::HashMap::new(),
-            images: Vec::new(),
             prompt_buf,
         }
     }
@@ -838,15 +876,15 @@ impl Gpu {
     /// the background) and before the glyphs (text stays readable on top).
     /// Bind groups are cloned (each is an Arc) so the pass borrow and the
     /// cache read do not fight over `self`.
-    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, wf: f32, hf: f32) {
-        if self.images.is_empty() {
+    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, images: &[ImageQuad], wf: f32, hf: f32) {
+        if images.is_empty() {
             return;
         }
         let clip = |px: f32, py: f32| -> [f32; 2] {
             [(px / wf) * 2.0 - 1.0, 1.0 - (py / hf) * 2.0]
         };
-        let mut verts: Vec<ImgVertex> = Vec::with_capacity(self.images.len() * 6);
-        for q in &self.images {
+        let mut verts: Vec<ImgVertex> = Vec::with_capacity(images.len() * 6);
+        for q in images {
             let [x, y, w, h] = q.dst;
             let (u0, v0, u1, v1) = (q.uv[0], q.uv[1], q.uv[2], q.uv[3]);
             let v = |px: f32, py: f32, u: f32, vv: f32| ImgVertex {
@@ -873,9 +911,7 @@ impl Gpu {
             });
         }
         self.queue.write_buffer(&self.img_buffer, 0, bytemuck::cast_slice(&verts));
-        let binds: Vec<Option<wgpu::BindGroup>> = self
-            .images
-            .iter()
+        let binds: Vec<Option<wgpu::BindGroup>> = images.iter()
             .map(|q| self.img_cache.get(&q.key).map(|s| s.bind.clone()))
             .collect();
         pass.set_pipeline(&self.img_pipeline.clone());
@@ -891,10 +927,40 @@ impl Gpu {
         }
     }
 
-    pub fn set_prev_sig(&mut self, idx: usize, sig: u64) {
-        if let Some(s) = self.prev_sigs.get_mut(idx) {
-            *s = sig;
+    pub fn invalidate_terminals(&mut self) {
+        self.prev_damage.fill(Damage::full());
+        self.prev_styles.fill(None);
+    }
+
+    /// Receiver for the terminal snapshot's damage callback. Rendering the
+    /// active tab and preparing a delayed background preview share this queue.
+    pub fn damage_terminal(&mut self, idx: usize, damage: &Damage) {
+        self.prev_damage[idx].merge(damage);
+    }
+
+    pub fn update_overlays(&mut self, idx: usize, next: TerminalOverlays, rows: usize, cell_h: f32, strip_h: f32) {
+        let old = &self.overlays[idx];
+        let damage = &mut self.prev_damage[idx];
+        if next.selection != old.selection {
+            for &(row, _, _) in next.selection.iter().chain(&old.selection) { damage.add_line(row); }
         }
+        if next.cursor != old.cursor {
+            for &(_, row) in next.cursor.iter().chain(old.cursor.iter()) { damage.add_line(row as usize); }
+        }
+        if next.underline != old.underline {
+            for &(_, y, _) in next.underline.iter().chain(old.underline.iter()) {
+                damage.add_line(((y - strip_h) / cell_h).max(0.0) as usize);
+            }
+        }
+        if next.notice != old.notice { damage.add_line(rows.saturating_sub(1)); }
+        if next.images != old.images {
+            for image in next.images.iter().chain(&old.images) {
+                let start = ((image.dst[1] - strip_h) / cell_h).floor().max(0.0) as usize;
+                let end = ((image.dst[1] + image.dst[3] - strip_h) / cell_h).ceil().max(0.0) as usize;
+                for row in start..end.min(rows) { damage.add_line(row); }
+            }
+        }
+        self.overlays[idx] = next;
     }
 
     /// Downsample directly into a persistent GPU thumbnail. The box filter
@@ -923,36 +989,44 @@ impl Gpu {
         // One destination pixel covers 1/tw (x) and (1-top_frac)/th (y) of
         // the texture in UV: the box filter's half-width.
         let half = [0.5 / tw as f32, 0.5 * (1.0 - top_frac) / th as f32];
+        let bg = self.prev_styles.get(idx)?.as_ref()?.bg;
+        let backdrop = [bg[0], bg[1], bg[2], 1.0];
         let quad: [PrevVertex; 6] = [
             PrevVertex {
                 pos: [-1.0, 1.0],
                 uv: [0.0, top_frac],
                 half,
+                backdrop,
             },
             PrevVertex {
                 pos: [1.0, 1.0],
                 uv: [1.0, top_frac],
                 half,
+                backdrop,
             },
             PrevVertex {
                 pos: [1.0, -1.0],
                 uv: [1.0, 1.0],
                 half,
+                backdrop,
             },
             PrevVertex {
                 pos: [-1.0, 1.0],
                 uv: [0.0, top_frac],
                 half,
+                backdrop,
             },
             PrevVertex {
                 pos: [1.0, -1.0],
                 uv: [1.0, 1.0],
                 half,
+                backdrop,
             },
             PrevVertex {
                 pos: [-1.0, -1.0],
                 uv: [0.0, 1.0],
                 half,
+                backdrop,
             },
         ];
         if self.prev_stage_quad.is_none() {
@@ -1062,24 +1136,49 @@ impl Gpu {
         Some(rgba)
     }
 
-    pub fn ensure_previews(&mut self, n: usize, size: (u32, u32)) {
+    /// Persistent tab targets follow stable ids through insertion and reordering.
+    /// The active terminal, thumbnails, and explicit exports all use these.
+    pub fn ensure_previews(&mut self, ids: &[usize], size: (u32, u32)) {
         let (w, h) = size;
-        if w == 0 || h == 0 {
-            return;
+        if w == 0 || h == 0 { return; }
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(old) = self.tab_ids.iter().position(|old| old == id) {
+                self.tab_ids.swap(i, old);
+                self.previews.swap(i, old);
+                self.prev_bufs.swap(i, old);
+                self.prev_damage.swap(i, old);
+                self.prev_revision.swap(i, old);
+                self.prev_styles.swap(i, old);
+                self.overlays.swap(i, old);
+                self.prev_last.swap(i, old);
+            } else {
+                self.tab_ids.insert(i, *id);
+                self.previews.insert(i, None);
+                self.prev_bufs.insert(i, Vec::new());
+                self.prev_damage.insert(i, Damage::full());
+                self.prev_revision.insert(i, 0);
+                self.prev_styles.insert(i, None);
+                self.overlays.insert(i, TerminalOverlays::default());
+                self.prev_last.insert(i, Instant::now());
+            }
         }
+        let n = ids.len();
+        self.tab_ids.truncate(n);
+        self.previews.truncate(n);
+        self.prev_bufs.truncate(n);
+        self.prev_damage.truncate(n);
+        self.prev_revision.truncate(n);
+        self.prev_styles.truncate(n);
+        self.overlays.truncate(n);
+        self.prev_last.truncate(n);
         if self.prev_size != size {
-            self.previews.clear();
-            self.prev_sigs.fill(0);
+            self.previews.iter_mut().for_each(|slot| *slot = None);
+            self.prev_revision.fill(0);
+            self.invalidate_terminals();
             self.prev_size = size;
-            self.prev_viewport = Some(Viewport::new(&self.device, &self.prev_cache));
         }
-        while self.prev_bufs.len() < n {
-            self.prev_bufs.push(Vec::new());
-            self.prev_sigs.push(0);
-            self.prev_last.push(Instant::now());
-        }
-        while self.previews.len() < n {
-            let i = self.previews.len();
+        for i in 0..n {
+            if self.previews[i].is_some() { continue; }
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("preview"),
                 size: wgpu::Extent3d {
@@ -1110,220 +1209,144 @@ impl Gpu {
                 ],
             });
             log::debug!("preview target {i}: {w}x{h}");
-            self.previews.push(Some(PreviewSlot {
+            self.previews[i] = Some(PreviewSlot {
                 _tex: tex,
                 view,
                 bind,
-            }));
+            });
         }
     }
 
+    /// Rasterize only damaged bands into a retained tab texture. Live and
+    /// background preparation use the same pass, atlas, and clipping rules.
+    fn render_terminal(
+        &mut self,
+        font_system: &mut FontSystem,
+        idx: usize,
+        areas: Vec<TextArea<'_>>,
+        rects: &[RectVertex],
+        scissors: &[[u32; 4]],
+        images: &[ImageQuad],
+    ) {
+        if scissors.is_empty() { return; }
+        let view = self.previews[idx].as_ref().expect("tab target").view.clone();
+        let viewport = &self.viewport;
+        let has_text = !areas.is_empty();
+        if has_text {
+            self.text_renderer.prepare(
+                &self.device, &self.queue, font_system, &mut self.atlas,
+                viewport, areas, &mut self.swash_cache,
+            ).expect("prepare terminal damage");
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terminal damage"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("terminal damage"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None, timestamp_writes: None,
+                occlusion_query_set: None, multiview_mask: None,
+            });
+            for &[x, y, w, h] in scissors {
+                pass.set_scissor_rect(x, y, w, h);
+                pass.set_pipeline(&self.clear_pipeline);
+                pass.set_vertex_buffer(0, self.clear_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+                self.draw_rects(&mut pass, rects);
+                self.draw_images(&mut pass, images, self.config.width as f32, self.config.height as f32);
+                if has_text {
+                    self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)
+                        .expect("render terminal damage");
+                }
+            }
+        }
+        // Submit before another target reuses the text/rect buffers.
+        self.queue.submit([encoder.finish()]);
+        self.next_revision += 1;
+        self.prev_revision[idx] = self.next_revision;
+        self.prev_last[idx] = Instant::now();
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
         font_system: &mut FontSystem,
         areas: Vec<glyphon::TextArea>,
+        images: Vec<ImageQuad>,
         previews: Vec<PreviewJob>,
         window: &Window,
         mut egui: Option<crate::egui_ui::EguiFrame<'_>>,
-        frame_key: u64,
+        active: usize,
+        live_scissors: Vec<[u32; 4]>,
+        generation: u64,
         force_present: bool,
     ) {
         let (w, h) = (self.config.width, self.config.height);
-        let size = self.prev_size;
-
-        // Real terminal frames into offscreen targets, before the main pass. Each
-        // job owns a buffer, so nothing here fights the main pass or the tiles for
-        // pool slots. Shaping already happened in the caller; this only positions
-        // and rasterises.
-        if !previews.is_empty() {
-            if let Some(vp) = self.prev_viewport.as_mut() {
-                vp.update(&self.queue, Resolution {
-                    width: size.0.max(1),
-                    height: size.1.max(1),
-                });
-            }
+        self.viewport.update(&self.queue, Resolution { width: w, height: h });
+        for job in previews {
+            // Take ownership while preparing; no references into a vector that
+            // can be mutated or reallocated by the shared target renderer.
+            let buffers = std::mem::take(&mut self.prev_bufs[job.idx]);
+            let areas = buffers.iter().zip(&job.text).map(|(buffer, run)| {
+                terminal_text_area(buffer, run.left, run.top, run.color, job.bounds)
+            }).collect();
+            self.render_terminal(font_system, job.idx, areas, &job.rects, &job.scissors, &job.images);
+            self.prev_bufs[job.idx] = buffers;
         }
-        for job in previews.iter() {
-            let pview = match self.previews.get(job.idx) {
-                Some(Some(slot)) => slot.view.clone(),
-                _ => continue,
-            };
-            let buf = match self.prev_bufs.get(job.idx) {
-                Some(b) => b,
-                None => continue,
-            };
-            let mut penc =
-                self.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("preview"),
-                    });
-            {
-                let mut ppass = penc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("preview"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &pview,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            // Opaque: the window background rect carries the
-                            // see-through alpha, and a translucent thumbnail is
-                            // just mud. The tile quad is drawn without blending.
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                if !job.rects.is_empty() {
-                    let need = job.rects.len() * std::mem::size_of::<RectVertex>();
-                    if need > self.rect_buffer.size() as usize {
-                        self.rect_buffer =
-                            self.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("rects"),
-                                size: ((need * 2) as u64).next_multiple_of(4096),
-                                usage: wgpu::BufferUsages::VERTEX
-                                    | wgpu::BufferUsages::COPY_DST,
-                                mapped_at_creation: false,
-                            });
-                    }
-                    let pipeline = self.rect_pipeline.clone();
-                    draw_rects(
-                        &self.device,
-                        &self.queue,
-                        &mut ppass,
-                        &mut self.rect_buffer,
-                        &pipeline,
-                        &job.rects,
-                    );
-                }
-                if size.0 > 0 && size.1 > 0 {
-                    let areas = buf.iter().zip(&job.text).map(|(buffer, run)| {
-                        terminal_text_area(buffer, run.left, run.top, run.color, job.bounds)
-                    });
-                    if let Some(vp) = self.prev_viewport.as_mut() {
-                        let prep = self.text_renderer.prepare(
-                            &self.device,
-                            &self.queue,
-                            font_system,
-                            &mut self.atlas,
-                            vp,
-                            areas,
-                            &mut self.swash_cache,
-                        );
-                        if prep.is_ok() {
-                            let _ = self.text_renderer.render(&self.atlas, vp, &mut ppass);
-                        }
-                    }
-                }
-            }
-            self.queue.submit(Some(penc.finish()));
-        }
+        let rects = std::mem::take(&mut self.rects);
+        self.render_terminal(font_system, active, areas, &rects, &live_scissors, &images);
+        self.rects = rects;
 
+        // A compositor redraw with no damage or UI change must not generate a
+        // fresh commit. Still apply/free egui texture deltas on skipped frames.
+        let terminal_revision = (self.tab_ids[active], self.prev_revision[active]);
+        if self.present_terminal == Some(terminal_revision)
+            && self.present_generation == Some(generation) && !force_present {
+            if let Some(e) = egui.as_mut() {
+                crate::egui_ui::apply_textures(&self.device, &self.queue, e.renderer, e.full);
+            }
+            return;
+        }
         let frame_tex = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            other => {
-                if matches!(other, wgpu::CurrentSurfaceTexture::Timeout) {
-                    log::debug!("surface timeout, will retry");
-                }
-                window.request_redraw();
-                return;
-            },
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => { window.request_redraw(); return; },
         };
         let view = frame_tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-
-        // egui's buffers and textures must be in place before the pass that
-        // samples them, and their copies run before this encoder's submit.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let egui_updates = egui.as_mut().map(|e| {
-            let cbs = e
-                .renderer
-                .update_buffers(&self.device, &self.queue, &mut encoder, &e.paint_jobs, &e.screen);
-            // Texture deltas (the font atlas) before the pass samples them.
+            let cbs = e.renderer.update_buffers(&self.device, &self.queue, &mut encoder, &e.paint_jobs, &e.screen);
             crate::egui_ui::apply_textures(&self.device, &self.queue, e.renderer, e.full);
             cbs
         });
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
+                    view: &view, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
                 })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
+                depth_stencil_attachment: None, timestamp_writes: None,
+                occlusion_query_set: None, multiview_mask: None,
             });
-
-            // Phase 1: the base rects, then the live terminal text. The
-            // pipelines are cloned out first: draw_rects mutably borrows
-            // `self`, which the &self pipeline fields are still borrowed from.
-            let rects = std::mem::take(&mut self.rects);
-            self.draw_rects(&mut pass, &rects);
-            let (iwf, ihf) = (w as f32, h as f32);
-            self.draw_images(&mut pass, iwf, ihf);
-            if !areas.is_empty() {
-                self.text_renderer
-                    .prepare(
-                        &self.device,
-                        &self.queue,
-                        font_system,
-                        &mut self.atlas,
-                        &self.viewport,
-                        areas,
-                        &mut self.swash_cache,
-                    )
-                    .expect("prepare");
-                self.text_renderer
-                    .render(&self.atlas, &self.viewport, &mut pass)
-                    .expect("render");
-            }
-
-            // Last: egui on top of everything (the config window). It clears
-            // nothing -- the pass was cleared transparent and egui only paints
-            // its own widgets, so the hand-drawn frame shows through.
+            // Full-resolution sampling (zero filter footprint) copies the
+            // retained tab texture exactly, including its premultiplied alpha.
+            pass.set_pipeline(&self.prev_pipeline);
+            pass.set_bind_group(0, &self.previews[active].as_ref().unwrap().bind, &[]);
+            pass.set_vertex_buffer(0, self.composite_quad.slice(..));
+            pass.draw(0..6, 0..1);
             if let Some(e) = egui.as_ref() {
-                // egui-wgpu wants a 'static pass; forget_lifetime is safe
-                // (the encoder is locked while the pass is live) and this is
-                // the pass's last use.
                 e.renderer.render(&mut pass.forget_lifetime(), &e.paint_jobs, &e.screen);
             }
         }
-        for cb in egui_updates.into_iter().flatten() {
-            self.queue.submit(Some(cb));
-        }
-        // A redraw whose frame is identical to the last one presented, with no
-        // live animation, is not committed. Skipping the commit starves the
-        // compositor's configure->commit->configure feedback loop, which would
-        // otherwise spin this window at vsync while idle.
-        let present = force_present || frame_key != self.present_key;
-        if present {
-            // Wayland uses this to request the compositor's next frame callback.
-            // Without it a busy PTY can drive redraws as fast as the CPU can
-            // submit them, even when those frames can never be displayed.
-            window.pre_present_notify();
-            self.present_key = frame_key;
-            self.queue.submit(Some(encoder.finish()));
-            self.queue.present(frame_tex);
-        }
-        let _ = (w, h);
+        for cb in egui_updates.into_iter().flatten() { self.queue.submit([cb]); }
+        window.pre_present_notify();
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(frame_tex);
+        self.present_generation = Some(generation);
+        self.present_terminal = Some(terminal_revision);
     }
-
 }

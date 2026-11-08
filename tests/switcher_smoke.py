@@ -143,7 +143,7 @@ try:
     # Find the long cyan top edge of the selected card. Preview text does
     # not contain a continuous cyan run this long.
     edge = None
-    for y in range(100, selected.height - 80):
+    for y in range(40, selected.height - 80):
         start = None
         for x in range(selected.width):
             r, g, b = selected.getpixel((x, y))
@@ -174,7 +174,7 @@ try:
     opened()
     key('End')
     # Cached previews from the old size must not force the modal off-screen.
-    panel_color = image.getpixel((image.width // 2, 180))
+    panel_color = image.getpixel((image.width // 2, 35))
     def resized():
         small = shot('small-last-tab')
         return small.getpixel((small.width // 2, 35)) == panel_color

@@ -51,6 +51,9 @@ pub enum Event {
     /// Terminal bell ring.
     Bell,
 
+    /// OSC 9/99/777 desktop notification, interpreted by the application.
+    Notification { protocol: u16, data: String },
+
     /// Shutdown request.
     Exit,
 
@@ -114,6 +117,7 @@ impl Debug for Event {
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),
             Event::Bell => write!(f, "Bell"),
+            Event::Notification { protocol, .. } => write!(f, "Notification(OSC {protocol})"),
             Event::Semantic { .. } => write!(f, "Semantic"),
             Event::Apc { payload, .. } => write!(f, "Apc({} bytes)", payload.len()),
             Event::GraphicsReset => write!(f, "GraphicsReset"),

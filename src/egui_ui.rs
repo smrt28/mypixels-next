@@ -1046,7 +1046,11 @@ impl Egui {
         let response = self.state.on_window_event(window, event);
         // Unfocused menus still need a frame to process Escape. Repainting
         // and claiming terminal input are independent egui responses.
-        if response.repaint { window.request_redraw(); }
+        // RedrawRequested is the frame we are about to draw, not a request
+        // for another one. Echoing it would spin even with no terminal damage.
+        if response.repaint && !matches!(event, winit::event::WindowEvent::RedrawRequested) {
+            window.request_redraw();
+        }
         response.consumed
     }
 

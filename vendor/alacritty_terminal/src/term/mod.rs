@@ -476,6 +476,18 @@ impl<T> Term<T> {
     /// [`reset_damage`]: Self::reset_damage
     #[must_use]
     pub fn damage(&mut self) -> TermDamage<'_> {
+        self.damage_internal(true)
+    }
+
+    /// Damage for retained renderers which track cursor visibility themselves.
+    /// Unlike `damage`, an idle cursor does not dirty its cell on every query.
+    /// Cursor movement and writes to its cell are still included.
+    #[must_use]
+    pub fn damage_content(&mut self) -> TermDamage<'_> {
+        self.damage_internal(false)
+    }
+
+    fn damage_internal(&mut self, include_cursor: bool) -> TermDamage<'_> {
         // Ensure the entire terminal is damaged after entering insert mode.
         // Leaving is handled in the ansi handler.
         if self.mode.contains(TermMode::INSERT) {
@@ -496,8 +508,9 @@ impl<T> Term<T> {
             self.damage.damage_point(point);
         }
 
-        // Always damage current cursor.
-        self.damage_cursor();
+        if include_cursor {
+            self.damage_cursor();
+        }
 
         // NOTE: damage which changes all the content when the display offset is non-zero (e.g.
         // scrolling) is handled via full damage.
@@ -1202,6 +1215,17 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn osc_raw(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let Some(protocol) = params.first().and_then(|p| match *p {
+            b"9" => Some(9), b"99" => Some(99), b"777" => Some(777), _ => None,
+        }) {
+            if params.len() > 1 && params[1..].iter().map(|p| p.len() + 1).sum::<usize>() <= 16_384 {
+                let data = params[1..].join(&b';');
+                if let Ok(data) = String::from_utf8(data) {
+                    self.event_proxy.send_event(Event::Notification { protocol, data });
+                }
+            }
+            return;
+        }
         if params.len() < 2 || params[0] != b"133" {
             return;
         }

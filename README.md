@@ -53,6 +53,8 @@ Features
 * Tab switcher with cached GPU previews - hold Alt: each tab is a scaled,
   live view of its own terminal; arrows move the selection. Hover a tab for
   its preview. Selection and reordering animate in both the strip and switcher.
+* Partial terminal redraws from Alacritty damage, into persistent per-tab GPU
+  textures shared by the live window, previews, and image export.
 * Entanglement - one command, many tabs: toggle a tab into the group
   (Alt+Shift+*) and keystrokes land in all of them.
 * Tab colorization - mark a tab with a colour so it can be easily
@@ -65,6 +67,10 @@ Features
   quads in the grid and scrollback.
 * Kitty keyboard protocol - full disambiguation, with real key
   releases.
+* Desktop notifications from terminal applications over OSC 9, OSC 99, and
+  OSC 777. Clicking a notification returns to its originating tab. OSC 99
+  supports chunked titles/bodies, updates, close/activation reports, queries,
+  and focus/visibility filtering; desktop calls run off the UI thread.
 * Command observability - with the shell integration scripts (OSC
   133 marks) every command is captured with its output, exit status
   and location: Alt+Shift+H opens the history panel, and

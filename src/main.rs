@@ -6,6 +6,7 @@
 
 mod clipboard;
 mod config;
+mod damage;
 mod egui_ui;
 mod ui_style;
 mod tab_bar;
@@ -14,6 +15,7 @@ mod gpu;
 mod kitty;
 mod kitty_kb;
 mod mcp;
+mod notifications;
 mod tab;
 mod session;
 mod theme;
@@ -43,6 +45,7 @@ use winit::window::{Window, WindowId};
 
 use config::Config;
 use gpu::Gpu;
+use damage::Damage;
 use tab::{SemanticMark, SpikeListener, Tab};
 
 const HISTORY: usize = 10_000;
@@ -167,39 +170,11 @@ impl Palette {
 // Draw list (owned data copied out of the terminal under the lock)
 // ---------------------------------------------------------------------------
 
-/// What a run's shaped form depends on: the text, both colours, the font it is
-/// drawn with, and the width its buffer was sized to. Equal signatures mean the
-/// pooled glyph buffer is still exactly right, so shaping can be skipped -- and
-/// shaping is by far the most expensive part of a frame here.
-fn run_sig(run: &Run, cell_w: f32) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x100000001b3);
-    };
-    for b in run.text.as_bytes() {
-        mix(*b as u64);
-    }
-    for &(byte, column) in &run.cells {
-        mix(byte as u64);
-        mix(column as u64);
-    }
-    // Colour is part of the identity: a TUI repaints the same text in different
-    // colours, and a stale colour is a visible bug.
-    for c in run.fg.iter().chain(run.bg.iter()) {
-        mix((c.clamp(0.0, 1.0) * 255.0).round() as u64);
-    }
-    mix((cell_w * 1000.0).round() as u64);
-    mix(run.width as u64);
-    mix(run.attrs as *const Attrs<'static> as u64);
-    h
-}
-
-/// Escape hatch to A/B the shaping cache against re-shaping everything
-/// (`MYPIXELS_NOCACHE=1`).
-fn shaping_cache_enabled() -> bool {
+/// Diagnostic oracle for checking partial rendering against complete redraws.
+fn full_redraw_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MYPIXELS_NOCACHE").is_none())
+    *ON.get_or_init(|| std::env::var_os("MYPIXELS_FULL_REDRAW").is_some()
+        || std::env::var_os("MYPIXELS_NOCACHE").is_some())
 }
 
 /// Append a run, dropping the ones that could never draw anything: padding in
@@ -242,6 +217,19 @@ struct FrameData {
     cursor: Option<(u32, u32)>,
 }
 
+/// Exact rendering inputs outside Alacritty's cell damage tracking.
+#[derive(Clone, PartialEq)]
+pub(crate) struct TerminalStyle {
+    tab_id: usize,
+    size: (u32, u32),
+    cell: (f32, f32),
+    strip_h: f32,
+    fg: [f32; 3],
+    bg: [f32; 3],
+    cursor_color: [f32; 3],
+    transparency: f32,
+}
+
 /// The Alt-held visual tab switcher. Standalone overview is intentionally absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OverviewMode {
@@ -271,7 +259,7 @@ struct SwThumb {
     texture: wgpu::Texture,
     size: (u32, u32),
     pixels: (u32, u32),
-    sig: u64,
+    revision: u64,
 }
 
 /// Everything that lives "in a window": the surface and its GPU, this
@@ -336,10 +324,9 @@ struct Win {
     /// Tab cell ringing a red pulse after a BEL arrived unseen (drain_bell_pings).
     bell_pulse: Option<(usize, Instant)>,
     focused: bool,
-    /// Bumped whenever anything that can change the visible frame happens
-    /// (input, PTY output, blink, theme, tabs). Compared against the last
-    /// presented key to skip redundant presents that would otherwise feed the
-    /// compositor's configure->commit->configure loop.
+    occluded: bool,
+    /// UI generation, bumped on input and UI changes. Terminal contents and
+    /// cursor blink use damage; compositor redraw requests do not bump this.
     frame_gen: u64,
 }
 
@@ -420,6 +407,9 @@ struct App {
     bell: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// every BEL as (tab_id, time), drained into attention + pulses
     bell_pings: Arc<std::sync::Mutex<Vec<(usize, std::time::Instant)>>>,
+    notification_requests: Arc<Mutex<Vec<notifications::Raw>>>,
+    notification_parser: notifications::Parser,
+    desktop_notifications: notifications::Desktop,
     /// OSC 133 marks as dispatched, drained into per-tab command blocks
     sems_ring: Arc<std::sync::Mutex<Vec<SemanticMark>>>,
     /// Opens an order stamp per command (see `CommandBlock::seq`).
@@ -628,12 +618,18 @@ impl App {
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             bell: Arc::new(Mutex::new(None)),
             bells: Arc::new(Mutex::new(Vec::new())),
+            notifications: Arc::new(Mutex::new(Vec::new())),
             sems: Arc::new(Mutex::new(Vec::new())),
             apcs: Arc::new(Mutex::new(Vec::new())),
             pty_writes: Arc::new(Mutex::new(Vec::new())),
             resets: Arc::new(Mutex::new(Vec::new())),
             cell_sizes: Arc::new(Mutex::new(Vec::new())),
         };
+        let notification_requests = Arc::clone(&shared.notifications);
+        let notification_windows = Arc::clone(&window_slot);
+        let desktop_notifications = notifications::Desktop::new(Arc::new(move || {
+            for window in notification_windows.lock().unwrap().iter() { window.request_redraw(); }
+        }));
         let bells = Arc::clone(&shared.bells);
         let sems = Arc::clone(&shared.sems);
         let apcs = Arc::clone(&shared.apcs);
@@ -743,6 +739,9 @@ impl App {
             last_activity,
             bell,
             bell_pings: bells,
+            notification_requests,
+            notification_parser: notifications::Parser::default(),
+            desktop_notifications,
             sems_ring: sems,
             sem_seq: 0,
             apcs_ring: apcs,
@@ -857,6 +856,8 @@ impl App {
     /// once previewed or shown in another window left copies there, and the
     /// key (a never-reused id) would never be overwritten.
     fn forget_gpu_images(&mut self, tab_id: usize) {
+        self.notification_parser.forget(tab_id);
+        self.desktop_notifications.send(notifications::Command::Forget(tab_id));
         for w in self.wins.iter_mut() {
             if let Some(g) = w.gpu.as_mut() {
                 g.forget_images(tab_id as u32);
@@ -1070,6 +1071,7 @@ impl App {
             last_activity: Arc::clone(&self.last_activity),
             bell: Arc::clone(&self.bell),
             bells: Arc::clone(&self.bell_pings),
+            notifications: Arc::clone(&self.notification_requests),
             sems: Arc::clone(&self.sems_ring),
             apcs: Arc::clone(&self.apcs_ring),
             pty_writes: Arc::clone(&self.pty_writes_ring),
@@ -1173,8 +1175,7 @@ impl App {
         self.fg = self.config.foreground_color.to_f32();
         self.bg = crate::config::terminal_bg(&self.config).to_f32();
         if let Some(gpu) = &mut self.wins[self.cur].gpu {
-            gpu.slot_sig.fill(0);
-            gpu.prev_sigs.fill(0);
+            gpu.invalidate_terminals();
         }
         if font_changed {
             self.apply_fonts();
@@ -1247,9 +1248,7 @@ impl App {
                 .collect();
             gpu.prompt_buf =
                 Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
-            // New buffers hold nothing, so every cached signature is a lie.
-            gpu.slot_sig = vec![0u64; gpu.pool.len()];
-            gpu.prev_sigs.fill(0);
+            gpu.invalidate_terminals();
         }
         // Cell size changed -> the grid that fits the surface changes.
         self.sync_term_size();
@@ -1416,8 +1415,65 @@ impl App {
         (items, seps)
     }
 
-    fn build_frame(&self, tab: &Tab, show_cursor: bool) -> FrameData {
-        let term = tab.term.lock();
+    /// Placements shared by full-size tab textures and their previews.
+    fn image_quads(&self, tab_index: usize, gpu: &mut Gpu, strip_h: f32, w: u32) -> Vec<gpu::ImageQuad> {
+        let mut draws = Vec::new();
+        if let Some(tab) = self.wins[self.cur].tabs.get(tab_index) {
+            let tab_id = tab.id as u32;
+            if let Some(k) = self.kitty.get(&tab.id) {
+                let (hist, off) = {
+                    let term = tab.term.lock();
+                    (term.grid().history_size(), term.grid().display_offset())
+                };
+                let top_abs = hist.saturating_sub(off);
+                let vy0 = strip_h;
+                let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
+                for pl in k.placements_sorted() {
+                    let Some(img) = k.image(pl.image_id) else { continue };
+                    let iw = pl
+                        .cols
+                        .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
+                    let ih = pl
+                        .rows
+                        .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
+                    let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
+                    let y0 = vy0
+                        + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
+                        + pl.y_off as f32;
+                    let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
+                    let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
+                    if cx1 <= cx0 || cy1 <= cy0 {
+                        continue;
+                    }
+                    let key = (tab_id, pl.image_id, img.generation);
+                    if !gpu.has_image(key) {
+                        gpu.upload_image(key, &img.rgba, img.width, img.height);
+                    }
+                    draws.push(gpu::ImageQuad {
+                        key,
+                        dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
+                        uv: [
+                            (cx0 - x0) / iw as f32,
+                            (cy0 - y0) / ih as f32,
+                            (cx1 - x0) / iw as f32,
+                            (cy1 - y0) / ih as f32,
+                        ],
+                    });
+                }
+            }
+        }
+        draws
+    }
+
+    fn build_frame(&self, tab: &Tab, show_cursor: bool, on_damage: impl FnOnce(Damage)) -> FrameData {
+        let mut term = tab.term.lock();
+        // Snapshot and reset under the same lock as the cells. Output arriving
+        // after this snapshot remains damaged for the next frame. The callback
+        // gives preview preparation an independent, accumulating damage queue.
+        let damage = if full_redraw_enabled() { Damage::full() }
+            else { Damage::collect(term.damage_content()) };
+        term.reset_damage();
+        on_damage(damage);
         let content = term.renderable_content();
         let palette = Palette::from_colors(content.colors, &self.config.palette);
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -1601,8 +1657,7 @@ impl App {
         let blink = self.cursor_blink.load(Ordering::SeqCst);
         // The overview is an overlay on the live terminal, so the terminal is
         // still painted underneath it -- that is what the backdrop dims.
-        // Every tab's frame is built first (thumbnails are live), before the
-        // borrow of `tab` ends.
+        // Candidate background snapshots are built before borrowing the GPU.
         // Visual bell: a brief lift of the background, VTE's built-in bell
         // with the sound removed. Run colors resolve from `self.bg` at build
         // time, so lifting it for the duration of the builds flashes the
@@ -1614,18 +1669,6 @@ impl App {
             self.bg = bell_mix(self.bg, bell_k);
             window.request_redraw();
         }
-        // "Copy as image" outside the switcher: no per-tab frames exist
-        // then, so the shot builds its own (one frame's cost, once).
-        let shot_frame: Option<FrameData> = if self.wins[self.cur].shot
-            && self.wins[self.cur].overview.is_none()
-        {
-            self.wins[self.cur]
-                .tabs
-                .get(self.wins[self.cur].active)
-                .map(|t| self.build_frame(t, false))
-        } else {
-            None
-        };
         let preview_hover = (self.wins[self.cur].overview.is_none() && self.show_tab_strip() && self.wins[self.cur].tab_drag.is_none()
             && self.wins[self.cur].pointer.1 >= 0.0 && self.wins[self.cur].pointer.1 < self.tab_h)
             .then_some(self.wins[self.cur].hover_tab).filter(|&i| i < self.wins[self.cur].tabs.len());
@@ -1638,7 +1681,8 @@ impl App {
             let i = (self.wins[self.cur].thumb_rr + k) % n;
             if !preview_order.contains(&i) { preview_order.push(i); }
         }
-        // Build at most three candidate frames, then render at most two.
+        // The active target is already the preview source. Build at most
+        // three candidates, then update at most two background targets.
         // Idle snapshots run at most five times a second, driven by existing
         // terminal redraws; cold caches and visible previews take priority.
         let now = Instant::now();
@@ -1649,10 +1693,15 @@ impl App {
             self.wins[self.cur].preview_next = now + std::time::Duration::from_millis(200);
             self.wins[self.cur].thumb_rr = (self.wins[self.cur].thumb_rr + 1) % n.max(1);
         } else { preview_order.clear(); }
+        let mut damage_events = Vec::new();
+        let frame = self.build_frame(&self.wins[self.cur].tabs[active], blink,
+            |damage| damage_events.push((active, damage)));
         let ov_frames: Vec<Option<FrameData>> = (0..n).map(|i| {
-            preview_order.contains(&i).then(|| self.build_frame(&self.wins[self.cur].tabs[i], false))
+            (i != active && preview_order.contains(&i)).then(|| {
+                self.build_frame(&self.wins[self.cur].tabs[i], false,
+                    |damage| damage_events.push((i, damage)))
+            })
         }).collect();
-        let frame = self.build_frame(&self.wins[self.cur].tabs[self.wins[self.cur].active], blink);
         self.bg = saved_bg;
         let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
@@ -2014,6 +2063,30 @@ impl App {
             }
             None => None,
         };
+        let images = self.image_quads(active, &mut gpu, strip_h, w);
+        let tab_ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
+        gpu.ensure_previews(&tab_ids, (w, h));
+        for (i, damage) in damage_events {
+            gpu.damage_terminal(i, &damage);
+        }
+        let style = TerminalStyle {
+            tab_id: tab_ids[active], size: (w, h), cell: (self.cell_w, self.cell_h), strip_h,
+            fg: frame.fg, bg: frame.bg, cursor_color: frame.cursor_color,
+            transparency: self.config.term_transparency,
+        };
+        if gpu.prev_styles[active].as_ref() != Some(&style) {
+            gpu.prev_damage[active] = Damage::full();
+        }
+        let selection = self.wins[self.cur].tabs[active].selection_rows();
+        gpu.update_overlays(active, gpu::TerminalOverlays {
+            selection: selection.clone(), cursor: frame.cursor,
+            underline: url_underline.filter(|_| frame.cursor.is_some()),
+            notice: self.wins[self.cur].notice.as_ref().map(|(text, _)| text.clone()),
+            images: images.clone(),
+        }, self.wins[self.cur].rows, self.cell_h, strip_h);
+        gpu.prev_styles[active] = Some(style);
+        let live_damage = std::mem::take(&mut gpu.prev_damage[active]);
+        let live_scissors = live_damage.scissors((w, h), self.cell_h, strip_h, self.wins[self.cur].rows);
         gpu.rects.clear();
         // Convert pixel coords to clip space. Clip is -1..1 on both axes with
         // +y pointing up, screen pixels have y pointing down, so flip y.
@@ -2069,7 +2142,7 @@ impl App {
         // Selection wash: over the cell backgrounds, under the cursor and the
         // glyphs, and translucent so coloured text stays readable underneath --
         // an opaque wash would hide exactly the text the user selected.
-        for (row, left, right) in self.wins[self.cur].tabs[self.wins[self.cur].active].selection_rows() {
+        for (row, left, right) in selection {
             push_rect(
                 &mut gpu.rects,
                 left as f32 * self.cell_w,
@@ -2122,10 +2195,9 @@ impl App {
         // only used this frame, before any further pool writes. The switcher
         // draws through egui and never touches this pool.
         {
-            let cache = shaping_cache_enabled();
             let fs = &mut self.font_system;
             let pool = &mut gpu.pool;
-            for (i, run) in frame.runs.iter().take(MAX_RUNS).enumerate() {
+            for (i, run) in frame.runs.iter().filter(|run| live_damage.shapes_row(run.row)).take(MAX_RUNS).enumerate() {
                 if self.wins[self.cur].notice.is_some() && run.row as usize == self.wins[self.cur].rows.saturating_sub(1) { continue; }
                 let blank = run.text.chars().all(|c| c == ' ');
                 let default_fg =
@@ -2135,12 +2207,8 @@ impl App {
                 if blank && default_fg {
                     continue;
                 }
-                let sig = run_sig(run, self.cell_w);
-                if !(cache && gpu.slot_sig.get(i) == Some(&sig)) {
-                    gpu.slot_sig[i] = sig;
-                    let b = &mut pool[i];
-                    fonts::shape_terminal_run(b, fs, &run.text, run.attrs, &run.cells, self.cell_w);
-                }
+                let b = &mut pool[i];
+                fonts::shape_terminal_run(b, fs, &run.text, run.attrs, &run.cells, self.cell_w);
                 let buf: &Buffer = unsafe { &*(&pool[i] as *const Buffer) };
                 areas.push(gpu::terminal_text_area(
                     buf,
@@ -2197,7 +2265,6 @@ impl App {
         {
             let n = self.wins[self.cur].tabs.len();
             let sel = preview_hover.unwrap_or(self.wins[self.cur].active).min(n.saturating_sub(1));
-            gpu.ensure_previews(n, (w, h));
             let now = Instant::now();
             // Selected tab first, then every other tab exactly once, from a
             // rotating cursor so a backlog drains in order and nothing starves.
@@ -2207,32 +2274,41 @@ impl App {
                 let Some(fd) = ov_frames.get(i).and_then(Option::as_ref) else {
                     continue;
                 };
-                let sig = frame_sig(fd, self.cell_w);
-                let held = gpu.prev_sigs.get(i).copied().unwrap_or(0);
-                if held == sig {
-                    continue;
+                let style = TerminalStyle {
+                    tab_id: tab_ids[i], size: (w, h), cell: (self.cell_w, self.cell_h), strip_h,
+                    fg: fd.fg, bg: fd.bg, cursor_color: fd.cursor_color,
+                    transparency: self.config.term_transparency,
+                };
+                if gpu.prev_styles[i].as_ref() != Some(&style) {
+                    gpu.prev_damage[i] = Damage::full();
                 }
+                let images = self.image_quads(i, &mut gpu, strip_h, w);
+                let selection = self.wins[self.cur].tabs[i].selection_rows();
+                gpu.update_overlays(i, gpu::TerminalOverlays {
+                    selection: selection.clone(), images: images.clone(), ..Default::default()
+                }, self.wins[self.cur].rows, self.cell_h, strip_h);
+                if gpu.prev_damage[i].is_empty() { continue; }
                 let gate = if i == sel { 60 } else { 200 };
-                let throttled = held != 0
-                    && now.duration_since(gpu.prev_last[i])
-                        < std::time::Duration::from_millis(gate);
-                if throttled || built >= 2 {
-                    continue;
-                }
+                let throttled = gpu.prev_revision[i] != 0
+                    && now.duration_since(gpu.prev_last[i]) < std::time::Duration::from_millis(gate);
+                if throttled || built >= 2 { continue; }
+                let damage = std::mem::take(&mut gpu.prev_damage[i]);
+                gpu.prev_styles[i] = Some(style);
                 let metrics = gpu.pool[0].metrics();
                 let buffers = &mut gpu.prev_bufs[i];
-                let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
+                let runs: Vec<_> = fd.runs.iter().filter(|run| damage.shapes_row(run.row)).take(MAX_RUNS).collect();
                 buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
-                for (buffer, run) in buffers.iter_mut().zip(runs) {
+                for (buffer, run) in buffers.iter_mut().zip(&runs) {
                     buffer.set_metrics(metrics);
                     fonts::shape_terminal_run(
                         buffer, &mut self.font_system, &run.text, run.attrs, &run.cells, self.cell_w,
                     );
                 }
-                gpu.set_prev_sig(i, sig);
                 gpu.prev_last[i] = now;
                 jobs.push(gpu::PreviewJob {
                     idx: i,
+                    images,
+                    scissors: damage.scissors((w, h), self.cell_h, strip_h, self.wins[self.cur].rows),
                     bounds,
                     text: runs.iter().map(|run| gpu::PreviewText {
                         left: run.col as f32 * self.cell_w,
@@ -2243,7 +2319,9 @@ impl App {
                         fd,
                         &fd.bg,
                         &self.config.tablist_background.to_f32(),
-                        &fd.cursor_color,
+                        &selection,
+                        self.config.selection_color.to_f32(),
+                        bg_a,
                         self.cell_w,
                         self.cell_h,
                         strip_h,
@@ -2255,136 +2333,16 @@ impl App {
                 built += 1;
             }
         }
-        // One-shot screenshot: shape the captured frame into the preview
-        // slot and queue the offscreen render. The readback happens after
-        // render_frame -- same textures, same pipeline the switcher uses,
-        // just at native resolution and exactly once.
-        let mut shot_at: Option<usize> = None;
-        if self.wins[self.cur].shot {
-            let a = self.wins[self.cur].active;
-            if a < self.wins[self.cur].tabs.len() {
-                gpu.ensure_previews(a + 1, (w, h));
-                if let Some(fd) = ov_frames.get(a).and_then(Option::as_ref).or(shot_frame.as_ref()) {
-                    let metrics = gpu.pool[0].metrics();
-                    let buffers = &mut gpu.prev_bufs[a];
-                    let runs = &fd.runs[..fd.runs.len().min(MAX_RUNS)];
-                    buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
-                    for (buffer, run) in buffers.iter_mut().zip(runs) {
-                        buffer.set_metrics(metrics);
-                        fonts::shape_terminal_run(
-                            buffer, &mut self.font_system, &run.text, run.attrs, &run.cells, self.cell_w,
-                        );
-                    }
-                    gpu.set_prev_sig(a, frame_sig(fd, self.cell_w));
-                    jobs.push(gpu::PreviewJob {
-                        idx: a,
-                        bounds,
-                        text: runs.iter().map(|run| gpu::PreviewText {
-                            left: run.col as f32 * self.cell_w,
-                            top: strip_h + run.row as f32 * self.cell_h,
-                            color: run.fg,
-                        }).collect(),
-                        rects: preview_rects(
-                            fd,
-                            &fd.bg,
-                            &self.config.tablist_background.to_f32(),
-                            &fd.cursor_color,
-                            self.cell_w,
-                            self.cell_h,
-                            strip_h,
-                            self.wins[self.cur].rows,
-                            w,
-                            h,
-                        ),
-                    });
-                    shot_at = Some(a);
-                }
-            } else {
-                self.wins[self.cur].shot = false;
-            }
-        }
-        // Kitty images for the active tab: placements anchored to absolute
-        // logical lines, mapped through the tab's scroll position to window
-        // pixels, clipped to the grid area (UV-split so a half-scrolled
-        // image peels off the top realistically). Text paints afterwards,
-        // so glyphs stay on top of whatever an image covers.
-        gpu.images = {
-            let mut draws = Vec::new();
-            let a = self.wins[self.cur].active;
-            if let Some(tab) = self.wins[self.cur].tabs.get(a) {
-                let tab_id = tab.id as u32;
-                if let Some(k) = self.kitty.get(&tab.id) {
-                    let (hist, off) = {
-                        let term = tab.term.lock();
-                        (term.grid().history_size(), term.grid().display_offset())
-                    };
-                    let top_abs = hist.saturating_sub(off);
-                    let vy0 = strip_h;
-                    let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
-                    for pl in k.placements_sorted() {
-                        let Some(img) = k.image(pl.image_id) else { continue };
-                        let iw = pl
-                            .cols
-                            .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
-                        let ih = pl
-                            .rows
-                            .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
-                        let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
-                        let y0 = vy0
-                            + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
-                            + pl.y_off as f32;
-                        let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
-                        let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
-                        if cx1 <= cx0 || cy1 <= cy0 {
-                            continue;
-                        }
-                        let key = (tab_id, pl.image_id, img.generation);
-                        if !gpu.has_image(key) {
-                            gpu.upload_image(key, &img.rgba, img.width, img.height);
-                        }
-                        draws.push(gpu::ImageQuad {
-                            key,
-                            dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
-                            uv: [
-                                (cx0 - x0) / iw as f32,
-                                (cy0 - y0) / ih as f32,
-                                (cx1 - x0) / iw as f32,
-                                (cy1 - y0) / ih as f32,
-                            ],
-                        });
-                    }
-                }
-            }
-            draws
-        };
-        // Present-dedup key, computed before `egui_frame` takes the mutable
-        // borrows of `self.wins` and `full_output`. An identical frame with no
-        // live animation is not committed; skipping the commit starves the
-        // compositor's configure->commit->configure loop that would otherwise
-        // spin this window at vsync while idle.
-        let mut key: u64 = 0xcbf29ce484222325 ^ self.wins[self.cur].frame_gen.wrapping_mul(0x100000001b3);
-        for run in &frame.runs {
-            for b in run.text.as_bytes() {
-                key ^= *b as u64;
-                key = key.wrapping_mul(0x100000001b3);
-            }
-        }
-        if let Some((cx, cy)) = frame.cursor {
-            key = key.wrapping_add((cx as u64).wrapping_mul(0x100000001b3)).wrapping_add(cy as u64);
-        }
-        key = key.wrapping_add(if blink { 0x9e3779b97f4a7c15 } else { 0 });
-        for c in self.fg.iter().chain(self.bg.iter()) {
-            key ^= c.to_bits() as u64;
-            key = key.wrapping_mul(0x100000001b3);
-        }
-        // A live effect (bell, ripple, notice, switcher, egui animation) must
-        // keep presenting even when the key is stable, or it would freeze.
+        // Export and thumbnails sample the very same persistent tab target.
+        let shot_at = self.wins[self.cur].shot.then_some(active);
+        let generation = self.wins[self.cur].frame_gen;
+        // UI effects must keep presenting even without terminal damage.
         let force_present = bell_k > 0.0
             || self.ripple.is_some()
             || self.wins[self.cur].notice.is_some()
             || self.wins[self.cur].overview.is_some()
             || full_output.as_ref().is_some_and(|o| o.viewport_output.get(&egui::ViewportId::ROOT)
-                .is_some_and(|v| v.repaint_delay < std::time::Duration::MAX));
+                .is_some_and(|v| v.repaint_delay.is_zero()));
         let egui_frame = match (full_output.as_mut(), self.wins[self.cur].egui.as_mut()) {
             (Some(full), Some(egui)) => {
                 // Take the shapes out: `full` is behind a reference, and the
@@ -2405,7 +2363,7 @@ impl App {
             },
             _ => None,
         };
-        gpu.render_frame(&mut self.font_system, areas, jobs, window, egui_frame, key, force_present);
+        gpu.render_frame(&mut self.font_system, areas, images, jobs, window, egui_frame, active, live_scissors, generation, force_present);
 
         // Finish the screenshot: read the offscreen frame (already rendered
         // this pass) at full resolution and hand a PNG to the clipboard.
@@ -2456,13 +2414,15 @@ impl App {
                 self.config.tab_overview_scale);
             let (tw, th) = ((ptw * self.scale).round().max(1.0) as u32, (pth * self.scale).round().max(1.0) as u32);
             let mut updated = 0;
-            for &i in &preview_order {
+            let mut thumbnail_order = preview_order.clone();
+            if !thumbnail_order.contains(&active) { thumbnail_order.insert(0, active); }
+            for &i in &thumbnail_order {
                 if updated >= 2 { break; }
-                let sig = gpu.prev_sigs.get(i).copied().unwrap_or(0);
-                if sig == 0 || ov_frames.get(i).and_then(Option::as_ref).is_none_or(|fd| frame_sig(fd, self.cell_w) != sig) { continue; }
+                let revision = gpu.prev_revision.get(i).copied().unwrap_or(0);
+                if revision == 0 { continue; }
                 let id = ids[i];
                 let old = thumbs.iter().position(|t| t.tab_id == id);
-                if old.is_some_and(|at| thumbs[at].pixels == (tw, th) && thumbs[at].sig == sig) { continue; }
+                if old.is_some_and(|at| thumbs[at].pixels == (tw, th) && thumbs[at].revision == revision) { continue; }
                 let old_texture = old.map(|at| &thumbs[at].texture);
                 let Some(texture) = gpu.thumbnail(i, strip_h as u32, (tw, th), old_texture) else { continue; };
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2474,15 +2434,12 @@ impl App {
                     renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear)
                 };
                 let thumb = SwThumb { tab_id: id, handle, texture, size: (ptw.round() as u32, pth.round() as u32),
-                    pixels: (tw, th), sig };
+                    pixels: (tw, th), revision };
                 if let Some(at) = old { thumbs[at] = thumb; } else { thumbs.push(thumb); }
                 updated += 1;
             }
-            // Cold caches fill in bounded batches on frames that already
-            // happen (terminal output, hover, blink). The warm path never
-            // schedules its own redraw: a tab whose thumbnail cannot be built
-            // (empty screen, signature 0) would otherwise keep `thumbs.len()`
-            // below `n` and spin the loop at vsync forever.
+            // Changed thumbnails need one UI redraw. Unchanged textures never
+            // schedule their own redraw, including completely empty terminals.
             if updated > 0 {
                 // A new thumbnail changes the tab strip, so the last presented
                 // frame is stale.
@@ -2494,19 +2451,13 @@ impl App {
         self.wins[self.cur].gpu = Some(gpu);
 
         if std::env::var("MYPIXELS_TRACE").is_ok() {
-            let mut h: u64 = 0xcbf29ce484222325;
-            for run in &frame.runs {
-                for b in run.text.as_bytes() {
-                    h ^= *b as u64;
-                    h = h.wrapping_mul(0x100000001b3);
-                }
-            }
             eprintln!(
-                "frame build {t_built:?} text {t_text:?} total {:?} grid {}x{} runs {} hash {h:x}",
+                "frame build {t_built:?} text {t_text:?} total {:?} grid {}x{} runs {} damage {}",
                 t_start.elapsed(),
                 self.wins[self.cur].cols,
                 self.wins[self.cur].rows,
                 frame.runs.len(),
+                if live_damage.full { "full".to_string() } else { format!("{} rows", live_damage.lines.len()) },
             );
         }
     }
@@ -2994,6 +2945,62 @@ impl App {
                     }
                     break;
                 }
+            }
+        }
+    }
+
+    fn drain_notifications(&mut self) {
+        let requests = std::mem::take(&mut *self.notification_requests.lock().unwrap());
+        for raw in requests {
+            let tab_id = raw.tab_id;
+            let Some((wi, ti)) = self.wins.iter().enumerate().find_map(|(wi, win)| {
+                win.tabs.iter().position(|tab| tab.id == tab_id).map(|ti| (wi, ti))
+            }) else { continue };
+            let win = &mut self.wins[wi];
+            let focused = win.active == ti && win.focused;
+            let visible = win.active == ti && !win.occluded
+                && win.window.as_ref().is_none_or(|w| !w.is_minimized().unwrap_or(false));
+            let (command, reply) = self.notification_parser.parse(raw, focused, visible);
+            if let Some(reply) = reply { win.tabs[ti].write(reply.as_bytes()); }
+            if let Some(command) = command {
+                if matches!(command, notifications::Command::Show(_)) && !focused {
+                    win.bell_pulse = Some((ti, Instant::now()));
+                    win.frame_gen = win.frame_gen.wrapping_add(1);
+                    if let Some(window) = &win.window {
+                        window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                        window.request_redraw();
+                    }
+                }
+                self.desktop_notifications.send(command);
+            }
+        }
+        for event in self.desktop_notifications.events() {
+            match event {
+                notifications::Event::Reply { tab_id, text } => {
+                    if let Some(tab) = self.wins.iter().flat_map(|win| &win.tabs).find(|tab| tab.id == tab_id) {
+                        tab.write(text.as_bytes());
+                    }
+                },
+                notifications::Event::Activate { tab_id, token } => {
+                    if let Some((wi, ti)) = self.wins.iter().enumerate().find_map(|(wi, win)| {
+                        win.tabs.iter().position(|tab| tab.id == tab_id).map(|ti| (wi, ti))
+                    }) {
+                        let current = self.cur;
+                        self.cur = wi;
+                        self.close_switcher();
+                        self.cur = current;
+                        let win = &mut self.wins[wi];
+                        win.active = ti;
+                        win.bell_pulse = None;
+                        win.frame_gen = win.frame_gen.wrapping_add(1);
+                        if let Some(window) = &win.window {
+                            window.set_minimized(false);
+                            notifications::activate(window, token.as_deref());
+                            window.request_user_attention(None);
+                            window.request_redraw();
+                        }
+                    }
+                },
             }
         }
     }
@@ -3995,50 +4002,16 @@ fn tab_title(t: &Tab, selected: bool, max_len: usize, cur_len: usize, shorten: &
     } else { name }
 }
 
-/// Cell backgrounds for an offscreen terminal preview. The switcher crops
-/// the reserved strip region before displaying the terminal thumbnail.
-/// Signature of a whole frame, so a preview buffer is only re-shaped when its
-/// tab actually changed. Same idea as `run_sig`, folded over the frame.
-fn frame_sig(fd: &FrameData, cell_w: f32) -> u64 {
-    fn mix(h: &mut u64, v: u64) {
-        *h ^= v;
-        *h = h.wrapping_mul(0x100000001b3);
-    }
-    let mut h: u64 = 0xcbf29ce484222325;
-    mix(
-        &mut h,
-        fd.cursor
-            .map(|c| (c.0 as u64) << 32 | c.1 as u64)
-            .unwrap_or(u64::MAX),
-    );
-    for color in fd.fg.iter().chain(fd.bg.iter()).chain(fd.cursor_color.iter()) {
-        mix(&mut h, color.to_bits() as u64);
-    }
-    mix(&mut h, fd.runs.len() as u64);
-    for run in &fd.runs {
-        mix(&mut h, run.row as u64);
-        mix(&mut h, run.col as u64);
-        mix(&mut h, run_sig(run, cell_w));
-        for b in run.text.as_bytes() {
-            mix(&mut h, *b as u64);
-        }
-        for c in run.fg.iter().chain(run.bg.iter()) {
-            mix(&mut h, (c.clamp(0.0, 1.0) * 255.0).round() as u64);
-        }
-    }
-    mix(&mut h, (cell_w * 1000.0).round() as u64);
-    h
-}
-
-/// Rects for an offscreen frame: window background, tab strip, cell backgrounds
-/// that differ from them, and the cursor. The live `gpu.rects` cannot be reused
-/// -- it belongs to the active tab and carries the overlay.
+/// Background tab rectangles, rendered into the same retained targets used
+/// by active terminals. Selection and images remain part of the tab picture.
 #[allow(clippy::too_many_arguments)]
 fn preview_rects(
     fd: &FrameData,
     bg: &[f32; 3],
     bar: &[f32; 3],
-    fg: &[f32; 3],
+    selection: &[(usize, usize, usize)],
+    selection_color: [f32; 3],
+    alpha: f32,
     cell_w: f32,
     cell_h: f32,
     strip_h: f32,
@@ -4052,8 +4025,8 @@ fn preview_rects(
     let mut push = |x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4]| {
         v.extend_from_slice(&gpu::rect_vertices(x, y, rw, rh, c, 0.0, wf, hf))
     };
-    // Opaque: the offscreen is a picture of the window, not a see-through one.
-    push(0.0, 0.0, wf, hf, [bg[0], bg[1], bg[2], 1.0]);
+    // Retain the window's alpha; downsampling flattens it for thumbnails.
+    push(0.0, 0.0, wf, hf, [bg[0], bg[1], bg[2], alpha]);
     if strip_h > 0.0 {
         push(0.0, 0.0, wf, strip_h, [bar[0], bar[1], bar[2], 1.0]);
     }
@@ -4074,14 +4047,10 @@ fn preview_rects(
             );
         }
     }
-    if let Some((cx, cy)) = fd.cursor {
-        push(
-            cx as f32 * cell_w,
-            strip_h + cy as f32 * cell_h,
-            cell_w,
-            cell_h,
-            [fg[0], fg[1], fg[2], 0.55],
-        );
+    for &(row, left, right) in selection {
+        push(left as f32 * cell_w, strip_h + row as f32 * cell_h,
+            (right - left) as f32 * cell_w, cell_h,
+            [selection_color[0], selection_color[1], selection_color[2], 0.35]);
     }
     v
 }
@@ -4275,6 +4244,7 @@ impl App {
                 notice: None,
                 bell_pulse: None,
                 focused: true,
+                occluded: false,
                 frame_gen: 0,
             });
             // The newest window is the one the user just asked for.
@@ -5127,6 +5097,7 @@ impl ApplicationHandler for App {
         self.check_theme_files();
         self.drain_clipboard();
         self.drain_bell_pings();
+        self.drain_notifications();
         self.drain_sems();
         self.drain_apcs();
         self.drain_ptwrites();
@@ -5137,6 +5108,7 @@ impl ApplicationHandler for App {
         for win in &mut self.wins {
             if win.repaint_at.is_some_and(|at| at <= now) {
                 win.repaint_at = None;
+                win.frame_gen = win.frame_gen.wrapping_add(1);
                 if let Some(window) = &win.window { window.request_redraw(); }
             }
         }
@@ -5247,6 +5219,7 @@ impl ApplicationHandler for App {
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_bell_pings();
+                self.drain_notifications();
                 self.drain_sems();
                 self.drain_apcs();
                 self.drain_ptwrites();
@@ -5745,6 +5718,9 @@ impl ApplicationHandler for App {
                 }
                 window.request_redraw();
             },
+            WindowEvent::Occluded(occluded) => {
+                self.wins[self.cur].occluded = occluded;
+            },
             WindowEvent::Focused(focused) => {
                 self.wins[self.cur].focused = focused;
                 if focused {
@@ -6061,25 +6037,7 @@ mod preview_tests {
         assert!(runs.is_empty());
     }
 
-    #[test]
-    fn signatures_see_text_cursor_and_default_colors() {
-        let mut fd = FrameData {
-            runs: vec![run(0, 0, "x")],
-            cursor: None,
-            ..FrameData::default()
-        };
-        let base = frame_sig(&fd, 7.0);
-        fd.cursor = Some((1, 0));
-        assert_ne!(base, frame_sig(&fd, 7.0), "the cursor is part of the frame");
-        fd.cursor = None;
-        fd.runs[0].text = "y".into();
-        assert_ne!(base, frame_sig(&fd, 7.0), "so is the text");
-        let old = frame_sig(&fd, 7.0);
-        fd.bg = [1.0; 3];
-        assert_ne!(old, frame_sig(&fd, 7.0), "blank previews also follow background changes");
-        let again = frame_sig(&fd, 7.0);
-        assert_eq!(again, frame_sig(&fd, 7.0), "same input, same signature");
-    }
+
 }
 
 #[cfg(test)]

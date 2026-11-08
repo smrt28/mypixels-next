@@ -54,6 +54,24 @@ Requires ImageMagick `import` and Pillow. It compares a switcher thumbnail
 against a downscaled live frame, checking all four edges, aspect ratio, glyph
 placement, and colors. Screenshots are left in `/tmp/mypixels-preview-*`.
 
+`xvfb-run -a python3 tests/damage_smoke.py` pixel-compares partial redraws
+against `MYPIXELS_FULL_REDRAW=1`, using the same binary and deterministic PTY
+output. It covers sparse edits, wide characters, erasure, colors, scrolling,
+alternate screens, selection, background previews, tab switches, and resizing.
+Requires xdotool, ImageMagick `import`, and Pillow. Screenshots and difference
+images are left in `/tmp/mypixels-damage-*`. `MYPIXELS_NOCACHE=1` also selects
+the full-redraw diagnostic path.
+
+For desktop notifications, use a private bus and display:
+
+```sh
+dbus-run-session -- xvfb-run -a python3 tests/notifications_smoke.py
+```
+
+Requires PyGObject (Gio), xdotool, and gdbus. It runs a fake notification daemon
+and checks OSC 9/99/777 delivery, chunked messages, replacement, click-to-tab,
+protocol replies, and focus filtering without sending real desktop toasts.
+
 To check command history with real zsh, bash, and fish shells (whichever
 are installed), run:
 

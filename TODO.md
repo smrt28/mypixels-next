@@ -12,6 +12,8 @@
 - [x] Print the selected existing instance and requested new-window action to stdout.
 - [x] Resolve a right-click popup dismissal regression that can pass Escape through to the terminal.
 - [x] Animate tab-bar selection, state fills, and reordering through the same shared helpers as the switcher.
+- [x] Replace renderer content hashes with Alacritty damage and partial redraws into persistent per-tab textures, shared by live display and previews.
+- [x] Handle terminal application notifications (including approval alerts) through OSC 9/99/777 and native desktop notifications, with click-to-tab and OSC 99 replies.
 
 Validation: debug build; `cargo test --offline` (137 passed, one isolated-Wayland test ignored); live menu/hover/reorder/keyboard checks; native 2× popup placement; GPU image comparison; private D-Bus default-window and stdout checks.
 
