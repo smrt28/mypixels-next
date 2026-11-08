@@ -837,7 +837,8 @@ impl App {
             "end" => win.tabs.len(),
             "first" => 0,
             _ => win.active + 1,
-        };
+        }
+        .min(win.tabs.len());
         win.tabs.insert(pos, tab);
         win.active = pos;
     }
@@ -2441,9 +2442,12 @@ impl App {
                 if let Some(at) = old { thumbs[at] = thumb; } else { thumbs.push(thumb); }
                 updated += 1;
             }
-            // Fill cold caches promptly in bounded batches, before the next
-            // interaction. Once warm, terminal activity drives refreshes.
-            if thumbs.len() < n || updated > 0 { window.request_redraw(); }
+            // Cold caches fill in bounded batches on frames that already
+            // happen (terminal output, hover, blink). The warm path never
+            // schedules its own redraw: a tab whose thumbnail cannot be built
+            // (empty screen, signature 0) would otherwise keep `thumbs.len()`
+            // below `n` and spin the loop at vsync forever.
+            if updated > 0 { window.request_redraw(); }
             self.wins[self.cur].sw_thumbs = thumbs;
         }
         self.wins[self.cur].gpu = Some(gpu);
