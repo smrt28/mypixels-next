@@ -475,6 +475,23 @@ pub(crate) fn tab_height(text_height: f32, scale: f32) -> f32 {
     (text_height + 8.0 * scale).max(28.0 * scale).round()
 }
 
+/// Keep theme text when readable; otherwise choose black or white for the fill.
+fn contrasting_text(foreground: egui::Color32, background: egui::Color32) -> egui::Color32 {
+    let luminance = |color: egui::Color32| {
+        let linear = egui::Rgba::from(color);
+        0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b()
+    };
+    let bg = luminance(background);
+    let fg = luminance(background.blend(foreground));
+    if (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05) >= 4.5 {
+        foreground
+    } else if (bg + 0.05) / 0.05 >= 1.05 / (bg + 0.05) {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 impl TermStyle {
     pub(crate) fn surface(&self, p: &egui::Painter, rect: egui::Rect, radius: f32, selected: bool, hovered: bool) {
         let fill = self.bg.lerp_to_gamma(
@@ -497,14 +514,20 @@ impl TermStyle {
     }
 
     pub(crate) fn number_badge(&self, p: &egui::Painter, rect: egui::Rect, number: usize, selected: bool, size: f32) {
+        let fill = if selected {
+            self.bg.blend(self.accent.gamma_multiply(0.8))
+        } else {
+            self.bg.lerp_to_gamma(self.fg, 0.14)
+        };
         p.rect(
             rect,
             4.0,
-            if selected { self.accent.gamma_multiply(0.8) } else { self.bg.lerp_to_gamma(self.fg, 0.14) },
+            fill,
             egui::Stroke::new(1.0, self.border),
             egui::StrokeKind::Inside,
         );
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::monospace(size), self.fg);
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::monospace(size),
+            contrasting_text(self.fg, fill));
     }
 }
 
