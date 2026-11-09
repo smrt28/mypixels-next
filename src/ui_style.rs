@@ -109,6 +109,23 @@ pub(crate) fn action_row(
     enabled: bool,
     c: &TermStyle,
 ) -> egui::Response {
+    action_row_tinted(ui, rect, id, label, shortcut, glyph, enabled, c, None)
+}
+
+/// As `action_row`, with the glyph forced to an identity colour: a workspace
+/// row's marker carries the workspace's own colour, which is not the row's
+/// accent. Text, hover and shortcut treatment stay shared.
+pub(crate) fn action_row_tinted(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    label: &str,
+    shortcut: &str,
+    glyph: Option<Icon>,
+    enabled: bool,
+    c: &TermStyle,
+    tint: Option<egui::Color32>,
+) -> egui::Response {
     let response = ui.interact(rect, id, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let highlight = enabled && (response.hovered() || response.has_focus());
@@ -118,7 +135,7 @@ pub(crate) fn action_row(
     }
     let color = if !enabled { c.bg.lerp_to_gamma(c.muted, 0.65) } else if highlight { c.accent } else { c.fg };
     if let Some(glyph) = glyph {
-        icon(ui.painter(), glyph, egui::pos2(rect.left() + 18.0, rect.center().y), color);
+        icon(ui.painter(), glyph, egui::pos2(rect.left() + 18.0, rect.center().y), tint.unwrap_or(color));
     }
     let shortcut_width = if shortcut.is_empty() { 0.0 } else {
         (ui.painter().layout_no_wrap(shortcut.to_string(), egui::FontId::monospace(12.0), c.muted).size().x + 20.0)

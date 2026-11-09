@@ -265,6 +265,23 @@ try:
     assert spy()[0] == 1, 'Alt+Q must be released to the shell when letter keys are off'
     send('alt+shift+1')
     wait(lambda: spy()[0] == 0, 'Alt+Shift+1, the standard workspace shortcut, did not switch')
+    # The workspace panel. A chord opens it (the tab-bar button is the mouse
+    # route), the arrows walk the list, Enter goes to the row under the cursor,
+    # and Escape hands those keys back to the terminal.
+    config.write_text(config.read_text() + 'bindings:\n  show_workspaces: MOD1+SHIFT+k\n')
+    send('ctrl+shift+r')
+    assert spy()[0] == 0, 'a config reload must not switch workspaces'
+    send('alt+shift+k')
+    time.sleep(.3)
+    send('down')
+    time.sleep(.3)
+    send('return')
+    wait(lambda: spy()[0] == 1, 'the workspace panel did not switch on Enter')
+    send('escape')
+    time.sleep(.3)
+    send('down')
+    send('return')
+    assert spy()[0] == 1, 'Escape must hand the arrows and Enter back to the terminal'
     print('Workspace, tab preference, and numbered tab checks passed. Artifacts:', work)
 finally:
     app.terminate()

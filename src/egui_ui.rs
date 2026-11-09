@@ -5,7 +5,7 @@
 //! retain their own keyboard behavior. The app routes terminal keys directly.
 
 use egui::{Context, FullOutput, ViewportId};
-use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row};
+use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row, action_row_tinted};
 
 /// The egui side of the app: context, winit event state and the wgpu
 /// renderer that paints egui's tessellation.
@@ -132,6 +132,13 @@ pub struct UiState {
     /// open); `grave_sel` indexes it newest-first; `grave_out` is a
     /// one-shot (index, action) the app applies after the frame, the same
     /// contract as `history_out`.
+    /// `ws_rows` is the app's snapshot of the ten workspaces (rebuilt every
+    /// frame while the panel is open); `ws_sel` indexes it and starts on the
+    /// current workspace; `ws_out` is the index the app switches to after the
+    /// frame. Same contract as `grave_rows`.
+    pub ws_rows: Vec<WsRow>,
+    pub ws_sel: Option<usize>,
+    pub ws_out: Option<usize>,
     pub grave_rows: Vec<GraveRow>,
     pub grave_sel: Option<usize>,
     pub grave_out: Option<(usize, String)>,
@@ -158,12 +165,30 @@ pub enum RightPanel {
     Closed,
     History,
     Graveyard,
+    Workspaces,
     Settings,
 }
 
 /// One buried tab, as the graveyard panel displays it. Every field is
 /// precomputed by the app (rebuilt every frame while the panel is open),
 /// so the panel never touches a terminal, a pty, or a codec.
+/// One workspace, as the panel displays it. The app precomputes every field
+/// each frame the panel is open, so the panel never walks a window's tab
+/// lists and never touches a terminal.
+#[derive(Clone)]
+pub struct WsRow {
+    pub index: usize,
+    /// Tabs the workspace holds; zero renders as an empty slot.
+    pub count: usize,
+    /// Caption of the workspace's selected tab, empty when it holds none.
+    pub title: String,
+    /// The workspace this window is looking at right now.
+    pub current: bool,
+    /// The chord that jumps here, read from the live config so the panel can
+    /// never show a shortcut the app does not answer to.
+    pub shortcut: String,
+}
+
 #[derive(Clone)]
 pub struct GraveRow {
     pub id: usize,
@@ -183,11 +208,13 @@ impl UiState {
     /// Sidebars are passive until an editor is explicitly focused. Merely
     /// opening a panel or clicking one of its buttons never claims typing.
     pub fn owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        // The graveyard drives its list with arrows and Enter and has no
-        // editor of its own, so it owns the keys outright (like the menus).
+        // The graveyard and workspace panels drive their lists with arrows and
+        // Enter and have no editor of their own, so they own the keys outright
+        // (like the menus).
         self.rename_open || self.menu_open || self.move_open || self.info_page.is_some()
             || self.key_capture.is_some()
-            || self.right_panel == RightPanel::Graveyard || egui::Popup::is_any_open(ctx)
+            || matches!(self.right_panel, RightPanel::Graveyard | RightPanel::Workspaces)
+            || egui::Popup::is_any_open(ctx)
             || (self.right_panel != RightPanel::Closed && ctx.memory(|m| m.focused())
                 .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some()))
     }
@@ -1129,6 +1156,160 @@ pub fn graveyard_panel(
                         }
                         let _ = color;
                         response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    }
+                }
+            });
+        });
+}
+
+/// The workspace picker, as a side panel: the ten slots in their own colours,
+/// each showing how many tabs it holds and what the front one is, with the
+/// chord that jumps to it on the right. Same anatomy as the graveyard panel:
+/// header, one line of keys, a list of rows, and a detail card for the row the
+/// keyboard is on.
+pub fn workspaces_panel(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    ok: egui::Color32,
+    err: egui::Color32,
+    top: f32,
+    colors_ws: &[egui::Color32],
+) {
+    if !st.panel_is(RightPanel::Workspaces) {
+        st.ws_out = None;
+        return;
+    }
+    st.ws_out = None;
+    if !st.menu_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        release_focus(ui.ctx());
+        st.close_panel(RightPanel::Workspaces);
+        return;
+    }
+    let colors = TermStyle::new(ui, ok, err);
+    let TermStyle { bg, fg, muted, border, accent, card, .. } = colors;
+    // Navigation belongs to the app's keyboard, which forwards to egui while
+    // this panel is the only surface.
+    let (nav, commit) = ui.input(|i| (
+        i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowDown),
+        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowRight),
+    ));
+    let count = st.ws_rows.len();
+    if nav && count > 0 {
+        let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let cur = st.ws_sel.unwrap_or(0).min(count - 1);
+        st.ws_sel = Some(if up { (cur + count - 1) % count } else { (cur + 1) % count });
+    }
+    if commit {
+        st.ws_out = st.ws_sel.filter(|s| *s < count);
+    }
+    let mut host = ui.max_rect();
+    host.min.y = host.min.y.max(top);
+    host.min.x = (host.max.x - 380.0).max(host.min.x);
+    egui::Area::new(egui::Id::unique("mypixels_workspaces_area"))
+        .fixed_pos(host.min)
+        .order(egui::Order::Middle)
+        .fade_in(false)
+        .movable(false)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_size(host.size());
+            egui::Frame::new().fill(bg).inner_margin(18.0).show(ui, |ui| {
+                ui.set_width((host.width() - 36.0).max(0.0));
+                ui.set_min_height((host.height() - 36.0).max(0.0));
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                let edge = ui.max_rect().left() - 18.0;
+                ui.painter().vline(edge, host.y_range(), egui::Stroke::new(1.0, border));
+                let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+                draw_icon(ui.painter(), Icon::Layers, egui::pos2(header.left() + 14.0, header.center().y), fg);
+                text(
+                    ui,
+                    egui::Rect::from_min_max(
+                        egui::pos2(header.left() + 36.0, header.top()),
+                        egui::pos2(header.right() - 68.0, header.bottom()),
+                    ),
+                    &format!("Workspaces {}", st.ws_rows.iter().filter(|r| r.count > 0).count()),
+                    fg,
+                    16.0,
+                    true,
+                );
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(header.right() - 10.0, header.center().y),
+                    egui::vec2(30.0, 30.0),
+                );
+                if icon_button(ui, close_rect, Icon::Dismiss, "Close workspaces", &colors).clicked() {
+                    st.close_panel(RightPanel::Workspaces);
+                }
+                let hint = egui::Rect::from_min_size(
+                    egui::pos2(ui.cursor().left(), ui.cursor().top()),
+                    egui::vec2(ui.available_width(), 16.0),
+                );
+                text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter go \u{b7} Esc close", muted, 11.0, false);
+                ui.add_space(14.0);
+                // A workspace with no tabs is still a slot: the keyboard can
+                // walk onto it, and visiting it opens its first terminal.
+                // The detail card is part of the panel, not something below
+                // the fold: the list gets what is left after it, the same
+                // split the history panel makes between its list and preview.
+                // 72 card + 14 gap + 18 frame padding, or the last line lands
+                // off the bottom of the window.
+                let reserve = if st.ws_sel.is_some() { 104.0 } else { 0.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("workspaces_list")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - reserve).max(120.0))
+                    .show(ui, |ui| {
+                        for row in &st.ws_rows {
+                            let index = row.index;
+                            let is_current = row.current;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+                            let selected = st.ws_sel == Some(index);
+                            if selected || is_current {
+                                colors.card_surface(ui.painter(), rect.shrink2(egui::vec2(0.0, 2.0)), selected, false);
+                            }
+                            let color = colors_ws.get(index).copied().unwrap_or(accent);
+                            // The number is the workspace's identity, so it leads
+                            // the row: ten rows of colour alone are a memory test.
+                            let what = match row.count {
+                                0 => "empty".to_string(),
+                                1 => "1 tab".to_string(),
+                                n => format!("{n} tabs"),
+                            };
+                            let label = format!("Workspace {} \u{b7} {}", index + 1, what);
+                            let response = action_row_tinted(
+                                ui, rect, ui.scope_id().with(("ws_row", index)), &label, &row.shortcut,
+                                Some(if is_current { Icon::Check } else { Icon::Layers }), true, &colors, Some(color));
+                            if response.clicked() {
+                                st.ws_sel = Some(index);
+                                st.ws_out = Some(index);
+                            }
+                            response.on_hover_text(format!(
+                                "Workspace {} \u{b7} {} \u{b7} {}", index + 1,
+                                if row.count == 0 { "empty" } else { row.title.as_str() }, row.shortcut))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                    });
+                if let Some(index) = st.ws_sel.filter(|i| *i < count) {
+                    let row = &st.ws_rows[index];
+                    ui.add_space(14.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), egui::Sense::hover());
+                    ui.painter().rect(rect, 9.0, card, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                    let left = rect.left() + 13.0;
+                    text(ui, egui::Rect::from_min_max(
+                        egui::pos2(left, rect.top() + 8.0),
+                        egui::pos2(rect.right() - 12.0, rect.top() + 30.0),
+                    ), &format!("Workspace {}", index + 1), fg, 15.0, true);
+                    // The chord is not repeated here: every row already shows its
+                    // own on the right, and a third line pushed this card off the
+                    // bottom of the window.
+                    for (i, (label, value)) in [
+                        ("Holds", if row.count == 0 { "nothing".into() } else { format!("{} tab{}", row.count, if row.count == 1 { "" } else { "s" }) }),
+                        ("Front", if row.title.is_empty() { "\u{2014}".into() } else { row.title.clone() }),
+                    ].into_iter().enumerate() {
+                        let y = rect.top() + 32.0 + i as f32 * 20.0;
+                        let line = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(rect.width() - 26.0, 20.0));
+                        text(ui, line.with_max_x(left + 64.0), label, muted, 13.0, false);
+                        text(ui, line.with_min_x(left + 68.0), &value, fg, 13.0, false);
                     }
                 }
             });
@@ -2079,9 +2260,11 @@ fn key_groups(cfg: &crate::config::Config) -> Vec<(&'static str, Vec<(String, St
         .collect()));
     // Listed whether or not the feature is on: the chords are real either way,
     // and hiding them here would drop ten rows into "Other".
-    groups.insert(3, ("Workspaces", (0..crate::config::WORKSPACES)
-        .map(|i| (format!("goto_workspace_{i}"), format!("Go to workspace {}", i + 1)))
-        .collect()));
+    let mut ws_rows: Vec<(String, String)> =
+        vec![("show_workspaces".to_string(), "Workspaces panel".to_string())];
+    ws_rows.extend((0..crate::config::WORKSPACES)
+        .map(|i| (format!("goto_workspace_{i}"), format!("Go to workspace {}", i + 1))));
+    groups.insert(3, ("Workspaces", ws_rows));
     let named: std::collections::HashSet<&str> = groups.iter()
         .flat_map(|(_, rows)| rows.iter().map(|a| a.0.as_str())).collect();
     let other: Vec<(String, String)> = cfg.bindings.iter()

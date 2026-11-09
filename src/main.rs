@@ -1347,6 +1347,27 @@ impl App {
         }
     }
 
+    /// The workspace panel's rows: all ten slots of this window. The current
+    /// workspace's tabs live in `Win::tabs`; the others are parked in their own
+    /// list, so the current one is read from where it actually is.
+    fn ws_rows(&self) -> Vec<egui_ui::WsRow> {
+        let win = &self.wins[self.cur];
+        (0..WORKSPACES).map(|i| {
+            let (tabs, active) = if i == win.workspace {
+                (&win.tabs, win.active)
+            } else {
+                (&win.workspaces[i].tabs, win.workspaces[i].active)
+            };
+            egui_ui::WsRow {
+                index: i,
+                count: tabs.len(),
+                title: tabs.get(active).map(|t| t.display_title()).unwrap_or_default(),
+                current: i == win.workspace,
+                shortcut: config::workspace_shortcut(&self.config, i),
+            }
+        }).collect()
+    }
+
     /// The graveyard panel's rows, newest first.
     fn grave_rows(&self) -> Vec<egui_ui::GraveRow> {
         self.graveyard.iter().rev().map(|g| {
@@ -1454,6 +1475,14 @@ impl App {
         self.bg = crate::config::terminal_bg(&self.config).to_f32();
         for win in &mut self.wins {
             if !self.config.tab_overview_on_alt { win.overview = None; }
+            // Turning the feature off must not leave a panel open that can no
+            // longer switch anything, with a check mark on a slot the window
+            // is not looking at.
+            if !self.config.workspaces_enabled
+                && win.egui.as_ref().is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Workspaces))
+            {
+                win.egui.as_mut().unwrap().ui_state.close_panel(egui_ui::RightPanel::Workspaces);
+            }
             if let Some(gpu) = &mut win.gpu {
                 gpu.invalidate_terminals();
             }
@@ -1689,6 +1718,7 @@ impl App {
         add("Copy last output", "copy_last_output", has_tab, false);
         add("Command history", "show_history", has_tab, false);
         add("Graveyard", "graveyard", true, false);
+        add("Workspaces", "show_workspaces", self.config.workspaces_enabled, false);
         add("New tab", "new_tab", true, true);
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
@@ -2177,6 +2207,12 @@ impl App {
                         }
                     }
                 }
+                // The workspace rows are a snapshot of this window's ten
+                // slots, rebuilt every frame while the panel is open, so a tab
+                // opened, closed or retitled elsewhere shows up immediately.
+                if egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces) {
+                    egui.ui_state.ws_rows = self.ws_rows();
+                }
                 // The graveyard rows are a snapshot of the buried tabs,
                 // rebuilt every frame while open: a buried shell that
                 // retitles itself shows up in the list on the next frame.
@@ -2212,28 +2248,16 @@ impl App {
                         }
                     }
                     if strip_geometry.workspace_clicked {
+                        // The tab-bar button owns the workspace panel. It used
+                        // to raise a popup menu, which could not show what a
+                        // workspace held and sat outside the panel design.
                         let st = &mut egui.ui_state;
-                        if st.menu_open && !st.menu_app {
-                            st.menu_open = false;
-                            egui_ui::release_focus(&ctx);
-                        } else {
-                            st.menu_items = (0..WORKSPACES).map(|i| {
-                                let count = if i == self.wins[self.cur].workspace {
-                                    self.wins[self.cur].tabs.len()
-                                } else { self.wins[self.cur].workspaces[i].tabs.len() };
-                                let mark = if i == self.wins[self.cur].workspace { "●  " } else { "   " };
-                                (format!("{mark}Workspace {} \u{b7} {} tabs \u{b7} {}", i + 1, count,
-                                    config::workspace_shortcut(&self.config, i)),
-                                    format!("goto_workspace_{i}"), true)
-                            }).collect();
-                            st.menu_seps.clear();
-                            st.menu_pos = [(window.inner_size().width as f32 / ctx.pixels_per_point() - 340.0).max(3.0),
-                                self.tab_h / ctx.pixels_per_point()];
-                            st.menu_app = false;
-                            st.menu_open = true;
-                            st.menu_out = None;
-                            st.menu_age = 0;
-                        }
+                        st.menu_open = false;
+                        egui_ui::release_focus(&ctx);
+                        st.toggle_panel(egui_ui::RightPanel::Workspaces);
+                        st.ws_sel = Some(self.wins[self.cur].workspace);
+                        st.ws_out = None;
+                        st.ws_rows = self.ws_rows();
                         ctx.request_repaint();
                     }
                     let mut config_open = egui.ui_state.panel_is(egui_ui::RightPanel::Settings);
@@ -2285,6 +2309,14 @@ impl App {
                             .map(|t| (t.tab_id, t.handle, t.size))
                             .collect();
                         egui_ui::graveyard_panel(ui, &mut egui.ui_state, ok, err, top, &thumbs);
+                    }
+                    if !sw_open && egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces) {
+                        let pal = self.config.palette;
+                        let ok = ui_style::rgb_c32(pal.map(|p| p[2]).unwrap_or(crate::config::Rgb(59, 193, 126)));
+                        let err = ui_style::rgb_c32(pal.map(|p| p[1]).unwrap_or(crate::config::Rgb(239, 97, 109)));
+                        let top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
+                        let ws: Vec<_> = self.config.workspace_colors.iter().map(|c| ui_style::rgb_c32(*c)).collect();
+                        egui_ui::workspaces_panel(ui, &mut egui.ui_state, ok, err, top, &ws);
                     }
                     if let Some(r) = self.ripple.as_ref() {
                         let t = r.at.elapsed().as_secs_f32() / 0.18;
@@ -2351,6 +2383,15 @@ impl App {
                     // frame already counted the burials it is rendering.
                     self.pending_grave = Some((index, action));
                     egui.ui_state.grave_sel = None;
+                    window.request_redraw();
+                }
+                if let Some(index) = egui.ui_state.ws_out.take() {
+                    // Switching is the app's job (it moves whole tab lists), so
+                    // it goes through the same action the chord uses. The panel
+                    // stays open: hopping between workspaces and watching the
+                    // check mark move is what a panel is for.
+                    self.pending_action = Some(format!("goto_workspace_{index}"));
+                    egui.ui_state.ws_sel = Some(index);
                     window.request_redraw();
                 }
                 if let Some(pick) = egui.ui_state.menu_out.take() {
@@ -3170,7 +3211,9 @@ impl App {
         }
         let m = egui_mods(mods);
         let action = self.action_for(key, None, false);
-        if !self.egui_owns_keyboard() || matches!(action.as_deref(), Some("show_config" | "show_history")) {
+        if !self.egui_owns_keyboard()
+            || action.is_some_and(|a| Self::is_panel_action(&a))
+        {
             return false;
         }
         match key {
@@ -4085,17 +4128,33 @@ impl App {
         )
     }
 
-    /// True while the graveyard panel is the ONLY keyboard surface (menus,
+    /// Actions that belong to the app rather than to egui even while a panel
+    /// has the keyboard: they open, close or steer the panels themselves, and
+    /// the workspace chords have to keep switching with the panel open.
+    fn is_panel_action(action: &str) -> bool {
+        matches!(action, "show_config" | "show_history" | "graveyard" | "show_workspaces")
+            || action.starts_with("goto_workspace_")
+    }
+
+    /// True while one of the list panels is the ONLY keyboard surface (menus,
     /// the rename box, the switcher and editors keep full ownership when
     /// they are open).
-    fn grave_only_owner(&self) -> bool {
+    fn sole_panel_owner(&self, panel: egui_ui::RightPanel) -> bool {
         !self.switcher_open_here()
             && self.wins[self.cur].egui.as_ref().is_some_and(|e| {
             let st = &e.ui_state;
-            st.right_panel == egui_ui::RightPanel::Graveyard
+            st.right_panel == panel
                 && !st.rename_open && !st.menu_open && !st.move_open
                 && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx)
         })
+    }
+
+    fn grave_only_owner(&self) -> bool {
+        self.sole_panel_owner(egui_ui::RightPanel::Graveyard)
+    }
+
+    fn ws_only_owner(&self) -> bool {
+        self.sole_panel_owner(egui_ui::RightPanel::Workspaces)
     }
 
     /// While the panel is the only surface, just its own keys reach egui;
@@ -4104,12 +4163,25 @@ impl App {
         !self.grave_only_owner() || self.grave_wants_key(key)
     }
 
+    /// As `graveyard_passes_key` for the workspace panel.
+    fn workspaces_passes_key(&self, key: &Key) -> bool {
+        !self.ws_only_owner() || self.ws_wants_key(key)
+    }
+
     /// The panel is the only surface and this key is one of its own: it is
     /// queued to egui and acted on during the next draw, so it must not also
     /// reach the terminal (the egui wrapper does not report plain keys as
     /// consumed, which would leak them).
     fn graveyard_claims_key(&self, key: &Key) -> bool {
         self.grave_only_owner() && self.grave_wants_key(key)
+            || self.ws_only_owner() && self.ws_wants_key(key)
+    }
+
+    /// The workspace panel's own keys. Its arrows and Enter are always its
+    /// business: with the panel open they mean "move the check mark" and
+    /// "go there", and a workspace switch is reversible with the same key.
+    fn ws_wants_key(&self, key: &Key) -> bool {
+        Self::is_grave_nav_key(key) || matches!(key, Key::Named(NamedKey::Enter))
     }
 
     /// The panel's own keys. Navigation is always its; the commit keys
@@ -4357,6 +4429,30 @@ impl App {
                     st.grave_sel = None;
                     st.grave_out = None;
                     st.grave_rows = rows;
+                }
+            }
+            "show_workspaces" => {
+                // Same contract as the graveyard: open with a snapshot, start
+                // the keyboard on the workspace the window is looking at. With
+                // the feature off the panel would open onto ten rows that
+                // cannot switch, so it does not open at all.
+                if !self.config.workspaces_enabled {
+                    return;
+                }
+                let current = self.wins[self.cur].workspace;
+                let opening = !self
+                    .wins[self.cur]
+                    .egui
+                    .as_ref()
+                    .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Workspaces));
+                let rows = if opening { self.ws_rows() } else { Vec::new() };
+                if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                    let st = &mut egui.ui_state;
+                    st.toggle_panel(egui_ui::RightPanel::Workspaces);
+                    egui_ui::release_focus(&egui.ctx);
+                    st.ws_sel = if opening { Some(current) } else { None };
+                    st.ws_out = None;
+                    st.ws_rows = rows;
                 }
             }
             "prev_tab" | "prev_tab_row" => {
@@ -5823,7 +5919,8 @@ impl ApplicationHandler for App {
                     && !self.recording_binding()
                     && self.egui_owns_keyboard()
                     && self.graveyard_passes_key(&key.logical_key)
-                    && !matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"))
+                    && self.workspaces_passes_key(&key.logical_key)
+                    && !Self::is_panel_action(action.as_deref().unwrap_or_default())
             }
             _ => true,
         };
@@ -6351,7 +6448,7 @@ impl ApplicationHandler for App {
                     let action = self.action_for(&key.logical_key, Some(&key), false);
                     // Panel shortcuts remain global while a sidebar field is focused.
                     // Other consumed presses belong only to egui's editor.
-                    let panel_shortcut = matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"));
+                    let panel_shortcut = Self::is_panel_action(action.as_deref().unwrap_or_default());
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
                         "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
                         "scroll_page_up" | "scroll_page_down" | "enlarge_font" | "shrink_font"));

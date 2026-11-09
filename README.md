@@ -74,8 +74,12 @@ Features
   missing tabs up to that number automatically (0 selects tab 10). Existing tabs
   keep their numbers; new tabs are appended. Workspaces remember the selected tab
   and keep their terminals running. Visiting an empty workspace opens its
-  first terminal. The W1…W10 button at the right of the tab bar shows the
-  current workspace and opens a picker. Closing a workspace's last tab
+  first terminal. The W button at the right of the tab bar shows the current
+  workspace and opens the workspace panel: all ten slots in their own colours,
+  each with its tab count, the caption of its front tab, and the chord that
+  jumps to it. Click a row or press Enter to go; the panel stays open so you
+  can hop, and Esc closes it. `show_workspaces` is its action, shipped unbound
+  so it collides with nothing, and bindable in Settings → Keys. Closing a workspace's last tab
   returns to another populated workspace; closing the window's final tab
   closes the window. Bindings are configurable as `goto_workspace_0` through
   `goto_workspace_9`, in Settings → Keys or under `bindings:`. Set each

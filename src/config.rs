@@ -187,6 +187,10 @@ impl Default for Config {
         bind("next_command", &["CONTROL+ALT+Down"]);
         bind("reopen_tab", &["CONTROL+SHIFT+z"]);
         bind("graveyard", &["CONTROL+SHIFT+g"]);
+        // Deliberately unbound: the tab-bar button is the panel's control, and
+        // every Alt+Shift+letter that would suit it (W especially) already
+        // belongs to something. Bind it in Settings > Keys if you want a chord.
+        bind("show_workspaces", &[]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
         bind("new_window", &["CONTROL+SHIFT+n"]);
         bind("send_tab_to_window", &["MOD1+SHIFT+w"]);
