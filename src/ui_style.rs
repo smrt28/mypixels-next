@@ -233,6 +233,7 @@ pub(crate) enum Icon {
     Rerun,
     View,
     Tombstone,
+    ChevronDown,
 }
 
 pub(crate) fn icon_button(
@@ -330,6 +331,9 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
             for x in [-6.0, 0.0, 6.0] {
                 p.circle_filled(pt(x, 0.0), 1.3, color);
             }
+        }
+        Icon::ChevronDown => {
+            line(&[(-4.5, -1.5), (0.0, 3.0), (4.5, -1.5)]);
         }
         Icon::Clock => {
             p.circle_stroke(center, 7.0, stroke);

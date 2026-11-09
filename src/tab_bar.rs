@@ -86,10 +86,17 @@ pub(crate) fn show(
                 if response.hovered() {
                     colors.surface(p, workspace_rect, 4.0, false, true);
                 }
-                ui_style::text(ui, workspace_rect, &format!("W{} ▾", workspace + 1), colors.accent, 11.0, false);
+                ui_style::text(
+                    ui,
+                    egui::Rect::from_min_max(
+                        egui::pos2(workspace_rect.left() + 8.0, workspace_rect.top()),
+                        egui::pos2(workspace_rect.right() - 18.0, workspace_rect.bottom())),
+                    &format!("W{}", workspace + 1), colors.accent, 11.0, false);
+                ui_style::icon(p, Icon::ChevronDown,
+                    egui::pos2(workspace_rect.right() - 9.0, workspace_rect.center().y), colors.accent);
                 geometry.workspace_clicked = response.clicked();
-                response.on_hover_text(format!("Workspace {} · Alt+{} · click to switch", workspace + 1,
-                    crate::WORKSPACE_KEYS.chars().nth(workspace).unwrap_or('q').to_ascii_uppercase()))
+                response.on_hover_text(format!("Workspace {} · {} · click to switch", workspace + 1,
+                    crate::config::workspace_shortcut(cfg, workspace)))
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
             }
             let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };

@@ -22,6 +22,9 @@ tab_overview_on_alt: false
 tab_overview_delay_ms: 60
 show_tab_titles: false
 workspaces_enabled: true
+# This test drives the opt-in Alt+Q..P scheme; the standard Alt+Shift+digit
+# scheme is checked at the end, after the letters are switched back off.
+workspace_letter_keys: true
 ''')
 fixture = work / 'fixture.py'
 fixture.write_text(r'''
@@ -251,6 +254,17 @@ try:
     wait(lambda: (work / 'input-35').exists(), 'numbered shortcut failed with the switcher disabled')
     if os.environ.get('MYPIXELS_WORKSPACE_SCREENSHOT'):
         sp.run(['grim', str(work / 'number-only-tabs.png')], check=True)
+    # The standard scheme must work, and the opt-in letters must go inert when
+    # switched off - bare Alt+letter belongs to the shell, not to workspaces.
+    config.write_text(config.read_text()
+                      .replace('workspace_letter_keys: true', 'workspace_letter_keys: false'))
+    send('ctrl+shift+r')
+    spy()
+    assert spy()[0] == 1, 'a config reload must not move the user between workspaces'
+    send('alt+q')
+    assert spy()[0] == 1, 'Alt+Q must be released to the shell when letter keys are off'
+    send('alt+shift+1')
+    wait(lambda: spy()[0] == 0, 'Alt+Shift+1, the standard workspace shortcut, did not switch')
     print('Workspace, tab preference, and numbered tab checks passed. Artifacts:', work)
 finally:
     app.terminate()

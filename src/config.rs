@@ -109,8 +109,13 @@ pub struct Config {
     /// Enables the Alt-held visual tab switcher. Numbered shortcuts work independently.
     pub tab_overview_on_alt: bool,
     pub show_tab_titles: bool,
-    /// Ten independent tab sets per window (Alt+Q..P). Off by default.
+    /// Ten independent tab sets per window. Off by default.
     pub workspaces_enabled: bool,
+    /// Opt-in alternative workspace shortcut: Alt+Q..P. Off by default because
+    /// bare Alt+letter collides with shell and editor bindings (word-wise
+    /// backward word, readline shortcuts). The standard scheme is
+    /// Alt+Shift+digit, which shares no range with those.
+    pub workspace_letter_keys: bool,
     pub tab_overview_opacity: f32,
     pub tab_overview_delay_ms: u32,
     /// Switcher preview scale: the tab's frame shrunk by this factor (1.0 =
@@ -217,8 +222,10 @@ impl Default for Config {
             bind(&format!("goto_tab_{i}"), &[&format!("MOD1+{d}")]);
         }
 
-        for (i, key) in "qwertyuiop".chars().enumerate() {
-            bind(&format!("goto_workspace_{i}"), &[&format!("MOD1+{key}")]);
+        for (i, digit) in ["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_0"].iter().enumerate() {
+            // Alt+Shift+digit: the standard scheme. Bare Alt+letter is opt-in
+            // (`workspace_letter_keys`) because it masks shell key combinations.
+            bind(&format!("goto_workspace_{i}"), &[&format!("MOD1+SHIFT+{digit}")]);
         }
 
         Self {
@@ -264,6 +271,7 @@ impl Default for Config {
             tab_overview_on_alt: true,
             show_tab_titles: true,
             workspaces_enabled: false,
+            workspace_letter_keys: false,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
             tab_overview_scale: 0.25,
@@ -378,7 +386,29 @@ impl Config {
         }
         cfg.theme_files.sort();
         cfg.theme_files.dedup();
+        cfg.apply_workspace_letter_keys();
         Ok(cfg)
+    }
+
+    /// Add the opt-in Alt+Q..P form alongside the standard Alt+Shift+digit
+    /// scheme. Runs after a file is merged, because the default bindings are
+    /// built before any setting is read. A binding the file states outright
+    /// is left alone.
+    fn apply_workspace_letter_keys(&mut self) {
+        if !self.workspace_letter_keys {
+            return;
+        }
+        for (i, letter) in WORKSPACE_LETTERS.chars().enumerate() {
+            let action = format!("goto_workspace_{i}");
+            let Some(letter_binding) = Binding::parse(&format!("MOD1+{letter}")) else { continue };
+            if let Some((_, list)) = self.bindings.iter_mut().find(|(a, _)| *a == action) {
+                if !list.iter().any(|b| b.key == letter_binding.key && b.mods == letter_binding.mods) {
+                    list.push(letter_binding.clone());
+                }
+            } else {
+                self.bindings.push((action, vec![letter_binding]));
+            }
+        }
     }
 
     /// Persist the fields the configuration UI edits, in place: each
@@ -425,6 +455,7 @@ impl Config {
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
+            ("workspace_letter_keys".into(), self.workspace_letter_keys.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
             ("tab_overview_scale".into(), self.tab_overview_scale.to_string()),
@@ -527,9 +558,38 @@ fn dedupe_top_level(text: &str) -> String {
     out
 }
 
+/// The US-layout symbol that Shift puts on a digit's key. Used so a binding
+/// written as Alt+Shift+2 also fires when the terminal reports Shift+2 as
+/// "@". Layouts that shift digits differently keep working if the binding
+/// spells the symbol their keyboard actually produces.
+pub(crate) fn shifted_digit_of(c: &str) -> Option<&'static str> {
+    Some(match c {
+        "1" => "!", "2" => "@", "3" => "#", "4" => "$", "5" => "%",
+        "6" => "^", "7" => "&", "8" => "*", "9" => "(", "0" => ")",
+        _ => return None,
+    })
+}
+
+/// Workspaces per window. Sized to the digit row, not to the letter scheme.
+pub const WORKSPACES: usize = 10;
+/// The opt-in letter shortcut scheme (`workspace_letter_keys`), one key per
+/// workspace. Kept separate from the standard Alt+Shift+digit scheme.
+pub const WORKSPACE_LETTERS: &str = "qwertyuiop";
+
+/// The human label of a workspace's shortcut, read from the real binding so
+/// the UI never advertises a key the user did not choose.
+pub fn workspace_shortcut(cfg: &Config, workspace: usize) -> String {
+    cfg.bindings
+        .iter()
+        .find(|(action, _)| *action == format!("goto_workspace_{workspace}"))
+        .and_then(|(_, list)| list.first())
+        .map(|b| b.label())
+        .unwrap_or_else(|| format!("Alt+Shift+{}", (workspace + 1) % 10))
+}
+
 pub(crate) fn workspace_color_index(key: &str) -> Option<usize> {
     let index = key.strip_prefix("workspace_color_")?.parse::<usize>().ok()?.checked_sub(1)?;
-    (index < 10).then_some(index)
+    (index < WORKSPACES).then_some(index)
 }
 
 pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
@@ -699,6 +759,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                         cfg.workspaces_enabled = b;
                     }
                 },
+                "workspace_letter_keys" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.workspace_letter_keys = b;
+                    }
+                },
                 "tab_overview_on_alt" => {
                     if let Some(b) = val.as_bool() {
                         cfg.tab_overview_on_alt = b;
@@ -806,13 +871,13 @@ fn merge_bindings(bindings: &mut Vec<(String, Vec<Binding>)>, val: &serde_yaml::
 // Keybindings
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BoundKey {
     Named(NamedKey),
     Char(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Binding {
     pub mods: ModifiersState,
     pub key: BoundKey,
@@ -928,7 +993,12 @@ impl Binding {
             // spell CONTROL+SHIFT+c. Caps Lock must not break shortcuts either.
             BoundKey::Char(c) => matches!(key, Key::Character(k) if k == c ||
                 (self.mods.intersects(ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT)
-                    && k.eq_ignore_ascii_case(c))),
+                    && k.eq_ignore_ascii_case(c))
+                // Shift turns a digit into a symbol before the key is ever
+                // reported: Alt+Shift+2 arrives as "@", never "2", so a
+                // digit written with Shift must also answer to its symbol.
+                // Same US-shifted-symbol convention as `braceleft` -> "{`.
+                || (self.mods.shift_key() && shifted_digit_of(c).is_some_and(|s| k == s))),
         }
     }
 
@@ -1030,17 +1100,65 @@ mod tests {
     }
 
     #[test]
-    fn workspaces_have_distinct_alt_letter_bindings() {
+    #[test]
+    fn workspace_shortcuts_use_alt_shift_digits_and_free_alt_letters() {
         let cfg = Config::default();
-        for (i, key) in "qwertyuiop".chars().enumerate() {
-            let key = Key::Character(key.to_string().into());
+        // The standard scheme: Alt+Shift+digit, in physical digit order.
+        for (i, digit) in "1234567890".chars().enumerate() {
+            let key = Key::Character(digit.to_string().into());
+            assert_eq!(
+                find_action(&cfg.bindings, &key, ModifiersState::ALT | ModifiersState::SHIFT, false),
+                Some(format!("goto_workspace_{i}")),
+                "Alt+Shift+{digit}");
+        }
+        // Bare Alt+letter belongs to the shell (readline, word motions) and
+        // must stay unclaimed unless the user opts into the letter scheme.
+        for letter in WORKSPACE_LETTERS.chars() {
+            let key = Key::Character(letter.to_string().into());
+            assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::ALT, false), None,
+                "Alt+{letter} must reach the shell by default");
+        }
+    }
+
+    #[test]
+    fn shift_digit_bindings_also_match_the_shifted_symbol() {
+        // The key report carries Shift's symbol ("@"), never the digit, so a
+        // binding written as MOD1+SHIFT+_2 has to answer to both spellings.
+        let cfg = Config::default();
+        // "*" is left out: it is also Shift+KP_Multiply (toggle_entangle), and
+        // the key report cannot tell the two keys apart.
+        for (symbol, i) in [("!", 0), ("@", 1), ("#", 2), ("$", 3), ("%", 4), ("^", 5), ("&", 6), ("(", 8), (")", 9)] {
+            let key = Key::Character(symbol.into());
+            assert_eq!(
+                find_action(&cfg.bindings, &key, ModifiersState::ALT | ModifiersState::SHIFT, false),
+                Some(format!("goto_workspace_{i}")),
+                "Alt+Shift should match {symbol}");
+        }
+        // A digit bound without Shift keeps the literal digit only.
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("2".into()), ModifiersState::ALT, false),
+            Some("goto_tab_1".into()));
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("@".into()), ModifiersState::ALT, false), None,
+            "the symbol of Shift+2 is not Alt+2");
+    }
+
+    #[test]
+    fn workspace_letter_keys_adds_alt_letters_without_losing_the_digits() {
+        let cfg = Config::from_text("wal_palette: ''\nworkspace_letter_keys: true\n", std::path::Path::new(".")).unwrap();
+        for (i, letter) in WORKSPACE_LETTERS.chars().enumerate() {
+            let key = Key::Character(letter.to_string().into());
             assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::ALT, false),
-                Some(format!("goto_workspace_{i}")));
+                Some(format!("goto_workspace_{i}")), "Alt+{letter}");
             assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::empty(), false), None);
         }
-        for (i, key) in "1234567890".chars().enumerate() {
-            assert_eq!(find_action(&cfg.bindings, &Key::Character(key.to_string().into()), ModifiersState::ALT, false),
-                Some(format!("goto_tab_{i}")));
+        // Both schemes coexist.
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("@".into()),
+            ModifiersState::ALT | ModifiersState::SHIFT, false), Some("goto_workspace_1".into()));
+        // Saved and reloaded, the scheme does not accumulate duplicates.
+        let saved = replace_top_level_values("", &cfg.ui_keys());
+        let again = Config::from_text(&saved, std::path::Path::new(".")).unwrap();
+        for i in 0..WORKSPACES {
+            let list = again.bindings.iter().find(|(a, _)| *a == format!("goto_workspace_{i}")).unwrap();
+            assert_eq!(list.1.len(), 2, "workspace {i} bindings");
         }
     }
 
@@ -1110,8 +1228,9 @@ mod tests {
         let mut cfg = Config::default();
         let legacy: serde_yaml::Value = serde_yaml::from_str("show_tab_overview: MOD1+o\noverview_exit: Escape\noverview_nav_left: Left\n").unwrap();
         merge_bindings(&mut cfg.bindings, &legacy);
-        // The retired overview chord now selects workspace 9 by default.
-        assert_eq!(find_action(&cfg.bindings, &Key::Character("o".into()), M::ALT, false).as_deref(), Some("goto_workspace_8"));
+        // Alt+o is no longer claimed: bare Alt+letters are left to the shell
+        // unless `workspace_letter_keys` opts in.
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("o".into()), M::ALT, false), None);
         assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Escape), M::empty(), false), None);
         assert!(cfg.tab_overview_on_alt, "the Alt-held visual switcher remains enabled");
     }

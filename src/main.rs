@@ -269,7 +269,9 @@ struct SwThumb {
     revision: u64,
 }
 
-const WORKSPACE_KEYS: &str = "qwertyuiop";
+/// Workspace shortcuts live in the config (`goto_workspace_0..9`); the count
+/// lives with them so the UI cannot drift from the bindings.
+const WORKSPACES: usize = crate::config::WORKSPACES;
 
 #[derive(Default)]
 struct Workspace {
@@ -918,7 +920,7 @@ impl App {
         if !self.config.workspaces_enabled {
             return;
         }
-        if target >= WORKSPACE_KEYS.len() || target == self.wins[self.cur].workspace {
+        if target >= WORKSPACES || target == self.wins[self.cur].workspace {
             return;
         }
         self.close_switcher();
@@ -1148,7 +1150,7 @@ impl App {
                         self.wins.iter().enumerate().map(|(i, w)| serde_json::json!({
                             "window": i + 1,
                             "active_workspace": w.workspace + 1,
-                            "workspaces": (0..WORKSPACE_KEYS.len()).map(|index| {
+                            "workspaces": (0..WORKSPACES).map(|index| {
                                 let (tabs, active) = if index == w.workspace { (&w.tabs, w.active) }
                                     else { (&w.workspaces[index].tabs, w.workspaces[index].active) };
                                 serde_json::json!({
@@ -2131,12 +2133,13 @@ impl App {
                             st.menu_open = false;
                             egui_ui::release_focus(&ctx);
                         } else {
-                            st.menu_items = WORKSPACE_KEYS.chars().enumerate().map(|(i, key)| {
+                            st.menu_items = (0..WORKSPACES).map(|i| {
                                 let count = if i == self.wins[self.cur].workspace {
                                     self.wins[self.cur].tabs.len()
                                 } else { self.wins[self.cur].workspaces[i].tabs.len() };
-                                let selected = if i == self.wins[self.cur].workspace { "● " } else { "" };
-                                (format!("{selected}Workspace {} · {} tabs · Alt+{}", i + 1, count, key.to_ascii_uppercase()),
+                                let mark = if i == self.wins[self.cur].workspace { "●  " } else { "   " };
+                                (format!("{mark}Workspace {} \u{b7} {} tabs \u{b7} {}", i + 1, count,
+                                    config::workspace_shortcut(&self.config, i)),
                                     format!("goto_workspace_{i}"), true)
                             }).collect();
                             st.menu_seps.clear();
@@ -4759,7 +4762,7 @@ impl App {
                 tabs: Vec::new(),
                 active: 0,
                 workspace: 0,
-                workspaces: (0..WORKSPACE_KEYS.len()).map(|_| Workspace::default()).collect(),
+                workspaces: (0..WORKSPACES).map(|_| Workspace::default()).collect(),
                 dims: Dims { cols, rows },
                 cols,
                 rows,
