@@ -2055,7 +2055,7 @@ pub fn config_window(
                                 ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
                                 form_grid("colors-workspaces").show(ui, |ui| {
                                     for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
-                                        color_row(ui, &format!("Workspace W{}", index + 1), color, &mut ev);
+                                        color_row(ui, &format!("Workspace {}", index + 1), color, &mut ev);
                                     }
                                 });
                             });
@@ -2950,7 +2950,7 @@ mod regression {
             full.textures_delta.clear();
         }
         for index in 1..=10 {
-            assert!(labels.contains(&format!("Workspace W{index}")), "missing workspace W{index}");
+            assert!(labels.contains(&format!("Workspace {index}")), "missing workspace {index}");
         }
         for retired in ["Tab", "Tab (active)", "Tab text", "Tab text (active)"] {
             assert!(!labels.iter().any(|label| label == retired));

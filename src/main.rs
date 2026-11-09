@@ -2224,7 +2224,8 @@ impl App {
                     if show_strip {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
                             &tab_faces, self.wins[self.cur].active, clock.as_deref(),
-                            egui.ui_state.menu_open && egui.ui_state.menu_app, self.wins[self.cur].workspace, &self.config);
+                            egui.ui_state.menu_open && egui.ui_state.menu_app, self.wins[self.cur].workspace,
+                            egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces), &self.config);
                         if strip_geometry.menu_clicked {
                             let st = &mut egui.ui_state;
                             if st.menu_open && st.menu_app {

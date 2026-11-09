@@ -3,6 +3,10 @@
 use crate::ui_style::{self, Icon};
 
 const MENU_WIDTH: f32 = 42.0;
+/// The workspace indicator: one number, not "W1". It sits beside the terminal
+/// icon rather than at the far end of the strip, because it names where you
+/// are rather than offering an action at the point of use.
+const WORKSPACE_WIDTH: f32 = 32.0;
 
 pub(crate) fn menu_button_rect(height: f32) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(3.0, 3.0), egui::pos2(MENU_WIDTH - 3.0, height - 3.0))
@@ -21,6 +25,8 @@ pub(crate) struct TabFace {
 pub(crate) struct Geometry {
     pub menu_clicked: bool,
     pub workspace_clicked: bool,
+    /// Where the indicator is, for anything that needs to point at it.
+    pub workspace: egui::Rect,
     pub tabs: Vec<egui::Rect>,
     pub close: Vec<egui::Rect>,
     pub add: egui::Rect,
@@ -28,7 +34,8 @@ pub(crate) struct Geometry {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Self { menu_clicked: false, workspace_clicked: false, tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
+        Self { menu_clicked: false, workspace_clicked: false, workspace: egui::Rect::NOTHING,
+            tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
     }
 }
 
@@ -41,6 +48,7 @@ pub(crate) fn show(
     clock: Option<&str>,
     menu_open: bool,
     workspace: usize,
+    workspace_open: bool,
     cfg: &crate::config::Config,
 ) -> Geometry {
     let chrome = ui_style::TabStyle::new(root, cfg, workspace);
@@ -63,7 +71,8 @@ pub(crate) fn show(
             let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
             p.rect_filled(bar, 0.0, colors.bg);
             p.hline(bar.x_range(), height - 0.5, egui::Stroke::new(1.0, colors.border));
-            let brand_width = MENU_WIDTH;
+            let workspace_width = if cfg.workspaces_enabled { WORKSPACE_WIDTH } else { 0.0 };
+            let brand_width = MENU_WIDTH + workspace_width;
             let menu = menu_button_rect(height);
             let response = ui.interact(menu, egui::Id::unique("app_menu_button"), egui::Sense::click());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "mypixels menu"));
@@ -77,33 +86,31 @@ pub(crate) fn show(
                 center + egui::vec2(3.0, -1.5)], egui::Stroke::new(1.0, color)));
             geometry.menu_clicked = response.clicked();
             response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
-            p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
-            let workspace_width = if cfg.workspaces_enabled { 64.0 } else { 0.0 };
-            if cfg.workspaces_enabled {
+            // The indicator belongs to neither neighbour, so a rule separates it
+            // from the menu on one side and from the tabs on the other.
+            p.vline(MENU_WIDTH - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
+            if workspace_width > 0.0 {
                 let workspace_rect = egui::Rect::from_min_max(
-                    egui::pos2(width - workspace_width, 3.0), egui::pos2(width - 3.0, height - 3.0));
+                    egui::pos2(MENU_WIDTH + 3.0, 3.0), egui::pos2(brand_width - 3.0, height - 3.0));
                 let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
-                if response.hovered() {
-                    colors.surface(p, workspace_rect, 4.0, false, true);
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true,
+                    &format!("Workspace {}", workspace + 1)));
+                if workspace_open || response.hovered() {
+                    colors.surface(p, workspace_rect, 4.0, workspace_open, response.hovered());
                 }
-                ui_style::text(
-                    ui,
-                    egui::Rect::from_min_max(
-                        egui::pos2(workspace_rect.left() + 8.0, workspace_rect.top()),
-                        egui::pos2(workspace_rect.right() - 18.0, workspace_rect.bottom())),
-                    &format!("W{}", workspace + 1), colors.accent, 11.0, false);
-                ui_style::icon(p, Icon::ChevronDown,
-                    egui::pos2(workspace_rect.right() - 9.0, workspace_rect.center().y), colors.accent);
+                ui_style::text_centered(ui, workspace_rect, &(workspace + 1).to_string(), colors.accent, 11.0, false);
                 geometry.workspace_clicked = response.clicked();
-                response.on_hover_text(format!("Workspace {} · {} · click to switch", workspace + 1,
-                    crate::config::workspace_shortcut(cfg, workspace)))
+                geometry.workspace = workspace_rect;
+                response.on_hover_text(format!("Workspace {} \u{b7} {} \u{b7} click for the workspace panel",
+                    workspace + 1, crate::config::workspace_shortcut(cfg, workspace)))
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
+                p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             }
             let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };
             if clock_width > 0.0 {
                 ui_style::text(
                     ui,
-                    egui::Rect::from_min_max(egui::pos2(width - workspace_width - clock_width, 0.0), egui::pos2(width - workspace_width, height)),
+                    egui::Rect::from_min_max(egui::pos2(width - clock_width, 0.0), egui::pos2(width, height)),
                     clock.unwrap(),
                     colors.muted,
                     11.0,
@@ -117,11 +124,11 @@ pub(crate) fn show(
                 .map(|tab| {
                     if !cfg.show_tab_titles { return 36.0; }
                     let title = ui.painter().layout_no_wrap(tab.title.clone(), font.clone(), colors.fg);
-                    (title.size().x + 58.0 + if tab.entangled { 10.0 } else { 0.0 }).clamp(96.0, (width - brand_width - clock_width - workspace_width - 54.0).clamp(96.0, 236.0))
+                    (title.size().x + 58.0 + if tab.entangled { 10.0 } else { 0.0 }).clamp(96.0, (width - brand_width - clock_width - 54.0).clamp(96.0, 236.0))
                 })
                 .collect();
             let content_width = widths.iter().sum::<f32>() + gap * tabs.len().saturating_sub(1) as f32;
-            let viewport_width = content_width.min((width - brand_width - clock_width - workspace_width - 38.0).max(30.0));
+            let viewport_width = content_width.min((width - brand_width - clock_width - 38.0).max(30.0));
             let viewport =
                 egui::Rect::from_min_size(egui::pos2(brand_width + 4.0, 3.0), egui::vec2(viewport_width, body_height));
             let selection = (tabs.get(active).map(|t| t.id), width.to_bits(), content_width.to_bits());
@@ -282,7 +289,7 @@ mod tests {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                         ..Default::default()
                     }, |ui| {
-                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, None, false, 0, &cfg);
+                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, None, false, 0, false, &cfg);
                     });
                     if !show_titles {
                         assert!(!full.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
@@ -301,6 +308,55 @@ mod tests {
                     assert!(geometry.close.iter().all(|rect| !rect.is_positive()), "invisible close hit targets");
                 }
             }
+        }
+    }
+
+    /// The indicator names where you are, so it lives beside the terminal icon
+    /// rather than at the far end of the strip - and a rule on each side keeps
+    /// it from reading as the menu's, or as the first tab's.
+    #[test]
+    fn the_workspace_indicator_sits_between_the_menu_and_the_tabs() {
+        for width in [360.0, 1280.0] {
+            let ctx = egui::Context::default();
+            let mut cfg = crate::config::Config::default();
+            cfg.workspaces_enabled = true;
+            let tabs: Vec<_> = (0..3)
+                .map(|id| TabFace {
+                    id, preview: None, title: format!("terminal {id}"), tooltip: String::new(),
+                    group: None, entangled: false, attention: 0.0,
+                })
+                .collect();
+            let mut geometry = Geometry::default();
+            let mut full = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                ..Default::default()
+            }, |ui| {
+                geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, Some("12:34"), false, 2, false, &cfg);
+            });
+            full.textures_delta.clear();
+            let mark = geometry.workspace;
+            assert!(mark.is_positive(), "the indicator has no hit area");
+            assert!(mark.left() >= MENU_WIDTH, "the indicator crowds the terminal icon");
+            assert!(mark.left() - MENU_WIDTH < 12.0, "the indicator drifts away from the icon");
+            assert!(geometry.tabs[0].left() >= mark.right(), "the indicator overlaps the first tab");
+            // The two rules and the number itself are strokes and text; egui
+            // hands back pruned shapes here, so they are checked on screen
+            // rather than from the shape list. What the layout guarantees is
+            // here: the cell is between the icon and the tabs, touching neither.
+
+            // Off, it takes no space at all: one rule, and the tabs start where
+            // they always did.
+            cfg.workspaces_enabled = false;
+            let mut off = Geometry::default();
+            let mut out = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                ..Default::default()
+            }, |ui| {
+                off = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, Some("12:34"), false, 2, false, &cfg);
+            });
+            out.textures_delta.clear();
+            assert!(!off.workspace.is_positive(), "a hidden indicator still claims a rect");
+            assert!(off.tabs[0].left() < geometry.tabs[0].left(), "the tabs did not move up when the indicator went away");
         }
     }
 
@@ -330,7 +386,7 @@ mod tests {
                         },
                         |ui| {
                             geometry =
-                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, 0, &cfg);
+                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, 0, false, &cfg);
                         },
                     );
                     output.textures_delta.clear();

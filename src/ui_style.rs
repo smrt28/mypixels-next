@@ -215,6 +215,17 @@ pub(crate) fn preview_image(ui: &egui::Ui, rect: egui::Rect, image: Option<(egui
 /// A single-line galley with an ellipsis, so long commands never move the
 /// clock column or enlarge the sidebar. The full command remains in a tooltip.
 pub(crate) fn text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool) {
+    draw_text(ui, rect, text, color, size, strong, false)
+}
+
+/// As `text`, centred in the rect. Indicator cells have no left edge to hang a
+/// label from: a workspace number reads as a mark, so it sits in the middle of
+/// the space the strip gave it.
+pub(crate) fn text_centered(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool) {
+    draw_text(ui, rect, text, color, size, strong, true)
+}
+
+fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool, center: bool) {
     if rect.width() <= 0.0 {
         return;
     }
@@ -228,7 +239,8 @@ pub(crate) fn text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Col
         rect.width(),
         egui::FontId::monospace(size),
     );
-    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
+    let x = if center { (rect.center().x - galley.size().x * 0.5).max(rect.left()) } else { rect.left() };
+    let pos = egui::pos2(x, rect.center().y - galley.size().y * 0.5);
     ui.painter().with_clip_rect(ui.clip_rect().intersect(rect)).galley(pos, galley, color);
 }
 
@@ -250,7 +262,6 @@ pub(crate) enum Icon {
     Rerun,
     View,
     Tombstone,
-    ChevronDown,
 }
 
 pub(crate) fn icon_button(
@@ -348,9 +359,6 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
             for x in [-6.0, 0.0, 6.0] {
                 p.circle_filled(pt(x, 0.0), 1.3, color);
             }
-        }
-        Icon::ChevronDown => {
-            line(&[(-4.5, -1.5), (0.0, 3.0), (4.5, -1.5)]);
         }
         Icon::Clock => {
             p.circle_stroke(center, 7.0, stroke);
