@@ -1,7 +1,7 @@
 //! Configuration with defaults ported from the Python version's config dict,
 //! plus keybinding parsing ("MOD1+SHIFT+Left", "CONTROL+ALT+x", "MOD1+_1" ...).
 
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -420,14 +420,70 @@ impl Config {
         self.save_to(&path)
     }
 
-    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
-        // First save into a fresh XDG location has to create it.
+    /// Save, optionally rewriting the `bindings:` block too. Bindings are
+    /// only rewritten when the configuration UI actually changed one, so a
+    /// hand-written block and its comments survive every other save.
+    pub fn save_with_bindings(&self, include_bindings: bool) -> Result<(), String> {
+        let path = Self::config_path().ok_or("Cannot determine configuration path")?;
+        self.save_to_with(&path, include_bindings)
+    }
+
+    fn save_to_with(&self, path: &std::path::Path, include_bindings: bool) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = std::fs::read_to_string(path).unwrap_or_default();
         let out = replace_top_level_values(&text, &Self::ui_keys(self));
+        let out = if include_bindings {
+            replace_top_level_block(&out, "bindings", &self.bindings_yaml())
+        } else {
+            out
+        };
         std::fs::write(path, out).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    }
+
+    /// The actions and chords this config would ship with, for a reset.
+    pub fn default_binding(action: &str) -> Vec<Binding> {
+        DEFAULT_BINDINGS.iter()
+            .find(|(a, _)| a == action)
+            .map(|(_, list)| list.clone())
+            .unwrap_or_default()
+    }
+
+    /// What this action is bound to now. Empty means deliberately unbound.
+    pub fn bindings_for(&self, action: &str) -> &[Binding] {
+        self.bindings.iter()
+            .find(|(a, _)| a == action)
+            .map(|(_, list)| list.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Bind an action to exactly these chords. An empty list unbinds it.
+    pub fn set_binding(&mut self, action: &str, list: Vec<Binding>) {
+        match self.bindings.iter_mut().find(|(a, _)| a == action) {
+            Some(entry) => entry.1 = list,
+            None => self.bindings.push((action.to_string(), list)),
+        }
+    }
+
+    /// The `bindings:` block as a file writes it: one action per line, in the
+    /// order the config holds them, quoted so symbols survive a YAML read.
+    pub fn bindings_yaml(&self) -> String {
+        let mut out = String::from("bindings:\n");
+        for (action, list) in &self.bindings {
+            let specs: Vec<String> = list.iter().map(|b| b.spec()).collect();
+            match specs.len() {
+                0 => out.push_str(&format!("  {action}: none\n")),
+                1 => out.push_str(&format!("  {action}: '{}'\n", specs[0])),
+                _ => out.push_str(&format!("  {action}: [{}]\n",
+                    specs.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "))),
+            }
+        }
+        out
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        self.save_to_with(path, false)
     }
 
     /// (yaml key, value text) for every field the configuration UI can change.
@@ -505,6 +561,38 @@ pub fn replace_top_level_values(text: &str, keys: &[(String, String)]) -> String
     out
 }
 
+/// Swap a whole top-level YAML block (the key line plus its indented body,
+/// or its single-line flow value) for another. Used for `bindings:`, whose
+/// body is many lines and so cannot go through replace_top_level_values.
+pub fn replace_top_level_block(text: &str, key: &str, block: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let indent = |l: &str| l.starts_with(' ') || l.starts_with('\t');
+    let Some(at) = lines.iter().position(|l| *l == key || l.starts_with(&format!("{key}:"))) else {
+        // Not present: the block goes at the end, after any single-line keys.
+        let mut out = text.trim_end().to_string();
+        out.push('\n');
+        out.push_str(block);
+        return out;
+    };
+    let mut end = at + 1;
+    while end < lines.len() {
+        if indent(lines[end]) {
+            end += 1;
+        } else if lines[end].trim().is_empty()
+            && lines.get(end + 1).is_some_and(|l| indent(l) && !l.trim().is_empty()) {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    let mut out: Vec<String> = lines[..at].iter().map(|l| l.to_string()).collect();
+    out.extend(block.trim_end_matches('\n').lines().map(str::to_string));
+    out.extend(lines[end..].iter().map(|l| l.to_string()));
+    let mut out = out.join("\n");
+    out.push('\n');
+    out
+}
+
 fn top_level_key(line: &str) -> Option<String> {
     let mut chars = line.chars();
     let first = chars.next()?;
@@ -558,6 +646,60 @@ fn dedupe_top_level(text: &str) -> String {
     out
 }
 
+/// The file spelling of a named key. Mirrors the names `parse` accepts; the
+/// debug form of most variants already matches, the rest are the exceptions.
+fn named_spec(key: &NamedKey) -> String {
+    String::from(match key {
+        NamedKey::ArrowLeft => "Left",
+        NamedKey::ArrowRight => "Right",
+        NamedKey::ArrowUp => "Up",
+        NamedKey::ArrowDown => "Down",
+        NamedKey::Enter => "Return",
+        NamedKey::PageUp => "Page_Up",
+        NamedKey::PageDown => "Page_Down",
+        other => return format!("{other:?}"),
+    })
+}
+
+/// The digit a Shifted symbol came from, so a chord recorded as "@" with
+/// Shift held is stored as the readable "2" (which matches both spellings).
+pub(crate) fn unshift_symbol(c: &str) -> Option<&'static str> {
+    ("1234567890").chars().position(|d| shifted_digit_of(&d.to_string()) == Some(c))
+        .map(|i| &"1234567890"[i..i + 1])
+}
+
+/// The key as if Shift had not been pressed, read from the key's physical
+/// position. Letters are already matched case-insensitively by the binding
+/// table; this exists for digits, whose shifted form differs on every layout
+/// (US "@", Czech "č"), so Alt+Shift+2 could otherwise only work on one board.
+pub fn unshifted_key(key: &Key, physical: PhysicalKey) -> Key {
+    use winit::keyboard::KeyCode;
+    let PhysicalKey::Code(code) = physical else { return key.clone() };
+    let base: &'static str = match code {
+        KeyCode::Digit0 => "0", KeyCode::Digit1 => "1", KeyCode::Digit2 => "2",
+        KeyCode::Digit3 => "3", KeyCode::Digit4 => "4", KeyCode::Digit5 => "5",
+        KeyCode::Digit6 => "6", KeyCode::Digit7 => "7", KeyCode::Digit8 => "8",
+        KeyCode::Digit9 => "9",
+        KeyCode::KeyA => "a", KeyCode::KeyB => "b", KeyCode::KeyC => "c",
+        KeyCode::KeyD => "d", KeyCode::KeyE => "e", KeyCode::KeyF => "f",
+        KeyCode::KeyG => "g", KeyCode::KeyH => "h", KeyCode::KeyI => "i",
+        KeyCode::KeyJ => "j", KeyCode::KeyK => "k", KeyCode::KeyL => "l",
+        KeyCode::KeyM => "m", KeyCode::KeyN => "n", KeyCode::KeyO => "o",
+        KeyCode::KeyP => "p", KeyCode::KeyQ => "q", KeyCode::KeyR => "r",
+        KeyCode::KeyS => "s", KeyCode::KeyT => "t", KeyCode::KeyU => "u",
+        KeyCode::KeyV => "v", KeyCode::KeyW => "w", KeyCode::KeyX => "x",
+        KeyCode::KeyY => "y", KeyCode::KeyZ => "z",
+        _ => return key.clone(),
+    };
+    // Only a typed character has a shifted form to undo; named keys are already
+    // position-based and must keep whatever they reported.
+    match key {
+        Key::Character(_) => Key::Character(base.into()),
+        _ => key.clone(),
+    }
+}
+
+
 /// The US-layout symbol that Shift puts on a digit's key. Used so a binding
 /// written as Alt+Shift+2 also fires when the terminal reports Shift+2 as
 /// "@". Layouts that shift digits differently keep working if the binding
@@ -569,6 +711,10 @@ pub(crate) fn shifted_digit_of(c: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// The bindings a pristine config ships with, for the settings panel's reset.
+static DEFAULT_BINDINGS: std::sync::LazyLock<Vec<(String, Vec<Binding>)>> =
+    std::sync::LazyLock::new(|| Config::default().bindings);
 
 /// Workspaces per window. Sized to the digit row, not to the letter scheme.
 pub const WORKSPACES: usize = 10;
@@ -855,6 +1001,16 @@ fn merge_bindings(bindings: &mut Vec<(String, Vec<Binding>)>, val: &serde_yaml::
             },
             _ => continue,
         };
+        // An action can be unbound on purpose (`close_tab: none`). Without
+        // this the empty result would fall through and the built-in default
+        // would silently come back.
+        if specs.iter().all(|s| matches!(s.trim().to_lowercase().as_str(), "" | "none" | "null" | "~")) {
+            match bindings.iter_mut().find(|(a, _)| a == action) {
+                Some(entry) => entry.1.clear(),
+                None => bindings.push((action.to_string(), Vec::new())),
+            }
+            continue;
+        }
         let parsed: Vec<Binding> = specs.iter().filter_map(|s| Binding::parse(s)).collect();
         if parsed.is_empty() {
             eprintln!("bad binding for {action:?}: {specs:?}");
@@ -978,6 +1134,29 @@ impl Binding {
         Some(Self { mods, key })
     }
 
+    /// The spelling a configuration file stores this binding as - the inverse
+    /// of `parse`, so a binding survives a save/reload unchanged.
+    pub fn spec(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.mods.control_key() { parts.push("CONTROL".into()); }
+        if self.mods.alt_key() { parts.push("MOD1".into()); }
+        if self.mods.shift_key() { parts.push("SHIFT".into()); }
+        parts.push(match &self.key {
+            BoundKey::Char(c) => match c.as_str() {
+                "+" => "KP_Add".into(),
+                "-" => "KP_Subtract".into(),
+                "*" => "KP_Multiply".into(),
+                "/" => "KP_Divide".into(),
+                "\r" => "Enter".into(),
+                "{" => "braceleft".into(),
+                "}" => "braceright".into(),
+                other => other.to_string(),
+            },
+            BoundKey::Named(k) => named_spec(k),
+        });
+        parts.join("+")
+    }
+
     /// Match a winit key + modifier state against this binding.
     pub fn matches(&self, key: &Key, mods: ModifiersState) -> bool {
         // Compare the three relevant modifier bits exactly.
@@ -1043,6 +1222,74 @@ mod tests {
             let cfg = Config::from_text(&format!("wal_palette: ''\nline_spacing: {invalid}\n"), base).unwrap();
             assert_eq!(cfg.line_spacing, 0.0, "invalid spacing {invalid}");
         }
+    }
+
+    #[test]
+    fn a_foreign_layouts_shifted_symbol_still_finds_the_digit_binding() {
+        // German puts an underscore-section sign on Shift+3, which no US table
+        // can predict; only the key's position connects it to Alt+Shift+3.
+        let cfg = Config::default();
+        let mods = ModifiersState::ALT | ModifiersState::SHIFT;
+        let reported = Key::Character("\u{a7}".into());
+        assert_eq!(find_action(&cfg.bindings, &reported, mods, false), None,
+            "the symbol itself is not a binding");
+        let by_position = unshifted_key(&reported, PhysicalKey::Code(winit::keyboard::KeyCode::Digit3));
+        assert_eq!(by_position, Key::Character("3".into()));
+        assert_eq!(find_action(&cfg.bindings, &by_position, mods, false),
+            Some("goto_workspace_2".into()));
+    }
+
+    #[test]
+    fn position_matching_never_broadens_an_unshifted_binding() {
+        // Alt+2 selects tab 2. The shifted press must not also look like it.
+        let cfg = Config::default();
+        let reported = Key::Character("\u{a7}".into());
+        let by_position = unshifted_key(&reported, PhysicalKey::Code(winit::keyboard::KeyCode::Digit2));
+        assert_eq!(find_action(&cfg.bindings, &by_position, ModifiersState::ALT, false),
+            Some("goto_tab_1".into()), "unshifted Alt+2 still selects the tab");
+        assert_eq!(find_action(&cfg.bindings, &by_position, ModifiersState::ALT | ModifiersState::SHIFT, false),
+            Some("goto_workspace_1".into()), "and the same position with Shift selects the workspace");
+    }
+
+    #[test]
+    fn binding_specs_round_trip_through_parse() {
+        // Every shipped binding must survive a save, which writes the spec.
+        for (action, list) in Config::default().bindings {
+            for b in list {
+                assert_eq!(Binding::parse(&b.spec()).as_ref().map(|p| (p.mods, p.key.clone())),
+                    Some((b.mods, b.key.clone())), "{action}: {}", b.spec());
+            }
+        }
+    }
+
+    #[test]
+    fn rebound_and_unbound_keys_round_trip_through_a_saved_file() {
+        let base = std::path::Path::new(".");
+        let mut cfg = Config::from_text("wal_palette: ''\nbindings:\n  new_tab: CONTROL+SHIFT+t\n", base).unwrap();
+        cfg.set_binding("new_tab", vec![Binding::parse("MOD1+SHIFT+2").unwrap()]);
+        cfg.set_binding("close_tab", vec![]);
+        let block = cfg.bindings_yaml();
+        let saved = replace_top_level_block("# keep me\nbindings:\n  new_tab: CONTROL+SHIFT+t\ncol_0: '#000000'\n", "bindings", &block);
+        assert!(saved.starts_with("# keep me\n"), "header survives: {saved}");
+        assert!(saved.contains("col_0: '#000000'"), "keys after the block survive");
+        assert_eq!(saved.matches("bindings:").count(), 1, "the old block is gone, not stacked: {saved}");
+        let back = Config::from_text(&saved, base).unwrap();
+        assert_eq!(back.bindings_for("new_tab").len(), 1);
+        assert_eq!(back.bindings_for("new_tab")[0].label(), "Alt+Shift+2");
+        assert!(back.bindings_for("close_tab").is_empty(), "an unbound key stays unbound");
+    }
+
+    #[test]
+    fn unbind_spelling_clears_the_default() {
+        let cfg = Config::from_text("wal_palette: ''\nbindings:\n  close_tab: none\n", std::path::Path::new(".")).unwrap();
+        assert!(cfg.bindings_for("close_tab").is_empty());
+    }
+
+    #[test]
+    fn block_replace_appends_when_the_key_is_absent() {
+        let out = replace_top_level_block("col_0: '#000000'\n", "bindings", "bindings:\n  new_tab: 'CONTROL+t'\n");
+        assert!(out.contains("col_0: '#000000'"));
+        assert!(out.contains("  new_tab: 'CONTROL+t'"));
     }
 
     #[test]

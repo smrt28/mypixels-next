@@ -971,6 +971,90 @@ impl App {
         }
     }
 
+    /// True while a keybinding row waits for a chord. The recorder owns the
+    /// keyboard outright, so keys go nowhere else - not the shell, not an
+    /// action, and not egui (a focused row would eat Space or Enter).
+    fn recording_binding(&self) -> bool {
+        self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.key_capture.is_some())
+    }
+
+    /// Feed one key to the waiting keybinding row. Always consumes the key
+    /// while a row is armed, and reports false when none is, so the caller
+    /// carries on with normal routing. Modifier presses only build the chord.
+    fn capture_binding(&mut self, key: &Key, kev: Option<&winit::event::KeyEvent>) -> bool {
+        use winit::keyboard::NamedKey as Nk;
+        let Some(action) = self.wins[self.cur].egui.as_ref()
+            .and_then(|e| e.ui_state.key_capture.clone()) else { return false };
+        let stop = |app: &mut App| {
+            if let Some(e) = app.wins[app.cur].egui.as_mut() { e.ui_state.key_capture = None; }
+        };
+        if matches!(key, Key::Named(Nk::Escape)) {
+            stop(self);
+            return true;
+        }
+        if matches!(key, Key::Named(Nk::Shift | Nk::Control | Nk::Alt | Nk::Super | Nk::Hyper | Nk::CapsLock)) {
+            return true;
+        }
+        // The config spells three modifiers; Super cannot be written down.
+        let mods = self.modifiers
+            & (ModifiersState::ALT | ModifiersState::SHIFT | ModifiersState::CONTROL);
+        let function_key = matches!(key, Key::Named(Nk::F1 | Nk::F2 | Nk::F3 | Nk::F4 | Nk::F5
+            | Nk::F6 | Nk::F7 | Nk::F8 | Nk::F9 | Nk::F10 | Nk::F11 | Nk::F12));
+        if mods.is_empty() && !function_key {
+            self.show_error(format!("{} needs a modifier, or typing that key would stop reaching the shell.",
+                egui_ui::action_label(&action)));
+            return true;
+        }
+        // Store the key by position. The report carries Shift's symbol, which
+        // is "@" on a US board and "č" on a Czech one, while the file and the
+        // row should both read "2" for Alt+Shift+2.
+        let mut key = key.clone();
+        if mods.shift_key() {
+            if let Some(k) = kev {
+                key = config::unshifted_key(&key, k.physical_key);
+            }
+            if let Key::Character(c) = &key {
+                if let Some(digit) = config::unshift_symbol(c.as_str()) {
+                    key = Key::Character(digit.into());
+                }
+            }
+        }
+        let bound = match &key {
+            Key::Named(n) => config::BoundKey::Named(n.clone()),
+            Key::Character(c) => config::BoundKey::Char(c.to_string()),
+            _ => {
+                self.show_error("That key cannot be bound.".into());
+                stop(self);
+                return true;
+            }
+        };
+        let binding = config::Binding { mods, key: bound };
+        log::info!("bind {action} = {}", binding.spec());
+        self.config.set_binding(&action, vec![binding]);
+        if let Some(e) = self.wins[self.cur].egui.as_mut() {
+            e.ui_state.key_capture = None;
+            e.ui_state.bindings_dirty = true;
+        }
+        if let Some(window) = self.wins[self.cur].window.as_ref() { window.request_redraw(); }
+        true
+    }
+
+    /// Which action this key means, if any. Tries the key as reported, then
+    /// the same key by physical position: Shift turns a digit into a layout
+    /// symbol, so a shortcut written Alt+Shift+2 could otherwise only ever
+    /// work on one keyboard. Modifiers are still compared exactly, so an
+    /// unshifted binding can never fire from a shifted press.
+    fn action_for(&self, key: &Key, kev: Option<&winit::event::KeyEvent>, overview_active: bool) -> Option<String> {
+        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
+            return Some(action);
+        }
+        let unshifted = config::unshifted_key(key, kev?.physical_key);
+        if unshifted == *key {
+            return None;
+        }
+        config::find_action(&self.config.bindings, &unshifted, self.modifiers, overview_active)
+    }
+
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
         // A window dying buries all its tabs — the current workspace and
         // the live terminals parked in inactive workspaces — so raising
@@ -2298,11 +2382,11 @@ impl App {
         self.wins[self.cur].add_hit = (strip_geometry.add.left() * scale, strip_geometry.add.right() * scale);
         self.wins[self.cur].tab_close_hits = strip_geometry.close.into_iter()
             .map(|r| egui::Rect::from_min_max(r.min * scale, r.max * scale)).collect();
-        let (revert, changed, save) = self.wins[self.cur].
+        let (revert, changed, save, bindings) = self.wins[self.cur].
             egui
             .as_ref()
-            .map(|e| (e.revert_requested, e.config_changed, e.save_requested))
-            .unwrap_or_default();
+            .map(|e| (e.revert_requested, e.config_changed, e.save_requested, e.ui_state.bindings_dirty))
+            .unwrap_or((false, false, false, false));
         if revert {
             self.reload_config();
         } else if changed {
@@ -2320,13 +2404,17 @@ impl App {
             }
         }
         if save {
-            match self.config.save() {
+            match self.config.save_with_bindings(bindings) {
                 // Done on purpose: saving closes the panel, so the user
                 // sees the result on the terminal, not in the dialog.
                 Ok(()) => {
                     log::info!("configuration saved");
                     if let Some(e) = self.wins[self.cur].egui.as_mut() {
                         e.ui_state.close_panel(egui_ui::RightPanel::Settings);
+                        // Kept until a save consumes them: a chord is recorded
+                        // many frames before the user presses Save.
+                        e.ui_state.bindings_dirty = false;
+                        e.ui_state.key_capture = None;
                     }
                 }
                 Err(err) => self.show_error(err),
@@ -3081,7 +3169,7 @@ impl App {
             return false;
         }
         let m = egui_mods(mods);
-        let action = config::find_action(&self.config.bindings, key, mods, false);
+        let action = self.action_for(key, None, false);
         if !self.egui_owns_keyboard() || matches!(action.as_deref(), Some("show_config" | "show_history")) {
             return false;
         }
@@ -3877,6 +3965,12 @@ impl App {
             }
             return;
         }
+        // 0.4. A keybinding row is waiting for a chord. The recorder takes the
+        //      key first: neither the shell nor the action table may act on
+        //      the very keystroke the user is capturing.
+        if self.capture_binding(key, kev) {
+            return;
+        }
         // 0.5. A transient egui picker (context menu, window picker) owns
         //      the keyboard the same way the rename box does: Escape closes
         //      it (through egui's own dismissal), and no key may also reach
@@ -3896,7 +3990,7 @@ impl App {
         }
         // 2. Configured bindings
         let overview_active = self.wins[self.cur].overview.is_some();
-        if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
+        if let Some(action) = self.action_for(key, kev, overview_active) {
             self.do_action(&action, event_loop);
             // The action may have closed the last window; nothing left to
             // sync. A surviving one may have lost its active tab; keep the
@@ -5721,11 +5815,12 @@ impl ApplicationHandler for App {
         // reach the terminal and focus a sidebar control on the next frame.
         let route_to_egui = match &event {
             WindowEvent::KeyboardInput { event: key, .. } => {
-                let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
+                let action = self.action_for(&key.logical_key, Some(key), false);
                 // The switcher is drawn by egui but steered by the app; while
                 // it is open, keys must not reach egui (the graveyard panel
                 // would steer an invisible selection with them).
                 !self.switcher_open_here()
+                    && !self.recording_binding()
                     && self.egui_owns_keyboard()
                     && self.graveyard_passes_key(&key.logical_key)
                     && !matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"))
@@ -6253,7 +6348,7 @@ impl ApplicationHandler for App {
                 // as a press or as the protocol's release half.
                 let grave_claim = self.graveyard_claims_key(&key.logical_key);
                 if key.state == ElementState::Pressed {
-                    let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
+                    let action = self.action_for(&key.logical_key, Some(&key), false);
                     // Panel shortcuts remain global while a sidebar field is focused.
                     // Other consumed presses belong only to egui's editor.
                     let panel_shortcut = matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"));

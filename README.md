@@ -65,18 +65,21 @@ Features
 * Partial terminal redraws from Alacritty damage, into persistent per-tab GPU
   textures shared by the live window, previews, and image export.
 * Workspaces - opt-in (`workspaces_enabled: true`; Settings → Tabs →
-  Workspaces). Off by default, in which case the Alt+Q…P bindings and the
+  Workspaces). Off by default, in which case the workspace bindings and the
   tab-bar button are inert and tabs keep their normal color. When on,
-  Alt+Q/W/E/R/T/Y/U/I/O/P select ten independent tab sets in each window.
-  Alt+1…9/0 select tabs within the current workspace, creating missing tabs
-  up to that number automatically (0 selects tab 10). Existing tabs keep
-  their numbers; new tabs are appended. Workspaces remember the selected tab
+  Alt+Shift+1…0 select ten independent tab sets in each window; the letter
+  chords Alt+Q/W/E/R/T/Y/U/I/O/P are the opt-in alternative
+  (`workspace_letter_keys: true`), left off because Alt+letter belongs to
+  shells and TUIs. Alt+1…9/0 select tabs within the current workspace, creating
+  missing tabs up to that number automatically (0 selects tab 10). Existing tabs
+  keep their numbers; new tabs are appended. Workspaces remember the selected tab
   and keep their terminals running. Visiting an empty workspace opens its
   first terminal. The W1…W10 button at the right of the tab bar shows the
   current workspace and opens a picker. Closing a workspace's last tab
   returns to another populated workspace; closing the window's final tab
   closes the window. Bindings are configurable as `goto_workspace_0` through
-  `goto_workspace_9`. Set each workspace's color in Settings → Appearance →
+  `goto_workspace_9`, in Settings → Keys or under `bindings:`. Set each
+  workspace's color in Settings → Appearance →
   Colors. Tabs inherit their workspace color; W1–W9 have distinct defaults.
   Colors are saved as `workspace_color_1` through `workspace_color_10` in the
   configuration.
@@ -114,8 +117,12 @@ keyboard reference reflect your current configured bindings.
 
 Config is `$XDG_CONFIG_HOME/mypixels/config.yml` (the legacy
 `~/.mypixels` is read until an XDG file exists). Every key is
-editable in the config panel; key bindings are rebindable under
-`bindings:`.
+editable in the config panel. Settings → Keys records bindings: click a
+chord, press a new one, and the keystroke goes to the recorder rather than the
+shell. A recorded chord is stored by key position, so Alt+Shift+2 reads as `2`
+on any layout and still fires where that cap types `@`, `"` or `č`. Saving
+rewrites the `bindings:` block only when something was rebound, so hand-written
+bindings survive unrelated changes.
 
 Themes are YAML colour sets, discovered in this repo's `themes/`,
 `~/.config/mypixels/themes`, `~/.local/share/mypixels/themes` and

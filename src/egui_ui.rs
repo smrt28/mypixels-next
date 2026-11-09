@@ -61,6 +61,13 @@ pub struct UiState {
     pub theme_choice: Vec<String>,
     pub theme_fetched: bool,
     pub settings_page: SettingsPage,
+    /// The keybinding row waiting for a chord. The app owns the next key
+    /// while this is set; Escape clears it. Held here (not in the app) so the
+    /// row can show its own waiting state and the keyboard arbiter can see it.
+    pub key_capture: Option<String>,
+    /// A chord was recorded this session, so saving must rewrite the
+    /// `bindings:` block. Until then a hand-written block is left untouched.
+    pub bindings_dirty: bool,
     /// A single slot keeps the right-side surfaces mutually exclusive.
     pub right_panel: RightPanel,
     /// Focus from the last completed UI frame, for editors opened by a click.
@@ -179,6 +186,7 @@ impl UiState {
         // The graveyard drives its list with arrows and Enter and has no
         // editor of its own, so it owns the keys outright (like the menus).
         self.rename_open || self.menu_open || self.move_open || self.info_page.is_some()
+            || self.key_capture.is_some()
             || self.right_panel == RightPanel::Graveyard || egui::Popup::is_any_open(ctx)
             || (self.right_panel != RightPanel::Closed && ctx.memory(|m| m.focused())
                 .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some()))
@@ -232,6 +240,7 @@ pub enum SettingsPage {
     Window,
     Tabs,
     Terminal,
+    Keys,
 }
 
 /// The history panel's list filter, in chip order.
@@ -372,15 +381,8 @@ pub fn app_info(ui: &egui::Ui, st: &mut UiState, cfg: &crate::config::Config) {
             egui::ScrollArea::both().max_height((ui.ctx().content_rect().height() - 160.0).max(60.0)).show(ui, |ui| {
                 egui::Grid::new("shortcut_reference").striped(true).spacing([24.0, 8.0]).show(ui, |ui| {
                     for (action, bindings) in &cfg.bindings {
-                        let label = if let Some(index) = action.strip_prefix("goto_workspace_").and_then(|n| n.parse::<usize>().ok()) {
-                            format!("Go to workspace {}", index + 1)
-                        } else if let Some(index) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
-                            format!("Switch to tab {}", index + 1)
-                        } else {
-                            let words = action.replace('_', " ");
-                            words.get(..1).map_or_else(|| words.clone(), |first| format!("{}{}", first.to_uppercase(), &words[1..]))
-                        };
-                        ui.label(label);
+                        if bindings.is_empty() { continue; }
+                        ui.label(action_label(action));
                         ui.monospace(bindings.iter().map(|b| b.label()).collect::<Vec<_>>().join(" / "));
                         ui.end_row();
                     }
@@ -1801,6 +1803,7 @@ pub fn config_window(
                     (SettingsPage::Window, "Window"),
                     (SettingsPage::Tabs, "Tabs"),
                     (SettingsPage::Terminal, "Terminal"),
+                    (SettingsPage::Keys, "Keys"),
                 ] {
                     let selected = st.settings_page == page;
                     let response = ui.add(egui::Button::new(egui::RichText::new(label).color(if selected { colors.accent } else { colors.muted }))
@@ -1810,6 +1813,7 @@ pub fn config_window(
                     if response.clicked() {
                         st.settings_page = page;
                         st.font_popup = None;
+                        st.key_capture = None;
                     }
                 }
             });
@@ -1963,6 +1967,22 @@ pub fn config_window(
                                 });
                             });
                         }
+                        SettingsPage::Keys => {
+                            if let Some(action) = st.key_capture.clone() {
+                                section(ui, "Waiting for a shortcut", &colors, |ui| {
+                                    ui.label(egui::RichText::new(format!(
+                                        "Press the keys for “{}”. Esc cancels.", action_label(&action)))
+                                        .strong().color(colors.accent));
+                                });
+                            }
+                            for (group, rows) in key_groups(cfg) {
+                                section(ui, group, &colors, |ui| {
+                                    for (action, label) in rows {
+                                        binding_row(ui, &action, &label, cfg, st, &colors);
+                                    }
+                                });
+                            }
+                        }
                     }
                 });
             ui.add_space(12.0);
@@ -1987,6 +2007,157 @@ fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) 
     response.on_hover_text(label);
     add_control(ui);
     ui.end_row();
+}
+
+/// The actions the Keys page names, grouped. Numbered tabs and workspaces are
+/// generated (they are ranges), so they are not here; `action_label` knows
+/// both prefixes, so a generated action still reads well everywhere.
+const KEY_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    ("Tabs", &[
+        ("new_tab", "New tab"), ("new_window", "New window"), ("close_tab", "Close tab"),
+        ("reopen_tab", "Raise last closed"), ("rename_tab", "Rename tab"),
+        ("toggle_hide_tabs", "Hide the tab strip"), ("toggle_entangle", "Type in all tabs"),
+        ("prev_color", "Previous tab color"), ("next_color", "Next tab color"),
+    ]),
+    ("Move between tabs", &[
+        ("prev_tab", "Previous tab"), ("next_tab", "Next tab"),
+        ("prev_tab_row", "Previous row of tabs"), ("next_tab_row", "Next row of tabs"),
+        ("first_tab", "First tab"), ("last_tab", "Last tab"),
+        ("move_prev_tab", "Move tab left"), ("move_next_tab", "Move tab right"),
+        ("move_first_tab", "Move tab to the start"), ("move_last_tab", "Move tab to the end"),
+        ("send_tab_to_window", "Move tab to another window"),
+    ]),
+    ("Copy and paste", &[
+        ("copy", "Copy"), ("paste", "Paste"), ("paste_primary", "Paste the selection"),
+        ("select_all", "Select all"), ("copy_last_output", "Copy last command output"),
+    ]),
+    ("Search and history", &[
+        ("show_search", "Search this tab"), ("show_search_all", "Search every tab"),
+        ("search_prev", "Previous match"), ("search_next", "Next match"),
+        ("show_history", "Command history"), ("graveyard", "Graveyard panel"),
+    ]),
+    ("Scrolling", &[
+        ("scroll_page_up", "Page up"), ("scroll_page_down", "Page down"),
+        ("scroll_bottom", "Jump to the prompt"),
+        ("prev_command", "Previous prompt"), ("next_command", "Next prompt"),
+    ]),
+    ("Text size", &[
+        ("enlarge_font", "Text bigger"), ("shrink_font", "Text smaller"),
+    ]),
+    ("Application", &[
+        ("config_reload", "Reload the configuration"), ("show_config", "Open settings"),
+    ]),
+];
+
+/// A human name for an action, shared by the Keys page and the shortcut list.
+/// Must not consult `key_groups`: that builds its "Other" group from here.
+pub fn action_label(action: &str) -> String {
+    for (_, rows) in KEY_GROUPS {
+        if let Some((_, label)) = rows.iter().find(|(a, _)| *a == action) {
+            return (*label).to_string();
+        }
+    }
+    if let Some(i) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
+        return format!("Go to tab {}", if i == 9 { 10 } else { i + 1 });
+    }
+    if let Some(i) = action.strip_prefix("goto_workspace_").and_then(|n| n.parse::<usize>().ok()) {
+        return format!("Go to workspace {}", i + 1);
+    }
+    let words = action.replace('_', " ");
+    words.get(..1).map_or_else(|| words.clone(), |first| format!("{}{}", first.to_uppercase(), &words[1..]))
+}
+
+/// Actions the Keys page offers, grouped. A chord the user bound by hand for
+/// an action this list does not name still shows up, under "Other".
+fn key_groups(cfg: &crate::config::Config) -> Vec<(&'static str, Vec<(String, String)>)> {
+    let mut groups: Vec<(&'static str, Vec<(String, String)>)> = KEY_GROUPS.iter()
+        .map(|(name, rows)| (*name, rows.iter()
+            .map(|(a, l)| (a.to_string(), l.to_string())).collect()))
+        .collect();
+    groups.insert(2, ("Numbered tabs", (0..10)
+        .map(|i| (format!("goto_tab_{i}"), format!("Go to tab {}", if i == 9 { 10 } else { i + 1 })))
+        .collect()));
+    // Listed whether or not the feature is on: the chords are real either way,
+    // and hiding them here would drop ten rows into "Other".
+    groups.insert(3, ("Workspaces", (0..crate::config::WORKSPACES)
+        .map(|i| (format!("goto_workspace_{i}"), format!("Go to workspace {}", i + 1)))
+        .collect()));
+    let named: std::collections::HashSet<&str> = groups.iter()
+        .flat_map(|(_, rows)| rows.iter().map(|a| a.0.as_str())).collect();
+    let other: Vec<(String, String)> = cfg.bindings.iter()
+        .filter(|(a, _)| !named.contains(a.as_str()))
+        .map(|(a, _)| (a.clone(), action_label(a)))
+        .collect();
+    if !other.is_empty() {
+        groups.push(("Other", other));
+    }
+    groups
+}
+
+/// One keybinding row: the chord as a button, then reset and unbind. Clicking
+/// the chord arms the recorder; the app feeds the next key back in.
+fn binding_row(
+    ui: &mut egui::Ui,
+    action: &str,
+    label: &str,
+    cfg: &mut crate::config::Config,
+    st: &mut UiState,
+    colors: &TermStyle,
+) {
+    let current: Vec<crate::config::Binding> = cfg.bindings_for(action).to_vec();
+    let recording = st.key_capture.as_deref() == Some(action);
+    let shown = if recording { "press a key".to_string() }
+        else if current.is_empty() { "unbound".to_string() }
+        else { current.iter().map(|b| b.label()).collect::<Vec<_>>().join("  /  ") };
+    let restore = crate::config::Config::default_binding(action);
+    let changed = current != restore;
+    ui.horizontal(|ui| {
+        // A row of its own rather than a form_grid cell: a chord row holds
+        // three widgets (chord, reset, unbind) and the settings grids are
+        // two columns.
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (label_rect, label_response) =
+            ui.allocate_exact_size(egui::vec2(158.0, 28.0), egui::Sense::hover());
+        text(ui, label_rect, label, ui.visuals().text_color(), 13.0, false);
+        label_response.on_hover_text(label);
+        let fill = if recording { colors.bg.lerp_to_gamma(colors.accent, 0.18) } else { colors.card };
+        let edge = if recording { colors.accent } else { colors.border };
+        let ink = if recording { colors.accent } else if current.is_empty() { colors.muted } else { colors.fg };
+        let button = egui::Button::new(egui::RichText::new(shown).monospace().color(ink))
+            .corner_radius(6.0)
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, edge))
+            .truncate();
+        let response = ui.add_sized([168.0, 28.0], button);
+        response.clone().on_hover_text(if recording {
+            format!("Waiting for the next shortcut. Esc cancels {label}.")
+        } else {
+            format!("Click, then press the shortcut for {label}.")
+        });
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+        if response.clicked() {
+            st.key_capture = if recording { None } else { Some(action.to_string()) };
+            release_focus(ui.ctx());
+            ui.ctx().request_repaint();
+        }
+        if recording {
+            return;
+        }
+        if changed {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+            if crate::ui_style::icon_button(ui, rect, Icon::Rerun, &format!("Restore the default for {label}"), colors).clicked() {
+                cfg.set_binding(action, restore);
+                st.bindings_dirty = true;
+            }
+        }
+        if !current.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+            if crate::ui_style::icon_button(ui, rect, Icon::Dismiss, &format!("Unbind {label}"), colors).clicked() {
+                cfg.set_binding(action, Vec::new());
+                st.bindings_dirty = true;
+            }
+        }
+    });
 }
 
 /// The sample text a font popup previews with.
@@ -2412,6 +2583,32 @@ mod regression {
     use super::*;
 
     #[test]
+    fn every_shipped_keybinding_is_listed_and_named() {
+        // An action missing from the table would land in "Other" with a
+        // snake_case name, and a label that calls key_groups would recurse.
+        let cfg = crate::config::Config::default();
+        let listed: std::collections::HashSet<String> = key_groups(&cfg)
+            .iter().flat_map(|(_, rows)| rows.iter().map(|(a, _)| a.clone())).collect();
+        for (action, _) in &cfg.bindings {
+            assert!(listed.contains(action), "{action} is not on the Keys page");
+            let label = action_label(action);
+            assert!(!label.is_empty() && !label.contains('_'), "{action} labels as {label:?}");
+        }
+        assert!(!key_groups(&cfg).iter().any(|(name, _)| *name == "Other"),
+            "a default config should need no Other group");
+    }
+
+    #[test]
+    fn a_hand_bound_action_still_reaches_the_keys_page() {
+        let cfg = crate::config::Config::from_text(
+            "wal_palette: ''\nbindings:\n  my_odd_action: MOD1+SHIFT+y\n", std::path::Path::new(".")).unwrap();
+        let groups = key_groups(&cfg);
+        let other = groups.iter().find(|(name, _)| *name == "Other")
+            .expect("a custom action belongs under Other");
+        assert!(other.1.iter().any(|(a, l)| a == "my_odd_action" && l == "My odd action"));
+    }
+
+    #[test]
     fn popup_anchors_convert_physical_pixels_once() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             assert_eq!(popup_position((120.0 * scale, 80.0 * scale), scale), [120.0, 80.0]);
@@ -2584,7 +2781,7 @@ mod regression {
         let mut cfg = crate::config::Config::default();
         let mut open = true;
         for (w, h) in [(1280.0, 850.0), (900.0, 540.0), (640.0, 420.0)] {
-            for page in [SettingsPage::Appearance, SettingsPage::Window, SettingsPage::Tabs, SettingsPage::Terminal] {
+            for page in [SettingsPage::Appearance, SettingsPage::Window, SettingsPage::Tabs, SettingsPage::Terminal, SettingsPage::Keys] {
                 st.settings_page = page;
                 for _ in 0..3 {
                     let mut full = ctx.run_ui(egui::RawInput {
