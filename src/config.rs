@@ -114,6 +114,10 @@ pub struct Config {
     /// default), `end` (after the last tab) or `first` (at the start).
     pub new_tab_position: String,
     pub hide_single_tab: bool,
+    /// How many closed tabs the graveyard keeps running. Buried tabs stay
+    /// alive (pty, child, scrollback) until raised; the oldest dies when
+    /// the limit is exceeded.
+    pub graveyard_limit: usize,
     /// OSC 133 semantic shell integration: fold the shell's prompt/command
     /// marks into navigable command blocks (scripts/shell_integration.*).
     pub osc133: bool,
@@ -169,6 +173,7 @@ impl Default for Config {
         bind("prev_command", &["CONTROL+ALT+Up"]);
         bind("next_command", &["CONTROL+ALT+Down"]);
         bind("reopen_tab", &["CONTROL+SHIFT+z"]);
+        bind("graveyard", &["CONTROL+SHIFT+g"]);
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
         bind("new_window", &["CONTROL+SHIFT+n"]);
         bind("send_tab_to_window", &["MOD1+SHIFT+w"]);
@@ -246,6 +251,7 @@ impl Default for Config {
             focus_new_tabs: true,
             new_tab_position: "next".to_string(),
             hide_single_tab: false,
+            graveyard_limit: 5,
             osc133: true,
             kitty_compatible: true,
             multiline_tabs: true,
@@ -403,6 +409,7 @@ impl Config {
             ("focus_new_tabs".into(), self.focus_new_tabs.to_string()),
             ("new_tab_position".into(), str_(&self.new_tab_position)),
             ("hide_single_tab".into(), self.hide_single_tab.to_string()),
+            ("graveyard_limit".into(), self.graveyard_limit.to_string()),
             ("osc133".into(), self.osc133.to_string()),
             ("kitty_compatible".into(), self.kitty_compatible.to_string()),
             ("multiline_tabs".into(), self.multiline_tabs.to_string()),
@@ -664,6 +671,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "hide_single_tab" => {
                     if let Some(b) = val.as_bool() {
                         cfg.hide_single_tab = b;
+                    }
+                },
+                "graveyard_limit" => {
+                    if let Some(n) = val.as_u64() {
+                        cfg.graveyard_limit = n.clamp(1, 32) as usize;
                     }
                 },
                 "osc133" => {

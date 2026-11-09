@@ -5,7 +5,7 @@
 //! retain their own keyboard behavior. The app routes terminal keys directly.
 
 use egui::{Context, FullOutput, ViewportId};
-use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, actions, section, form_grid, rgb_c32};
+use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, actions, section, form_grid, rgb_c32, preview_image, action_row};
 
 /// The egui side of the app: context, winit event state and the wgpu
 /// renderer that paints egui's tessellation.
@@ -117,7 +117,31 @@ pub struct UiState {
     pub history_search_open: bool,
     pub history_oldest_first: bool,
     pub history_sel: Option<u64>,
+    /// Only the selected, completed command is decoded for preview.
+    pub history_preview: Option<HistoryPreview>,
     pub history_out: Option<(u64, String)>,
+    /// The graveyard panel (Ctrl+Shift+G): closed tabs that keep running.
+    /// `grave_rows` is the app's snapshot (rebuilt every frame while
+    /// open); `grave_sel` indexes it newest-first; `grave_out` is a
+    /// one-shot (index, action) the app applies after the frame, the same
+    /// contract as `history_out`.
+    pub grave_rows: Vec<GraveRow>,
+    pub grave_sel: Option<usize>,
+    pub grave_out: Option<(usize, String)>,
+}
+
+pub struct HistoryPreview {
+    pub seq: u64,
+    pub lines: Vec<String>,
+    pub columns: usize,
+}
+
+impl HistoryPreview {
+    pub fn new(seq: u64, output: &str) -> Self {
+        let lines: Vec<String> = output.lines().map(str::to_owned).collect();
+        let columns = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+        Self { seq, lines, columns }
+    }
 }
 
 /// A window has one sidebar slot. Adding a panel here keeps visibility exclusive.
@@ -126,7 +150,20 @@ pub enum RightPanel {
     #[default]
     Closed,
     History,
+    Graveyard,
     Settings,
+}
+
+/// One buried tab, as the graveyard panel displays it. Every field is
+/// precomputed by the app (rebuilt every frame while the panel is open),
+/// so the panel never touches a terminal, a pty, or a codec.
+#[derive(Clone)]
+pub struct GraveRow {
+    pub id: usize,
+    pub title: String,
+    pub cwd: String,
+    /// "42 s" / "3 m" / "1 h 04 m" since the tab was buried.
+    pub buried: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,7 +176,10 @@ impl UiState {
     /// Sidebars are passive until an editor is explicitly focused. Merely
     /// opening a panel or clicking one of its buttons never claims typing.
     pub fn owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        self.rename_open || self.menu_open || self.move_open || self.info_page.is_some() || egui::Popup::is_any_open(ctx)
+        // The graveyard drives its list with arrows and Enter and has no
+        // editor of its own, so it owns the keys outright (like the menus).
+        self.rename_open || self.menu_open || self.move_open || self.info_page.is_some()
+            || self.right_panel == RightPanel::Graveyard || egui::Popup::is_any_open(ctx)
             || (self.right_panel != RightPanel::Closed && ctx.memory(|m| m.focused())
                 .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some()))
     }
@@ -171,12 +211,16 @@ impl UiState {
     pub fn toggle_panel(&mut self, panel: RightPanel) {
         self.right_panel = if self.panel_is(panel) { RightPanel::Closed } else { panel };
         self.font_popup = None;
+        if self.right_panel != RightPanel::History {
+            self.history_preview = None;
+        }
     }
 
     pub fn close_panel(&mut self, panel: RightPanel) {
         if self.panel_is(panel) {
             self.right_panel = RightPanel::Closed;
             self.font_popup = None;
+            self.history_preview = None;
         }
     }
 }
@@ -472,23 +516,13 @@ pub fn history_panel(ui: &mut egui::Ui, st: &mut UiState, ok: egui::Color32, err
                         st.history_query.clear();
                     }
                 }
-                let more_rect = egui::Rect::from_center_size(
+                let close_rect = egui::Rect::from_center_size(
                     egui::pos2(header.right() - 10.0, header.center().y),
                     egui::vec2(30.0, 30.0),
                 );
-                let more = icon_button(ui, more_rect, Icon::More, "History options", &colors);
-                egui::Popup::from_toggle_button_response(&more)
-                    .layout(egui::Layout::top_down_justified(egui::Align::Min))
-                    .frame(colors.menu_frame())
-                    .show(|ui| {
-                        ui.set_width(180.0);
-                        colors.menu_contents(ui, |ui| {
-                            if crate::ui_style::menu_item(ui, "Close history", "", Some(Icon::Dismiss), true, &colors).clicked() {
-                                st.close_panel(RightPanel::History);
-                                ui.close();
-                            }
-                        });
-                    });
+                if icon_button(ui, close_rect, Icon::Dismiss, "Close history", &colors).clicked() {
+                    st.close_panel(RightPanel::History);
+                }
                 ui.add_space(16.0);
                 if st.history_search_open {
                     let search = ui.add_sized(
@@ -573,7 +607,8 @@ pub fn history_panel(ui: &mut egui::Ui, st: &mut UiState, ok: egui::Color32, err
                 ui.add_space(18.0);
                 // The list scrolls independently; on short windows the outer
                 // scroll area keeps every details action reachable as well.
-                let list_height = (ui.available_height() - 390.0).clamp(76.0, 274.0);
+                let list_height = (ui.available_height() - 550.0).clamp(76.0, 274.0);
+                let body_bottom = ui.max_rect().bottom();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("history_body").show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("history_commands")
@@ -694,10 +729,61 @@ pub fn history_panel(ui: &mut egui::Ui, st: &mut UiState, ok: egui::Color32, err
                         if let Some(action) = history_details(ui, row, &colors) {
                             st.history_out = Some((row.seq, action.to_string()));
                         }
+                        ui.add_space(14.0);
+                        history_output_preview(ui, row, st.history_preview.as_ref(), &colors,
+                            (body_bottom - ui.cursor().top()).max(100.0));
                     }
                 });
             });
     });
+}
+
+fn history_output_preview(ui: &mut egui::Ui, row: &HistoryRow, preview: Option<&HistoryPreview>, c: &TermStyle, height: f32) {
+    egui::Frame::new()
+        .fill(c.card)
+        .stroke(egui::Stroke::new(1.0, c.border))
+        .corner_radius(9.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Output preview").size(14.0).strong().color(c.fg));
+            ui.add_space(8.0);
+            let height = (height - 50.0).max(40.0);
+            let preview = preview.filter(|p| p.seq == row.seq);
+            let message = if row.alt_seen {
+                Some("Full-screen program; output was not captured.")
+            } else if !row.done {
+                Some("Output will appear when the command finishes.")
+            } else if preview.is_none() {
+                ui.ctx().request_repaint();
+                Some("Loading output…")
+            } else if preview.is_some_and(|p| p.lines.is_empty()) {
+                Some("No output captured.")
+            } else {
+                None
+            };
+            if let Some(message) = message {
+                ui.set_min_height(height);
+                ui.label(egui::RichText::new(message).color(c.muted));
+            } else if let Some(preview) = preview {
+                let font = egui::FontId::monospace(12.0);
+                let line_height = ui.fonts_mut(|f| f.row_height(&font));
+                let column_width = ui.fonts_mut(|f| f.glyph_width(&font, 'M'));
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::both()
+                    .id_salt(("history_output", row.seq))
+                    .auto_shrink([false, false])
+                    .max_height(height)
+                    .min_scrolled_height(height)
+                    .show_rows(ui, line_height, preview.lines.len(), |ui, range| {
+                        ui.set_min_width(preview.columns as f32 * column_width);
+                        for line in &preview.lines[range] {
+                            ui.add(egui::Label::new(egui::RichText::new(if line.is_empty() { " " } else { line })
+                                .font(font.clone()).color(c.fg)).wrap_mode(egui::TextWrapMode::Extend));
+                        }
+                    });
+            }
+        });
 }
 
 fn history_details(ui: &mut egui::Ui, row: &HistoryRow, c: &TermStyle) -> Option<&'static str> {
@@ -800,6 +886,212 @@ fn history_details(ui: &mut egui::Ui, row: &HistoryRow, c: &TermStyle) -> Option
         }
     }
     action
+}
+
+/// The graveyard sidebar: closed tabs that keep running, with a live
+/// preview of each. Same shape as the history panel -- header, a
+/// scrollable list of cards, a details card with actions for the
+/// selection. `thumbs` maps tab id to its current preview texture.
+pub fn graveyard_panel(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    _ok: egui::Color32,
+    _err: egui::Color32,
+    top: f32,
+    thumbs: &[(usize, egui::TextureId, (u32, u32))],
+) {
+    if !st.panel_is(RightPanel::Graveyard) {
+        st.grave_out = None;
+        return;
+    }
+    st.grave_out = None;
+    if !st.menu_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        release_focus(ui.ctx());
+        st.close_panel(RightPanel::Graveyard);
+        return;
+    }
+    let colors = TermStyle::new(ui, _ok, _err);
+    let TermStyle { bg, fg, muted, border, accent, card, .. } = colors;
+    // List navigation lives in the app's keyboard, which routes to egui
+    // while this panel is the only surface.
+    // Navigation is opt-in: without a selection (no click, no arrow key)
+    // Enter is not the panel's, so a command typed with the panel open
+    // still runs in the terminal.
+    let keys = ui.input(|i| {
+        (i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowDown),
+         i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowRight))
+    });
+    let (nav, commit) = keys;
+    if nav && !st.grave_rows.is_empty() {
+        let len = st.grave_rows.len();
+        let cur = st.grave_sel.map(|s| s.min(len - 1)).unwrap_or(if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) { len - 1 } else { 0 });
+        st.grave_sel = Some(if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            (cur + len - 1) % len
+        } else {
+            (cur + 1) % len
+        });
+    }
+    if commit {
+        if let Some(sel) = st.grave_sel.filter(|s| *s < st.grave_rows.len()) {
+            st.grave_out = Some((sel, "raise".to_string()));
+        }
+    }
+    let count = st.grave_rows.len();
+    let mut host = ui.max_rect();
+    host.min.y = host.min.y.max(top);
+    host.min.x = (host.max.x - 380.0).max(host.min.x);
+    egui::Area::new(egui::Id::unique("mypixels_graveyard_area"))
+        .fixed_pos(host.min)
+        .order(egui::Order::Middle)
+        .fade_in(false)
+        .movable(false)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_size(host.size());
+            egui::Frame::new().fill(bg).inner_margin(18.0).show(ui, |ui| {
+                ui.set_width((host.width() - 36.0).max(0.0));
+                ui.set_min_height((host.height() - 36.0).max(0.0));
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                let edge = ui.max_rect().left() - 18.0;
+                ui.painter().vline(edge, host.y_range(), egui::Stroke::new(1.0, border));
+                let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+                draw_icon(
+                    ui.painter(),
+                    Icon::Tombstone,
+                    egui::pos2(header.left() + 14.0, header.center().y),
+                    fg,
+                );
+                text(
+                    ui,
+                    egui::Rect::from_min_max(
+                        egui::pos2(header.left() + 36.0, header.top()),
+                        egui::pos2(header.right() - 68.0, header.bottom()),
+                    ),
+                    &format!("Graveyard {}", count).trim_end().to_string(),
+                    fg,
+                    16.0,
+                    true,
+                );
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(header.right() - 10.0, header.center().y),
+                    egui::vec2(30.0, 30.0),
+                );
+                if icon_button(ui, close_rect, Icon::Dismiss, "Close graveyard", &colors).clicked() {
+                    st.close_panel(RightPanel::Graveyard);
+                }
+                let hint = egui::Rect::from_min_size(
+                    egui::pos2(ui.cursor().left(), ui.cursor().top()),
+                    egui::vec2(ui.available_width(), 16.0),
+                );
+                text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter raise \u{b7} Esc close",
+                    muted, 11.0, false);
+                ui.add_space(14.0);
+                if count == 0 {
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new("No buried tabs.\nClosed tabs keep running here.")
+                            .color(muted),
+                    );
+                    return;
+                }
+                // Keep an explicit selection on a visible row after eviction.
+                if let Some(sel) = st.grave_sel.filter(|s| *s >= count) {
+                    st.grave_sel = Some(sel.min(count.saturating_sub(1)));
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("graveyard_list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Newest first: the tab buried last is the one a
+                        // mistaken Ctrl+Shift+x is most likely to mourn.
+                        for index in (0..count).rev() {
+                            let row = &st.grave_rows[index];
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
+                            let response = ui.interact(
+                                rect,
+                                ui.scope_id().with(("grave_row", row.id)),
+                                egui::Sense::click(),
+                            );
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::Role::RadioButton,
+                                    true,
+                                    st.grave_sel == Some(index),
+                                    &row.title,
+                                )
+                            });
+                            if response.clicked() {
+                                st.grave_sel = Some(index);
+                            }
+                            let selected = st.grave_sel == Some(index);
+                            colors.card_surface(ui.painter(), rect.shrink2(egui::vec2(0.0, 3.0)), selected, response.hovered());
+                            let preview = thumbs.iter().find(|(id, _, _)| *id == row.id)
+                                .map(|(_, handle, size)| (*handle, *size));
+                            let well = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + 10.0, rect.top() + 10.0),
+                                egui::vec2(128.0, 72.0),
+                            );
+                            preview_image(ui, well, preview, &colors);
+                            let text_x = well.right() + 12.0;
+                            text(ui, egui::Rect::from_min_max(
+                                egui::pos2(text_x, rect.top() + 12.0),
+                                egui::pos2(rect.right() - 12.0, rect.top() + 32.0),
+                            ), &row.title, fg, 14.0, true);
+                            text(ui, egui::Rect::from_min_max(
+                                egui::pos2(text_x, rect.top() + 36.0),
+                                egui::pos2(rect.right() - 12.0, rect.top() + 56.0),
+                            ), if row.cwd.is_empty() { "\u{2014}" } else { &row.cwd }, muted, 12.0, false);
+                            let when = egui::Rect::from_min_max(
+                                egui::pos2(text_x, rect.bottom() - 34.0),
+                                egui::pos2(rect.right() - 12.0, rect.bottom() - 12.0),
+                            );
+                            draw_icon(ui.painter(), Icon::Clock, egui::pos2(when.left() + 6.0, when.center().y), muted);
+                            text(ui, when.with_min_x(when.left() + 18.0), &format!("buried {}", row.buried), muted, 12.0, false);
+                            response.on_hover_text(format!("{}\n{}\nburied {}", row.title, row.cwd, row.buried))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            ui.add_space(8.0);
+                        }
+                    });
+                if let Some(index) = st.grave_sel.filter(|i| *i < count) {
+                    let row = &st.grave_rows[index];
+                    ui.add_space(14.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 210.0), egui::Sense::hover());
+                    ui.painter().rect(rect, 9.0, card, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                    let left = rect.left() + 13.0;
+                    text(ui, egui::Rect::from_min_max(
+                        egui::pos2(left, rect.top() + 8.0),
+                        egui::pos2(rect.right() - 12.0, rect.top() + 30.0),
+                    ), &row.title, fg, 15.0, true);
+                    for (i, (label, value)) in [
+                        ("Buried", row.buried.as_str()),
+                        ("Path", if row.cwd.is_empty() { "\u{2014}" } else { &row.cwd }),
+                    ].into_iter().enumerate()
+                    {
+                        let y = rect.top() + 42.0 + i as f32 * 26.0;
+                        let line = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(rect.width() - 26.0, 26.0));
+                        text(ui, line.with_max_x(left + 80.0), label, muted, 14.0, false);
+                        text(ui, line.with_min_x(left + 84.0), value, fg, 14.0, false);
+                    }
+                    ui.painter().hline(rect.x_range(), rect.top() + 100.0, egui::Stroke::new(1.0, border));
+                    for (i, (label, name, icon, color)) in [
+                        ("Raise tab", "raise", Icon::Rerun, accent),
+                        ("Kill for good", "kill", Icon::Close, muted),
+                    ].into_iter().enumerate()
+                    {
+                        let button = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 7.0, rect.top() + 112.0 + i as f32 * 46.0),
+                            egui::vec2(rect.width() - 14.0, 40.0),
+                        );
+                        let response = action_row(ui, button, ui.scope_id().with(("grave_action", name)), label, "", Some(icon), true, &colors);
+                        if response.clicked() {
+                            st.grave_out = Some((index, name.to_string()));
+                        }
+                        let _ = color;
+                        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    }
+                }
+            });
+        });
 }
 
 /// The rename box: a small frameless window with one text field. Enter
@@ -1573,6 +1865,9 @@ pub fn config_window(
                                             cfg.new_tab_position = chosen;
                                             ev.apply = true;
                                         }
+                                    });
+                                    row(ui, "Graveyard keeps", |ui| {
+                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.graveyard_limit).range(1..=32)).changed();
                                     });
                                     checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, &mut ev);
                                 });
@@ -2837,6 +3132,38 @@ mod input_regression {
             // UI pass has updated egui's pointer state.
             assert!(!panel_pointer_input(&ctx, egui::pos2(100.0, 200.0)));
             assert!(panel_pointer_input(&ctx, egui::pos2(1100.0, 200.0)));
+        }
+    }
+
+    #[test]
+    fn history_preview_uses_remaining_space_and_only_draws_visible_lines() {
+        for height in [700.0, 1000.0] {
+            let ctx = Context::default();
+            let mut st = UiState {
+                right_panel: RightPanel::History,
+                history_rows: vec![row(1, "build", Some(0))],
+                history_sel: Some(1),
+                history_preview: Some(HistoryPreview::new(1, &"build output\n".repeat(50_000))),
+                ..Default::default()
+            };
+            for frame in 0..3 {
+                let mut full = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, height))),
+                    ..Default::default()
+                }, |ui| history_panel(ui, &mut st, egui::Color32::GREEN, egui::Color32::RED, 28.0));
+                full.textures_delta.clear();
+                if frame == 0 { continue; }
+                let lines: Vec<_> = full.shapes.iter().filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "build output" => Some((s.clip_rect, t)),
+                    _ => None,
+                }).collect();
+                assert!(!lines.is_empty(), "preview missing at height {height}");
+                assert!(lines.len() < 100, "offscreen output was laid out");
+                let clip = lines[0].0;
+                assert!(clip.bottom() > height - 40.0, "preview does not fill remaining height");
+                assert!(clip.right() <= 1100.0 && clip.left() >= 720.0, "preview escaped sidebar");
+                assert!(!st.owns_keyboard(&ctx), "output preview must keep terminal typing active");
+            }
         }
     }
 

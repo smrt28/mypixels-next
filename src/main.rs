@@ -250,6 +250,13 @@ struct OverviewState {
 // App
 // ---------------------------------------------------------------------------
 
+/// A closed tab kept alive in the graveyard: the terminal, its pty and
+/// its child all keep running; only the window stopped looking at it.
+struct GraveEntry {
+    tab: Tab,
+    closed_at: Instant,
+}
+
 /// A persistent GPU thumbnail shared by switcher cards and tab hover previews.
 /// Identity follows the tab across reordering; closed tabs release their texture.
 #[derive(Clone)]
@@ -302,6 +309,10 @@ struct Win {
     /// key itself is a global modifier).
     overview: Option<OverviewState>,
     sw_thumbs: Vec<SwThumb>,
+    /// Buried-tab previews for the graveyard panel: same persistent GPU
+    /// thumbnails as the switcher, keyed by the stable tab id, refreshed
+    /// only while the panel is open.
+    grave_thumbs: Vec<SwThumb>,
     thumb_rr: usize,
     preview_next: Instant,
     repaint_at: Option<Instant>,
@@ -441,12 +452,12 @@ struct App {
     /// so the eye can keep the pointer's agent when it slides across the
     /// grid (mouse-reporting apps, search jumps, wide terminals).
     ripple: Option<Ripple>,
-    /// Closed tabs, most recent last: (window title at death, working
-    /// directory at death). Ctrl+Shift+z respawns the newest from here, in
-    /// the window that asks. Bounded - a reopen history is a memory of the
-    /// last few minutes, not a session manager; that is a different,
-    /// harder promise, and half-measures should not pretend at it.
-    closed_ring: std::collections::VecDeque<(String, Option<std::path::PathBuf>)>,
+    /// Buried tabs, oldest first: closing a tab does not kill the shell.
+    /// The tab keeps running here - pty, child, scrollback all live - until
+    /// it is raised from the graveyard panel, the limit evicts it, its
+    /// child exits on its own, or the last window ends the session. Bounded
+    /// by `graveyard_limit`.
+    graveyard: Vec<GraveEntry>,
     /// URLs on the row under the pointer (only that row can underline or
     /// be clicked); reparsed only when the row's content hash moves.
     url_spans: Vec<UrlSpan>,
@@ -462,6 +473,12 @@ struct App {
     pending_move: Option<usize>,
     /// A context-menu choice, run by the drain (which has the event loop).
     pending_action: Option<String>,
+    /// A graveyard choice (raise/kill), deferred to the drain: applying it
+    /// inside the draw path would shrink the graveyard mid-frame, and the
+    /// preview index space built at the frame's top would go stale under it.
+    pending_grave: Option<(usize, String)>,
+    /// Keeps the session-bus thread -- and with it the bus name -- alive for
+    /// as long as the app runs.
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     _session: Option<session::Server>,
@@ -755,9 +772,10 @@ impl App {
             mcp_rx,
             pending_move: None,
             pending_action: None,
+            pending_grave: None,
             ripple: None,
             cursor_pt: None,
-            closed_ring: std::collections::VecDeque::new(),
+            graveyard: Vec::new(),
             url_spans: Vec::new(),
             url_cache: None,
             url_hover: None,
@@ -866,16 +884,10 @@ impl App {
     }
 
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
-        // A window dying takes its tabs with it; remember them all, oldest
-        // first, so Ctrl+Shift+z can walk them back one by one.
-        let deaths: Vec<_> = self.wins[i].tabs.iter().map(tab_death).collect();
-        let dying: Vec<usize> = self.wins[i].tabs.iter().map(|t| t.id).collect();
-        self.kitty.retain(|id, _| !dying.contains(id));
-        for id in dying {
-            self.forget_gpu_images(id);
-        }
-        for d in deaths {
-            self.remember_closed(d);
+        // A window dying buries its tabs, oldest first, so raising walks
+        // them back in the order they were lost.
+        for tab in std::mem::take(&mut self.wins[i].tabs) {
+            self.bury_tab(tab);
         }
         if let Some(w) = self.wins[i].window.as_ref() {
             let id = w.id();
@@ -883,6 +895,9 @@ impl App {
         }
         self.wins.remove(i);
         self.cur = self.cur.min(self.wins.len().saturating_sub(1));
+        // Burials live while a window does: there is no UI to raise from
+        // without one, and a headless process holding shells is a leak, not
+        // a feature. The last window ending the session takes them with it.
         if self.wins.is_empty() {
             event_loop.exit();
         }
@@ -1080,28 +1095,84 @@ impl App {
         }
     }
 
-    /// Remember a tab's death in the reopen ring (bounded, oldest first out).
-    /// Takes the already-collected entry, not the tab: callers are holding a
-    /// borrow of the tab list that remembering must not fight with.
-    fn remember_closed(&mut self, entry: (String, Option<std::path::PathBuf>)) {
-        self.closed_ring.push_back(entry);
-        while self.closed_ring.len() > 8 {
-            self.closed_ring.pop_front();
+    /// Bury a tab: it keeps running in the graveyard, unseen, until raised
+    /// or evicted. The per-tab state (command blocks, kitty images, the
+    /// desktop-notification parser) all survive the burial with it.
+    fn bury_tab(&mut self, tab: Tab) {
+        self.graveyard.push(GraveEntry { tab, closed_at: Instant::now() });
+        while self.graveyard.len() > self.config.graveyard_limit {
+            let entry = self.graveyard.remove(0);
+            self.forget_tab(entry.tab.id);
         }
+    }
+
+    /// Shared cleanup for a tab that dies for good (eviction, kill, a buried
+    /// child that exited): per-tab state out, then the Tab's drop sends its
+    /// pty thread the shutdown that kills the child.
+    fn forget_tab(&mut self, id: usize) {
+        self.sem_blocks.remove(&id);
+        self.kitty.remove(&id);
+        self.forget_gpu_images(id);
+    }
+
+    /// Kill one buried tab for good. Positions are the panel's, newest
+    /// first, so the caller translates before calling.
+    fn kill_grave(&mut self, pos: usize) {
+        if pos >= self.graveyard.len() {
+            return;
+        }
+        let id = self.graveyard[pos].tab.id;
+        self.graveyard.remove(pos);
+        self.forget_tab(id);
+    }
+
+    /// Raise a buried tab back into the current window, next to the active
+    /// tab. The grid already follows the drawing window's size (the frame
+    /// path keeps buried grids in step), so nothing else needs resizing.
+    fn revive_tab(&mut self, pos: usize) {
+        if pos >= self.graveyard.len() || self.wins.is_empty() {
+            return;
+        }
+        let entry = self.graveyard.remove(pos);
+        let win = &mut self.wins[self.cur];
+        let insert = (win.active + 1).min(win.tabs.len());
+        win.tabs.insert(insert, entry.tab);
+        win.active = insert;
+        win.frame_gen = win.frame_gen.wrapping_add(1);
+    }
+
+    /// Apply a deferred graveyard choice. The panel's index is newest-first;
+    /// the graveyard is oldest-first.
+    fn apply_pending_grave(&mut self) {
+        let Some((index, action)) = self.pending_grave.take() else { return };
+        let Some(pos) = grave_pos_for(self.graveyard.len(), index) else { return };
+        if action == "raise" {
+            self.revive_tab(pos);
+        } else {
+            self.kill_grave(pos);
+        }
+    }
+
+    /// The graveyard panel's rows, newest first.
+    fn grave_rows(&self) -> Vec<egui_ui::GraveRow> {
+        self.graveyard.iter().rev().map(|g| {
+            let secs = Instant::now().duration_since(g.closed_at).as_secs();
+            egui_ui::GraveRow {
+                id: g.tab.id,
+                title: g.tab.display_title(),
+                cwd: g.tab.current_dir().unwrap_or_default(),
+                buried: buried_label(secs),
+            }
+        }).collect()
     }
 
     fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
         if idx >= self.wins[self.cur].tabs.len() {
             return;
         }
-        let dying_id = self.wins[self.cur].tabs[idx].id;
-        self.sem_blocks.remove(&dying_id);
-        self.kitty.remove(&dying_id);
-        self.forget_gpu_images(dying_id);
-        self.remember_closed(tab_death(&self.wins[self.cur].tabs[idx]));
-        // Stable ids: find the id of the tab being removed
-        self.wins[self.cur].tabs.remove(idx);
+        let tab = self.wins[self.cur].tabs.remove(idx);
         self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
+        self.bury_tab(tab);
         if self.wins[self.cur].tabs.is_empty() {
             // The last tab closes its WINDOW, not the application: a second
             // window must survive closing all of the first one's tabs.
@@ -1403,6 +1474,7 @@ impl App {
         add("Copy last image", "copy_last_image", has_image, false);
         add("Copy last output", "copy_last_output", has_tab, false);
         add("Command history", "show_history", has_tab, false);
+        add("Graveyard", "graveyard", true, false);
         add("New tab", "new_tab", true, true);
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
@@ -1417,50 +1489,57 @@ impl App {
 
     /// Placements shared by full-size tab textures and their previews.
     fn image_quads(&self, tab_index: usize, gpu: &mut Gpu, strip_h: f32, w: u32) -> Vec<gpu::ImageQuad> {
+        match self.wins[self.cur].tabs.get(tab_index) {
+            Some(tab) => self.image_quads_for(tab, gpu, strip_h, w),
+            None => Vec::new(),
+        }
+    }
+
+    /// Tab-based form: the graveyard's buried tabs share the same placement
+    /// math, and they are not in any window's index space.
+    fn image_quads_for(&self, tab: &Tab, gpu: &mut Gpu, strip_h: f32, w: u32) -> Vec<gpu::ImageQuad> {
         let mut draws = Vec::new();
-        if let Some(tab) = self.wins[self.cur].tabs.get(tab_index) {
-            let tab_id = tab.id as u32;
-            if let Some(k) = self.kitty.get(&tab.id) {
-                let (hist, off) = {
-                    let term = tab.term.lock();
-                    (term.grid().history_size(), term.grid().display_offset())
-                };
-                let top_abs = hist.saturating_sub(off);
-                let vy0 = strip_h;
-                let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
-                for pl in k.placements_sorted() {
-                    let Some(img) = k.image(pl.image_id) else { continue };
-                    let iw = pl
-                        .cols
-                        .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
-                    let ih = pl
-                        .rows
-                        .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
-                    let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
-                    let y0 = vy0
-                        + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
-                        + pl.y_off as f32;
-                    let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
-                    let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
-                    if cx1 <= cx0 || cy1 <= cy0 {
-                        continue;
-                    }
-                    let key = (tab_id, pl.image_id, img.generation);
-                    if !gpu.has_image(key) {
-                        gpu.upload_image(key, &img.rgba, img.width, img.height);
-                    }
-                    draws.push(gpu::ImageQuad {
-                        key,
-                        dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
-                        uv: [
-                            (cx0 - x0) / iw as f32,
-                            (cy0 - y0) / ih as f32,
-                            (cx1 - x0) / iw as f32,
-                            (cy1 - y0) / ih as f32,
-                        ],
-                    });
-                }
+        let tab_id = tab.id as u32;
+        if let Some(k) = self.kitty.get(&tab.id) {
+        let (hist, off) = {
+            let term = tab.term.lock();
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        let top_abs = hist.saturating_sub(off);
+        let vy0 = strip_h;
+        let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
+        for pl in k.placements_sorted() {
+            let Some(img) = k.image(pl.image_id) else { continue };
+            let iw = pl
+                .cols
+                .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
+            let ih = pl
+                .rows
+                .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
+            let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
+            let y0 = vy0
+                + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
+                + pl.y_off as f32;
+            let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
+            let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
+            if cx1 <= cx0 || cy1 <= cy0 {
+                continue;
             }
+            let key = (tab_id, pl.image_id, img.generation);
+            if !gpu.has_image(key) {
+                gpu.upload_image(key, &img.rgba, img.width, img.height);
+            }
+            draws.push(gpu::ImageQuad {
+                key,
+                dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
+                uv: [
+                    (cx0 - x0) / iw as f32,
+                    (cy0 - y0) / ih as f32,
+                    (cx1 - x0) / iw as f32,
+                    (cy1 - y0) / ih as f32,
+                ],
+            });
+        }
         }
         draws
     }
@@ -1714,6 +1793,32 @@ impl App {
                     |damage| damage_events.push((i, damage)))
             })
         }).collect();
+        // Buried tabs keep running: every frame their damage joins the same
+        // queue, and their grids follow the drawing window's size so the
+        // graveyard panel's previews line up with it. They occupy the
+        // preview index space right after the window's own tabs.
+        let g = self.graveyard.len();
+        let grave_frames: Vec<FrameData> = (0..g).map(|gi| {
+            let entry = &self.graveyard[gi];
+            {
+                let mut term = entry.tab.term.lock();
+                if term.columns() != self.wins[self.cur].cols
+                    || term.screen_lines() != self.wins[self.cur].rows {
+                    let dims = self.wins[self.cur].dims;
+                    term.resize(dims);
+                    let _ = entry.tab.sender.send(Msg::Resize(WindowSize {
+                        num_lines: self.wins[self.cur].rows as u16,
+                        num_cols: self.wins[self.cur].cols as u16,
+                        cell_width: self.cell_w as u16,
+                        cell_height: self.cell_h as u16,
+                    }));
+                }
+                let damage = Damage::collect(term.damage_content());
+                term.reset_damage();
+            }
+            self.build_frame(&entry.tab, false,
+                |d| damage_events.push((n + gi, d)))
+        }).collect();
         self.bg = saved_bg;
         let t_built = t_start.elapsed();
         let show_strip = self.show_tab_strip();
@@ -1836,7 +1941,33 @@ impl App {
                 if egui.ui_state.panel_is(egui_ui::RightPanel::History) {
                     if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
                         egui.ui_state.history_rows = self.history_rows_for(tab.id);
+                        let st = &mut egui.ui_state;
+                        // A click changes selection during the UI pass. Decode
+                        // it on the next frame, retaining the pool's compressed
+                        // storage and caching only one command per window.
+                        let selected = st.history_rows.iter().find(|r| Some(r.seq) == st.history_sel);
+                        if let Some(row) = selected.filter(|r| r.done && !r.alt_seen) {
+                            if st.history_preview.as_ref().is_none_or(|p| p.seq != row.seq) {
+                                st.history_preview = self.sem_blocks.get(&tab.id)
+                                    .and_then(|q| q.iter().find(|b| b.seq == row.seq))
+                                    .map(|b| {
+                                        let mut preview = egui_ui::HistoryPreview::new(b.seq, &b.output_text());
+                                        if b.truncated_head || b.truncated_tail {
+                                            preview.lines.insert(0, "[Captured output is truncated]".into());
+                                        }
+                                        preview
+                                    });
+                            }
+                        } else {
+                            st.history_preview = None;
+                        }
                     }
+                }
+                // The graveyard rows are a snapshot of the buried tabs,
+                // rebuilt every frame while open: a buried shell that
+                // retitles itself shows up in the list on the next frame.
+                if egui.ui_state.panel_is(egui_ui::RightPanel::Graveyard) {
+                    egui.ui_state.grave_rows = self.grave_rows();
                 }
                 egui.ui_state.panel_top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
                 let full = ctx.run_ui(raw, |ui| {
@@ -1905,6 +2036,17 @@ impl App {
                         let top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
                         egui_ui::history_panel(ui, &mut egui.ui_state, ok, err, top);
                     }
+                    if !sw_open && egui.ui_state.panel_is(egui_ui::RightPanel::Graveyard) {
+                        let pal = self.config.palette;
+                        let ok = ui_style::rgb_c32(pal.map(|p| p[2]).unwrap_or(crate::config::Rgb(59, 193, 126)));
+                        let err = ui_style::rgb_c32(pal.map(|p| p[1]).unwrap_or(crate::config::Rgb(239, 97, 109)));
+                        let top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
+                        let thumbs: Vec<_> = self.wins[self.cur].grave_thumbs
+                            .iter()
+                            .map(|t| (t.tab_id, t.handle, t.size))
+                            .collect();
+                        egui_ui::graveyard_panel(ui, &mut egui.ui_state, ok, err, top, &thumbs);
+                    }
                     if let Some(r) = self.ripple.as_ref() {
                         let t = r.at.elapsed().as_secs_f32() / 0.18;
                         if t < 1.0 {
@@ -1962,6 +2104,14 @@ impl App {
                         // which the draw path does not have.
                         self.pending_move = Some(t);
                     }
+                    window.request_redraw();
+                }
+                if let Some((index, action)) = egui.ui_state.grave_out.take() {
+                    // The panel's list is newest-first; the graveyard is
+                    // oldest-first. Translate, then defer to the drain: the
+                    // frame already counted the burials it is rendering.
+                    self.pending_grave = Some((index, action));
+                    egui.ui_state.grave_sel = None;
                     window.request_redraw();
                 }
                 if let Some(pick) = egui.ui_state.menu_out.take() {
@@ -2076,7 +2226,8 @@ impl App {
             None => None,
         };
         let images = self.image_quads(active, &mut gpu, strip_h, w);
-        let tab_ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
+        let mut tab_ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
+        tab_ids.extend(self.graveyard.iter().map(|entry| entry.tab.id));
         gpu.ensure_previews(&tab_ids, (w, h));
         for (i, damage) in damage_events {
             gpu.damage_terminal(i, &damage);
@@ -2344,6 +2495,72 @@ impl App {
                 });
                 built += 1;
             }
+            // The graveyard panel keeps its previews live through the same
+            // batched pipeline; the list is short by construction (limit),
+            // and nothing is built while the panel is closed.
+            if self.wins[self.cur].egui.as_ref()
+                .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Graveyard))
+            {
+                for gi in 0..g {
+                    let i = n + gi;
+                    let fd = &grave_frames[gi];
+                    let style = TerminalStyle {
+                        tab_id: tab_ids[i], size: (w, h), cell: (self.cell_w, self.cell_h), strip_h,
+                        fg: fd.fg, bg: fd.bg, cursor_color: fd.cursor_color,
+                        transparency: self.config.term_transparency,
+                    };
+                    if gpu.prev_styles[i].as_ref() != Some(&style) {
+                        gpu.prev_damage[i] = Damage::full();
+                    }
+                    let images = self.image_quads_for(&self.graveyard[gi].tab, &mut gpu, strip_h, w);
+                    gpu.update_overlays(i, gpu::TerminalOverlays {
+                        images: images.clone(), ..Default::default()
+                    }, self.wins[self.cur].rows, self.cell_h, strip_h);
+                    if gpu.prev_damage[i].is_empty() { continue; }
+                    let throttled = gpu.prev_revision[i] != 0
+                        && now.duration_since(gpu.prev_last[i]) < std::time::Duration::from_millis(200);
+                    if throttled || built >= 2 { continue; }
+                    let damage = std::mem::take(&mut gpu.prev_damage[i]);
+                    gpu.prev_styles[i] = Some(style);
+                    let metrics = gpu.pool[0].metrics();
+                    let buffers = &mut gpu.prev_bufs[i];
+                    let runs: Vec<_> = fd.runs.iter().filter(|run| damage.shapes_row(run.row)).take(MAX_RUNS).collect();
+                    buffers.resize_with(runs.len(), || Buffer::new(&mut self.font_system, metrics));
+                    for (buffer, run) in buffers.iter_mut().zip(&runs) {
+                        buffer.set_metrics(metrics);
+                        fonts::shape_terminal_run(
+                            buffer, &mut self.font_system, &run.text, run.attrs, &run.cells, self.cell_w,
+                        );
+                    }
+                    gpu.prev_last[i] = now;
+                    jobs.push(gpu::PreviewJob {
+                        idx: i,
+                        images,
+                        scissors: damage.scissors((w, h), self.cell_h, strip_h, self.wins[self.cur].rows),
+                        bounds,
+                        text: runs.iter().map(|run| gpu::PreviewText {
+                            left: run.col as f32 * self.cell_w,
+                            top: strip_h + run.row as f32 * self.cell_h,
+                            color: run.fg,
+                        }).collect(),
+                        rects: preview_rects(
+                            fd,
+                            &fd.bg,
+                            &self.config.tablist_background.to_f32(),
+                            &[],
+                            self.config.selection_color.to_f32(),
+                            bg_a,
+                            self.cell_w,
+                            self.cell_h,
+                            strip_h,
+                            self.wins[self.cur].rows,
+                            w,
+                            h,
+                        ),
+                    });
+                    built += 1;
+                }
+            }
         }
         // Export and thumbnails sample the very same persistent tab target.
         let shot_at = self.wins[self.cur].shot.then_some(active);
@@ -2459,6 +2676,57 @@ impl App {
                 window.request_redraw();
             }
             self.wins[self.cur].sw_thumbs = thumbs;
+        }
+        // Buried-tab previews refresh through the same downsample pass, only
+        // while the graveyard panel is open (a closed panel has no viewer, and
+        // the list is short by construction anyway). Own block: the renderer
+        // borrow must not span other windows access.
+        if self.wins[self.cur].egui.as_ref()
+            .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Graveyard))
+        {
+            let gids: Vec<_> = self.graveyard.iter().map(|g| g.tab.id).collect();
+            let mut gthumbs = std::mem::take(&mut self.wins[self.cur].grave_thumbs);
+            let term_h = ((h as f32) - strip_h).max(1.0);
+            let (ptw, pth) = egui_ui::thumbnail_size(w as f32 / self.scale.max(1.0), w as f32 / term_h,
+                self.config.tab_overview_scale);
+            let (tw, th) = ((ptw * self.scale).round().max(1.0) as u32, (pth * self.scale).round().max(1.0) as u32);
+            let renderer = &mut self.wins[self.cur].egui.as_mut().unwrap().renderer;
+            gthumbs.retain(|thumb| {
+                let keep = gids.contains(&thumb.tab_id);
+                if !keep { renderer.free_texture(&thumb.handle); }
+                keep
+            });
+            let mut gupdated = 0;
+            for gi in 0..gids.len() {
+                if gupdated >= 2 { break; }
+                let i = n + gi;
+                let revision = gpu.prev_revision.get(i).copied().unwrap_or(0);
+                if revision == 0 { continue; }
+                let id = gids[gi];
+                let old = gthumbs.iter().position(|t| t.tab_id == id);
+                if old.is_some_and(|at| gthumbs[at].pixels == (tw, th) && gthumbs[at].revision == revision) {
+                    continue;
+                }
+                let old_texture = old.map(|at| &gthumbs[at].texture);
+                let Some(texture) = gpu.thumbnail(i, strip_h as u32, (tw, th), old_texture) else { continue; };
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let handle = if let Some(at) = old {
+                    let handle = gthumbs[at].handle;
+                    renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &view, wgpu::FilterMode::Linear, handle);
+                    handle
+                } else {
+                    renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear)
+                };
+                let thumb = SwThumb { tab_id: id, handle, texture,
+                    size: (ptw.round() as u32, pth.round() as u32), pixels: (tw, th), revision };
+                if let Some(at) = old { gthumbs[at] = thumb; } else { gthumbs.push(thumb); }
+                gupdated += 1;
+            }
+            if gupdated > 0 {
+                self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
+                window.request_redraw();
+            }
+            self.wins[self.cur].grave_thumbs = gthumbs;
         }
         self.wins[self.cur].gpu = Some(gpu);
 
@@ -2624,7 +2892,8 @@ impl App {
                 }
             }
         }
-        if let Some(window) = self.wins[self.cur].window.as_ref() {
+        // A spec may have closed the last window; the session is ending.
+        if let Some(window) = self.wins.get(self.cur).and_then(|w| w.window.as_ref()) {
             window.request_redraw();
         }
     }
@@ -3028,7 +3297,7 @@ impl App {
             return;
         }
         let cap = self.config.history_block_bytes;
-        for SemanticMark { tab_id, code, exit, line, row, col, alt, command, when } in evs {
+        for SemanticMark { tab_id, code, exit, line, row, col, alt, command, output, when } in evs {
             // The tab the mark belongs to, wherever it lives now.
             let tab = match self
                 .wins
@@ -3075,6 +3344,16 @@ impl App {
                 b.alt_seen = true;
                 continue;
             }
+            if b.executing {
+                if let Some(output) = output {
+                    b.truncated_head |= output.truncated_head;
+                    push_block_text(b, &output.text, cap);
+                }
+                finish_block(b);
+                continue;
+            }
+            // Compatibility for old integrations with only A/D markers:
+            // without C, the output boundary cannot be separated from input.
             // Translate the block's row IDs into TODAY'S buffer rows:
             // buffer row 0 is whichever row the ring's oldest survivor
             // is, `scrolled_out - history_size` rows past the start of
@@ -3142,7 +3421,7 @@ impl App {
                         .unwrap_or_default(),
                     _ => String::new(),
                 };
-                let cmd = if b.cmd_line.is_empty() {
+                let cmd = if b.cmd_line.is_empty() && !b.executing {
                     b.text.lines().next().unwrap_or_default().to_string()
                 } else {
                     b.cmd_line.clone()
@@ -3445,11 +3724,14 @@ impl App {
         let overview_active = self.wins[self.cur].overview.is_some();
         if let Some(action) = config::find_action(&self.config.bindings, key, self.modifiers, overview_active) {
             self.do_action(&action, event_loop);
-            // A delegated action may have moved or closed the active tab;
-            // keep the highlighted tile in sync while the switcher is open.
-            let cur_active = self.wins[self.cur].active;
-            if let Some(ov) = self.wins[self.cur].overview.as_mut() {
-                ov.selected = cur_active;
+            // The action may have closed the last window; nothing left to
+            // sync. A surviving one may have lost its active tab; keep the
+            // highlighted tile in sync while the switcher is open.
+            if let Some(win) = self.wins.get_mut(self.cur) {
+                let cur_active = win.active;
+                if let Some(ov) = win.overview.as_mut() {
+                    ov.selected = cur_active;
+                }
             }
             return;
         }
@@ -3523,6 +3805,40 @@ impl App {
             return false;
         };
         e.ui_state.owns_keyboard(&e.ctx)
+    }
+
+    /// True while the graveyard panel is the ONLY keyboard surface (menus,
+    /// the rename box and editors keep full ownership when they are open).
+    fn grave_only_owner(&self) -> bool {
+        self.wins[self.cur].egui.as_ref().is_some_and(|e| {
+            let st = &e.ui_state;
+            st.right_panel == egui_ui::RightPanel::Graveyard
+                && !st.rename_open && !st.menu_open && !st.move_open
+                && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx)
+        })
+    }
+
+    /// While the panel is the only surface, just its navigation keys reach
+    /// egui; a command typed with the panel open must still land in the
+    /// terminal.
+    fn graveyard_passes_key(&self, key: &Key) -> bool {
+        !self.grave_only_owner() || Self::is_grave_nav_key(key)
+    }
+
+    /// The panel is the only surface and this key is one of its own: it is
+    /// queued to egui and acted on during the next draw, so it must not also
+    /// reach the terminal (the egui wrapper does not report plain keys as
+    /// consumed, which would leak them).
+    fn graveyard_claims_key(&self, key: &Key) -> bool {
+        self.grave_only_owner() && Self::is_grave_nav_key(key)
+    }
+
+    fn is_grave_nav_key(key: &Key) -> bool {
+        matches!(key,
+            Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown)
+            | Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape)
+            | Key::Named(NamedKey::Home) | Key::Named(NamedKey::End))
     }
 
     /// Close the rename box without committing (app-side Escape).
@@ -3723,11 +4039,27 @@ impl App {
             "prev_command" => self.jump_command(true),
             "next_command" => self.jump_command(false),
             "reopen_tab" => {
-                // The shell that died comes back where it died. The title it
-                // carried is remembered for context we do not yet spend;
-                // the directory is the whole value of this feature.
-                if let Some((_title, cwd)) = self.closed_ring.pop_back() {
-                    self.add_tab_with(cwd, None);
+                // The newest burial comes straight back, no panel needed:
+                // Ctrl+Shift+undoes Ctrl+Shift+x in one motion. The tab is
+                // the same live terminal - pty, child, scrollback intact.
+                if !self.graveyard.is_empty() {
+                    self.revive_tab(self.graveyard.len() - 1);
+                }
+            }
+            "graveyard" => {
+                let opening = !self
+                    .wins[self.cur]
+                    .egui
+                    .as_ref()
+                    .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Graveyard));
+                let rows = if opening { self.grave_rows() } else { Vec::new() };
+                if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                    let st = &mut egui.ui_state;
+                    st.toggle_panel(egui_ui::RightPanel::Graveyard);
+                    egui_ui::release_focus(&egui.ctx);
+                    st.grave_sel = None;
+                    st.grave_out = None;
+                    st.grave_rows = rows;
                 }
             }
             "prev_tab" | "prev_tab_row" => {
@@ -3886,6 +4218,7 @@ impl App {
                     st.toggle_panel(egui_ui::RightPanel::History);
                     egui_ui::release_focus(&egui.ctx);
                     st.history_sel = None;
+                    st.history_preview = None;
                     st.history_rows = rows;
                 }
             }
@@ -3955,7 +4288,9 @@ impl App {
             },
             _ => {},
         }
-        if let Some(w) = &self.wins[self.cur].window {
+        // The action may have closed the last window (a buried tab's window
+        // dies with its last tab); the session is ending, nothing to redraw.
+        if let Some(w) = self.wins.get(self.cur).and_then(|w| w.window.as_ref()) {
             w.request_redraw();
         }
     }
@@ -4245,6 +4580,7 @@ impl App {
                 renaming: false,
                 overview: None,
                 sw_thumbs: Vec::new(),
+                grave_thumbs: Vec::new(),
                 thumb_rr: 0,
                 preview_next: Instant::now(),
                 repaint_at: None,
@@ -4476,16 +4812,14 @@ pub struct CommandBlock {
     pub finished_at: Option<std::time::SystemTime>,
     /// A prompt alone is not a running command. Set only by C.
     pub executing: bool,
-    /// Buffer-row ID (survives scrollback eviction) of the prompt when
-    /// the A mark landed. Capture starts AT the prompt so the echoed
-    /// command rides along in the block.
+    /// Prompt row ID, used only by the legacy A/D-only capture fallback.
     pub start_global: usize,
     /// The alternate screen owned the display at one of this command's
     /// marks: its "output" was a TUI's redraws, not capturable text.
     pub alt_seen: bool,
-    /// Captured output: the prompt row (with the command) and everything
-    /// the command wrote, taken in one at the D mark. Empty while the
-    /// block's text lives in `compressed`.
+    /// Captured output between C and D, copied by the terminal parser at D.
+    /// Empty while the block's text lives in `compressed`. Legacy A/D-only
+    /// integrations include input because they do not mark the output start.
     pub text: String,
     /// The closed block's text, compressed at the D mark. The in-progress
     /// block stays plain (it is appended to hot); only finished output is
@@ -4524,19 +4858,29 @@ impl CommandBlock {
     /// Readable output. A closed block inflates on first read and drops
     /// its compressed copy, so repeated queries pay the codec once.
     pub fn readable_text(&mut self) -> &str {
-        if let Some(c) = self.compressed.take() {
+        if self.compressed.is_some() {
+            self.text = self.output_text().into_owned();
+            self.compressed = None;
+        }
+        &self.text
+    }
+
+    /// Borrow plain output or decode a copy without expanding pool storage.
+    fn output_text(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(c) = &self.compressed {
             let (len, frame) = if c.len() > 8 {
                 let len = u64::from_le_bytes(c[0..8].try_into().unwrap());
                 (len as usize, &c[8..])
             } else {
                 (0, &c[..])
             };
-            self.text = match lz4_flex::decompress(frame, len) {
+            std::borrow::Cow::Owned(match lz4_flex::decompress(frame, len) {
                 Ok(t) => String::from_utf8_lossy(&t).into_owned(),
                 Err(e) => format!("# (pool block unreadable: {e})"),
-            };
+            })
+        } else {
+            std::borrow::Cow::Borrowed(&self.text)
         }
-        &self.text
     }
 }
 
@@ -4545,7 +4889,7 @@ impl CommandBlock {
 /// integrations retain the legacy first-line fallback.
 fn finish_block(b: &mut CommandBlock) {
     b.line_count = b.text.lines().count();
-    if !b.command_captured && b.cmd_line.is_empty() {
+    if !b.executing && !b.command_captured && b.cmd_line.is_empty() {
         b.cmd_line = b.text.lines().next().unwrap_or_default().trim_end().to_string();
     }
     // The compression decision is unchanged: blocks too small to be worth
@@ -4755,9 +5099,22 @@ fn format_last_output(q: &mut std::collections::VecDeque<CommandBlock>, n: usize
     out
 }
 
-/// What a dying tab leaves behind for the reopen ring.
-fn tab_death(tab: &Tab) -> (String, Option<std::path::PathBuf>) {
-    (tab.title.lock().unwrap().clone(), tab.cwd_raw())
+/// The panel lists burials newest-first; the graveyard stores them
+/// oldest-first. Translate a panel index to a graveyard position.
+fn grave_pos_for(len: usize, panel_index: usize) -> Option<usize> {
+    (panel_index < len).then(|| len - 1 - panel_index)
+}
+
+/// "42 s" / "3 m" / "1 h 04 m" since burial, without the clock reaching
+/// into the panel.
+fn buried_label(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} m", secs / 60)
+    } else {
+        format!("{} h {:02} m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 /// State of the cursor's movement pulse (see `App::ripple`).
@@ -5155,7 +5512,8 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event: key, .. } => {
                 let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
                 self.egui_owns_keyboard()
-                    && !matches!(action.as_deref(), Some("show_config" | "show_history"))
+                    && self.graveyard_passes_key(&key.logical_key)
+                    && !matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"))
             }
             _ => true,
         };
@@ -5228,6 +5586,15 @@ impl ApplicationHandler for App {
                 self.close_window(self.cur, event_loop);
             },
             WindowEvent::RedrawRequested => {
+                // This frame belongs to the window that asked for it. The
+                // drains below may open a window and switch `cur` to it
+                // (session requests, pending actions and moves); drawing
+                // with the switched `cur` would render the newcomer's state
+                // into THIS window's surface and desync this window's
+                // frame-callback bookkeeping in winit -- the exact recipe
+                // for a window that stops drawing forever. Draw for the
+                // original window, then hand `cur` to the newcomer.
+                let frame_win = self.cur;
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_bell_pings();
@@ -5239,6 +5606,7 @@ impl ApplicationHandler for App {
                 self.drain_cell_sizes();
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
+                self.apply_pending_grave();
                 if let Some(action) = self.pending_action.take() {
                     self.do_action(&action, event_loop);
                 }
@@ -5292,6 +5660,12 @@ impl ApplicationHandler for App {
                         if self.wins.is_empty() {
                             return;
                         }
+                        // A buried shell that exits on its own is dead
+                        // weight: evict it, never re-bury a corpse.
+                        if let Some(pos) = self.graveyard.iter().position(|g| g.tab.id == *id) {
+                            self.kill_grave(pos);
+                            continue;
+                        }
                         if let Some(pos) = self.wins[self.cur].tabs.iter().position(|t| t.id == *id) {
                             self.close_tab_at(pos, event_loop);
                         }
@@ -5300,12 +5674,25 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+                // The drains may have moved `cur` (new window from a session
+                // request, a pending action); the frame itself still belongs
+                // to the window that requested it. If a drain closed that
+                // window, the frame request is moot.
+                let wanted_cur = self.cur;
+                if frame_win >= self.wins.len() {
+                    self.cur = wanted_cur.min(self.wins.len().saturating_sub(1));
+                    return;
+                }
+                self.cur = frame_win;
                 // Draw unconditionally: winit only sends RedrawRequested when a
                 // frame is actually wanted (our own request_redraw, resize, or
                 // compositor damage). A hand-rolled damage flag here would have
                 // to be remembered by every caller -- and silently swallow
                 // frames for the ones that didn't (e.g. the cursor blink).
                 self.draw(&window);
+                if wanted_cur < self.wins.len() && wanted_cur != frame_win {
+                    self.cur = wanted_cur;
+                }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 let px = position.x as f32;
@@ -5614,18 +6001,22 @@ impl ApplicationHandler for App {
                         key.logical_key, key.text, self.modifiers, egui_consumed
                     );
                 }
+                // The graveyard panel's own keys are queued to egui and act
+                // on the next draw; they must not reach the terminal either
+                // as a press or as the protocol's release half.
+                let grave_claim = self.graveyard_claims_key(&key.logical_key);
                 if key.state == ElementState::Pressed {
                     let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
                     // Panel shortcuts remain global while a sidebar field is focused.
                     // Other consumed presses belong only to egui's editor.
-                    let panel_shortcut = matches!(action.as_deref(), Some("show_config" | "show_history"));
+                    let panel_shortcut = matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"));
                     let repeatable = action.as_deref().is_none_or(|action| matches!(action,
                         "prev_tab" | "next_tab" | "prev_tab_row" | "next_tab_row" |
                         "scroll_page_up" | "scroll_page_down" | "enlarge_font" | "shrink_font"));
-                    if (!egui_consumed || panel_shortcut) && (!key.repeat || repeatable) {
+                    if (!egui_consumed || panel_shortcut) && !grave_claim && (!key.repeat || repeatable) {
                         self.handle_key(&key.logical_key, Some(&key), event_loop);
                     }
-                } else {
+                } else if !grave_claim {
                     // Releases flow to the enhanced protocol only (see
                     // handle_key's early branch); cheaply, they no-op.
                     self.handle_key(&key.logical_key, Some(&key), event_loop);
@@ -6012,6 +6403,32 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("run");
     log::info!("exited");
+}
+
+#[cfg(test)]
+mod graveyard_tests {
+    use super::*;
+
+    #[test]
+    fn panel_index_maps_newest_first_onto_oldest_first_storage() {
+        // Five burials, oldest at 0, newest at 4. Panel row 0 is the newest.
+        assert_eq!(grave_pos_for(5, 0), Some(4));
+        assert_eq!(grave_pos_for(5, 2), Some(2));
+        assert_eq!(grave_pos_for(5, 4), Some(0));
+        // A stale selection (an eviction shrank the list) maps to nothing
+        // rather than the wrong tab.
+        assert_eq!(grave_pos_for(5, 5), None);
+        assert_eq!(grave_pos_for(0, 0), None);
+    }
+
+    #[test]
+    fn burial_age_stays_short_and_readable() {
+        assert_eq!(buried_label(0), "0 s");
+        assert_eq!(buried_label(59), "59 s");
+        assert_eq!(buried_label(60), "1 m");
+        assert_eq!(buried_label(3600), "1 h 00 m");
+        assert_eq!(buried_label(3600 + 240), "1 h 04 m");
+    }
 }
 
 #[cfg(test)]
@@ -6473,6 +6890,11 @@ mod sem_tests {
         assert!(b.compressed.is_some(), "repetitive text compresses");
         assert!(b.text.is_empty(), "the live buffer gives way to the codec");
         assert!(b.stored_len() < original.len() / 2, "the budget sees the compressed size");
+        let stored = b.stored_len();
+        assert_eq!(b.output_text(), original, "the preview gets the exact bytes back");
+        assert!(b.compressed.is_some(), "previewing preserves pool compression");
+        assert!(b.text.is_empty());
+        assert_eq!(b.stored_len(), stored, "previewing preserves budget accounting");
         assert_eq!(b.readable_text(), original, "the query path gets the exact bytes back");
         assert!(b.compressed.is_none(), "a second query pays nothing");
         // Small blocks are not worth a frame header.

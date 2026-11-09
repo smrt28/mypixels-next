@@ -232,6 +232,7 @@ pub(crate) enum Icon {
     Pipe,
     Rerun,
     View,
+    Tombstone,
 }
 
 pub(crate) fn icon_button(
@@ -353,6 +354,20 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
             );
             line(&[(-3.0, -2.0), (0.0, 0.0), (-3.0, 2.0)]);
             line(&[(1.0, 3.0), (4.0, 3.0)]);
+        }
+        Icon::Tombstone => {
+            // Slab with a domed top, seated on a ground line.
+            line(&[
+                (-5.0, 7.0),
+                (-5.0, -2.0),
+                (-3.5, -5.5),
+                (0.0, -7.0),
+                (3.5, -5.5),
+                (5.0, -2.0),
+                (5.0, 7.0),
+            ]);
+            line(&[(-8.0, 7.0), (8.0, 7.0)]);
+            line(&[(-2.0, -2.0), (2.0, -2.0)]);
         }
     }
 }
