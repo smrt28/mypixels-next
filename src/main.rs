@@ -3807,10 +3807,22 @@ impl App {
         e.ui_state.owns_keyboard(&e.ctx)
     }
 
+    /// The Alt-held switcher's state machine lives in the app (its arrows
+    /// drive `prev_tab`/`next_tab`), so while it is open it owns the keys
+    /// outright and nothing keyboard-related may go to egui.
+    fn switcher_open_here(&self) -> bool {
+        matches!(
+            self.wins[self.cur].overview.as_ref().map(|o| o.mode),
+            Some(OverviewMode::Switcher)
+        )
+    }
+
     /// True while the graveyard panel is the ONLY keyboard surface (menus,
-    /// the rename box and editors keep full ownership when they are open).
+    /// the rename box, the switcher and editors keep full ownership when
+    /// they are open).
     fn grave_only_owner(&self) -> bool {
-        self.wins[self.cur].egui.as_ref().is_some_and(|e| {
+        !self.switcher_open_here()
+            && self.wins[self.cur].egui.as_ref().is_some_and(|e| {
             let st = &e.ui_state;
             st.right_panel == egui_ui::RightPanel::Graveyard
                 && !st.rename_open && !st.menu_open && !st.move_open
@@ -5511,7 +5523,11 @@ impl ApplicationHandler for App {
         let route_to_egui = match &event {
             WindowEvent::KeyboardInput { event: key, .. } => {
                 let action = config::find_action(&self.config.bindings, &key.logical_key, self.modifiers, false);
-                self.egui_owns_keyboard()
+                // The switcher is drawn by egui but steered by the app; while
+                // it is open, keys must not reach egui (the graveyard panel
+                // would steer an invisible selection with them).
+                !self.switcher_open_here()
+                    && self.egui_owns_keyboard()
                     && self.graveyard_passes_key(&key.logical_key)
                     && !matches!(action.as_deref(), Some("show_config" | "show_history" | "graveyard"))
             }
