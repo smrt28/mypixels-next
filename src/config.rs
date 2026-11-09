@@ -90,6 +90,8 @@ pub struct Config {
     /// changes override these per color.
     pub palette: Option<[Rgb; 16]>,
     pub term_font: String,
+    /// Extra row height as a fraction of the font's normal line height.
+    pub line_spacing: f32,
     pub tablist_font: String,
     /// Scrollback depth. Costs width*24+40 bytes per line (full-width
     /// Vec<Cell>), so raising this is a real RAM decision; the command
@@ -242,6 +244,7 @@ impl Default for Config {
             theme_files: Vec::new(),
             palette: None,
             term_font: "Terminus 8".to_string(),
+            line_spacing: 0.0,
             tablist_font: "Liberation Mono 7".to_string(),
             scrollback_lines: 5000,
             history_bytes: 32 * 1024 * 1024,
@@ -350,6 +353,10 @@ impl Config {
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    pub fn terminal_line_height(&self, normal_height: f32) -> f32 {
+        (normal_height * (1.0 + self.line_spacing)).round().max(1.0)
+    }
+
     pub fn from_text(text: &str, base: &std::path::Path) -> Result<Config, String> {
         let text = dedupe_top_level(&text.replace("!!python/tuple", ""));
         let mut value: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| format!("Invalid config YAML: {e}"))?;
@@ -396,6 +403,7 @@ impl Config {
         let str_ = |s: &str| format!("'{}'", s.replace('\'', "''"));
         let mut keys = vec![
             ("term_font".into(), str_(&self.term_font)),
+            ("line_spacing".into(), self.line_spacing.to_string()),
             ("tablist_font".into(), str_(&self.tablist_font)),
             ("term_transparency".into(), self.term_transparency.to_string()),
             ("scrollback_lines".into(), self.scrollback_lines.to_string()),
@@ -566,6 +574,13 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "theme" => {
                     if let Some(s) = val.as_str() {
                         cfg.theme = s.to_string();
+                    }
+                },
+                "line_spacing" => {
+                    if let Some(value) = val.as_f64().filter(|v| v.is_finite() && (-0.9..=3.0).contains(v)) {
+                        cfg.line_spacing = value as f32;
+                    } else {
+                        log::warn!("line_spacing must be a finite number between -0.9 and 3.0");
                     }
                 },
                 "term_font" => {
@@ -934,6 +949,23 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn line_spacing_scales_the_normal_height_and_round_trips() {
+        let base = std::path::Path::new(".");
+        assert_eq!(Config::default().line_spacing, 0.0);
+        for (spacing, height) in [(0.0, 20.0), (0.1, 22.0), (-0.1, 18.0), (0.5, 30.0), (-0.9, 2.0)] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nline_spacing: {spacing}\n"), base).unwrap();
+            assert_eq!(cfg.terminal_line_height(20.0), height);
+            assert!(cfg.terminal_line_height(1.0) >= 1.0);
+            let saved = replace_top_level_values("", &cfg.ui_keys());
+            assert_eq!(Config::from_text(&saved, base).unwrap().line_spacing, spacing);
+        }
+        for invalid in [".nan", ".inf", "-.inf", "-1", "4", "'wide'", "null"] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nline_spacing: {invalid}\n"), base).unwrap();
+            assert_eq!(cfg.line_spacing, 0.0, "invalid spacing {invalid}");
+        }
+    }
+
     #[test]
     fn tab_presentation_preferences_default_on_and_round_trip() {
         let defaults = Config::default();

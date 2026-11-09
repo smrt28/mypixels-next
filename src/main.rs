@@ -571,7 +571,7 @@ impl App {
             .unwrap_or(fonts::LineMetrics::DEFAULT);
         let tab_metrics = fonts::line_metrics(&mut font_system, tab_family, tab.weight, tab.slant)
             .unwrap_or(fonts::LineMetrics::DEFAULT);
-        let term_lh = term_metrics.height_at(font_px);
+        let term_lh = config.terminal_line_height(term_metrics.height_at(font_px));
         let tab_lh = tab_metrics.height_at(tab_font_px);
 
         let mut measure = Buffer::new(&mut font_system, Metrics::new(font_px, term_lh));
@@ -1302,6 +1302,10 @@ impl App {
 
     /// Resize terminal grid of all tabs to fit the current surface size.
     fn sync_term_size(&mut self) {
+        self.sync_term_size_with(false);
+    }
+
+    fn sync_term_size_with(&mut self, force: bool) {
         let (w, h) = match self.wins.get(self.cur).and_then(|w| w.gpu.as_ref()) {
             Some(g) => (g.config.width, g.config.height),
             None => return,
@@ -1324,7 +1328,7 @@ impl App {
                 nrows = r.parse().unwrap_or(nrows);
             }
         }
-        if (ncols, nrows) != (self.wins[self.cur].cols, self.wins[self.cur].rows) {
+        if force || (ncols, nrows) != (self.wins[self.cur].cols, self.wins[self.cur].rows) {
             eprintln!("term resize: {}x{} -> {}x{}", self.wins[self.cur].cols, self.wins[self.cur].rows, ncols, nrows);
             self.wins[self.cur].cols = ncols;
             self.wins[self.cur].rows = nrows;
@@ -1349,7 +1353,7 @@ impl App {
     /// draw time, so swapping the struct (done by the caller) covers them. We
     /// only need to recompute the values copied into App at startup: fg/bg and,
     /// when the font changed, the cell metrics + glyph pools.
-    fn apply_config(&mut self, font_changed: bool) {
+    fn apply_config(&mut self, font_changed: bool, spacing_changed: bool) {
         if !self.config.tab_overview_on_alt {
             *self.switcher_alt_at.lock().unwrap() = None;
             self.switcher_show_req.store(false, Ordering::SeqCst);
@@ -1366,6 +1370,9 @@ impl App {
         }
         if font_changed {
             self.apply_fonts();
+        } else if spacing_changed {
+            // Changing row spacing preserves the live font zoom.
+            self.rebuild_term_font();
         }
     }
 
@@ -1373,8 +1380,9 @@ impl App {
         match Config::try_load() {
             Ok(config) => {
                 let font_changed = config.term_font != self.config.term_font || config.tablist_font != self.config.tablist_font;
+                let spacing_changed = config.line_spacing != self.config.line_spacing;
                 self.config = config;
-                self.apply_config(font_changed);
+                self.apply_config(font_changed, spacing_changed);
                 self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
                 if let Some(watcher) = &self.theme_watcher { watcher.set_paths(self.config.theme_files.clone()); }
                 if let Some(window) = &self.wins[self.cur].window { window.request_redraw(); }
@@ -1399,7 +1407,7 @@ impl App {
         self.term_metrics =
             fonts::line_metrics(&mut self.font_system, self.term_family, self.term_weight, self.term_slant)
                 .unwrap_or(fonts::LineMetrics::DEFAULT);
-        let term_lh = self.term_metrics.height_at(font_px);
+        let term_lh = self.config.terminal_line_height(self.term_metrics.height_at(font_px));
         self.mono_attrs = {
             let db = self.font_system.db();
             fonts::pin_face(
@@ -1429,7 +1437,7 @@ impl App {
         self.cell_h = cell_h;
 
         // Native scaling can rebuild metrics before the first window exists.
-        if let Some(gpu) = self.wins.get_mut(self.cur).and_then(|w| w.gpu.as_mut()) {
+        for gpu in self.wins.iter_mut().filter_map(|w| w.gpu.as_mut()) {
             gpu.pool = (0..MAX_RUNS)
                 .map(|_| Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh)))
                 .collect();
@@ -1437,16 +1445,15 @@ impl App {
                 Buffer::new(&mut self.font_system, Metrics::new(font_px, term_lh));
             gpu.invalidate_terminals();
         }
-        // Cell size changed -> the grid that fits the surface changes.
-        self.sync_term_size();
-        // The cell size is global, so refresh every tab's term - not just the
-        // active window's - so a native-sized Kitty image in any window is
-        // measured in the current cell, not a stale one.
-        for w in self.wins.iter() {
-            for t in w.all_tabs() {
-                t.term.lock().set_cell_pixels(self.cell_w as u32, self.cell_h as u32);
-            }
+        // Metrics are global: resize every window and all its workspaces.
+        // Force PTY pixel-size updates even when the row count stays the same.
+        let current = self.cur;
+        for index in 0..self.wins.len() {
+            self.cur = index;
+            self.sync_term_size_with(true);
+            if let Some(window) = &self.wins[index].window { window.request_redraw(); }
         }
+        self.cur = current;
         // Font routing depends on the terminal font, so rebuild it with it.
         *self.coverage.borrow_mut() = Some(fonts::Coverage::new(
             &self.font_system,
@@ -1955,6 +1962,7 @@ impl App {
             self.config.foreground_color,
             crate::config::terminal_bg(&self.config),
             self.config.col,
+            self.config.line_spacing,
         );
         // The UI wears the terminal's EFFECTIVE colours (theme, palette and
         // overrides resolved upstream - not the raw config fields, which a
@@ -2294,8 +2302,9 @@ impl App {
             let colors_changed = old_text_state.2 != self.config.foreground_color
                 || old_text_state.3 != crate::config::terminal_bg(&self.config)
                 || old_text_state.4 != self.config.col;
-            if font_changed || colors_changed {
-                self.apply_config(font_changed);
+            let spacing_changed = old_text_state.5 != self.config.line_spacing;
+            if font_changed || colors_changed || spacing_changed {
+                self.apply_config(font_changed, spacing_changed);
             }
         }
         if save {

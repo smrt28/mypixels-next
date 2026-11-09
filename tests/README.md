@@ -122,3 +122,9 @@ Alt-hold timer live, disabling an open switcher, and numbered shortcuts in
 number-only mode with the switcher disabled.
 It sends no desktop keyboard input and does not access the clipboard. Set
 `MYPIXELS_WORKSPACE_SCREENSHOT=1` to also save a desktop screenshot with `grim`.
+
+`python3 tests/line_spacing_smoke.py` checks normal, +0.1, and -0.1 row spacing
+in live PTYs across two windows and hidden workspaces. It checks terminal pixel
+size reports, row counts, restoring the default, and preserving live font zoom.
+It uses isolated children and a FIFO, without desktop keyboard or clipboard
+input. Set `MYPIXELS_SPACING_SCREENSHOT=1` to save desktop screenshots with grim.

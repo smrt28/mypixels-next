@@ -908,6 +908,27 @@ mod tests {
     }
 
     #[test]
+    fn line_spacing_moves_baselines_without_resizing_glyphs() {
+        let (mut fs, mut cov) = coverage("Cascadia Code");
+        let attrs = cov.attrs_for(fs.db(), 'a');
+        let mut cfg = crate::config::Config::default();
+        let mut baselines = Vec::new();
+        for spacing in [-0.1, 0.0, 0.1] {
+            cfg.line_spacing = spacing;
+            let mut buffer = Buffer::new(&mut fs, glyphon::Metrics::new(12.0, cfg.terminal_line_height(20.0)));
+            shape_terminal_run(&mut buffer, &mut fs, "abcd", attrs, &[(0, 0), (1, 1), (2, 2), (3, 3)], 7.0);
+            let rows: Vec<_> = buffer.layout_runs().collect();
+            assert_eq!(rows.len(), 1);
+            baselines.push(rows[0].line_y);
+            for glyph in rows[0].glyphs {
+                assert_eq!(glyph.font_size, 12.0);
+                assert_eq!(glyph.x, glyph.start as f32 * 7.0);
+            }
+        }
+        assert!(baselines[0] < baselines[1] && baselines[1] < baselines[2]);
+    }
+
+    #[test]
     fn ls_columns_never_wrap_or_accumulate_fractional_spacing() {
         let (mut fs, mut cov) = coverage("Cascadia Code");
         let attrs = cov.attrs_for(fs.db(), 'a');

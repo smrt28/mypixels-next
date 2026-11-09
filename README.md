@@ -50,6 +50,10 @@ query, not a launch.
 Features
 ========
 
+* Adjustable line spacing in Settings → Appearance → Fonts. `0` keeps the
+  normal spacing, `+0.1` adds 10% row height, and `-0.1` removes 10%, without
+  changing font size. The `line_spacing` config key accepts -0.9 through 3.0;
+  row heights are rounded to whole pixels. Changes apply live and persist.
 * Tab switcher with cached GPU previews - hold Alt: each tab is a scaled,
   live view of its own terminal; arrows move the selection. Hover a tab for
   its preview. Selection and reordering animate in both the strip and switcher.

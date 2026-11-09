@@ -1825,6 +1825,12 @@ pub fn config_window(
                             section(ui, "Fonts", &colors, |ui| {
                                 form_grid("fonts").show(ui, |ui| {
                                     font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, &mut ev);
+                                    row(ui, "Line spacing", |ui| {
+                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.line_spacing)
+                                            .speed(0.05).range(-0.9..=3.0).fixed_decimals(2))
+                                            .on_hover_text("0 = current spacing; +0.1 adds 10% row height; -0.1 removes 10%.")
+                                            .changed();
+                                    });
                                     font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, &mut ev);
                                 });
                             });
