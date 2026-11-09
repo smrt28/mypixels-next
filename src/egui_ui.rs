@@ -1895,6 +1895,7 @@ pub fn config_window(
                             section(ui, "Tab strip", &colors, |ui| {
                                 form_grid("tabs").show(ui, |ui| {
                                     checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, &mut ev);
+                                    checkbox_row(ui, "Workspaces (Alt+Q…P)", &mut cfg.workspaces_enabled, &mut ev);
                                     row(ui, "Title length", |ui| {
                                         ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed();
                                     });

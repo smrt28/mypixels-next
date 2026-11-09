@@ -21,6 +21,7 @@ hide_single_tab: false
 tab_overview_on_alt: false
 tab_overview_delay_ms: 60
 show_tab_titles: false
+workspaces_enabled: true
 ''')
 fixture = work / 'fixture.py'
 fixture.write_text(r'''

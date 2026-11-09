@@ -913,6 +913,11 @@ impl App {
     }
 
     fn switch_workspace(&mut self, target: usize) {
+        // Gated: with workspaces off the bindings and the tab-bar button are
+        // inert, and this is the one funnel every workspace switch flows through.
+        if !self.config.workspaces_enabled {
+            return;
+        }
         if target >= WORKSPACE_KEYS.len() || target == self.wins[self.cur].workspace {
             return;
         }
@@ -2040,7 +2045,11 @@ impl App {
         } else {
             Vec::new()
         };
-        let sw_accent = ui_style::rgb_c32(self.config.workspace_colors[self.wins[self.cur].workspace]);
+        let sw_accent = if self.config.workspaces_enabled {
+            ui_style::rgb_c32(self.config.workspace_colors[self.wins[self.cur].workspace])
+        } else {
+            ui_style::rgb_c32(self.config.col[2])
+        };
         let sw_dim = egui_ui::dim_fill(
             &self.config,
             self.bg,

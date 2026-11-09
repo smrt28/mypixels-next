@@ -109,6 +109,8 @@ pub struct Config {
     /// Enables the Alt-held visual tab switcher. Numbered shortcuts work independently.
     pub tab_overview_on_alt: bool,
     pub show_tab_titles: bool,
+    /// Ten independent tab sets per window (Alt+Q..P). Off by default.
+    pub workspaces_enabled: bool,
     pub tab_overview_opacity: f32,
     pub tab_overview_delay_ms: u32,
     /// Switcher preview scale: the tab's frame shrunk by this factor (1.0 =
@@ -261,6 +263,7 @@ impl Default for Config {
             ],
             tab_overview_on_alt: true,
             show_tab_titles: true,
+            workspaces_enabled: false,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
             tab_overview_scale: 0.25,
@@ -421,6 +424,7 @@ impl Config {
             ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
+            ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
             ("tab_overview_scale".into(), self.tab_overview_scale.to_string()),
@@ -688,6 +692,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "show_tab_titles" => {
                     if let Some(b) = val.as_bool() {
                         cfg.show_tab_titles = b;
+                    }
+                },
+                "workspaces_enabled" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.workspaces_enabled = b;
                     }
                 },
                 "tab_overview_on_alt" => {
@@ -964,6 +973,15 @@ mod tests {
             let cfg = Config::from_text(&format!("wal_palette: ''\nline_spacing: {invalid}\n"), base).unwrap();
             assert_eq!(cfg.line_spacing, 0.0, "invalid spacing {invalid}");
         }
+    }
+
+    #[test]
+    fn workspaces_default_off_and_round_trip() {
+        assert!(!Config::default().workspaces_enabled);
+        let cfg = Config::from_text("wal_palette: ''\nworkspaces_enabled: true\n", std::path::Path::new(".")).unwrap();
+        assert!(cfg.workspaces_enabled);
+        let saved = replace_top_level_values("", &cfg.ui_keys());
+        assert!(Config::from_text(&saved, std::path::Path::new(".")).unwrap().workspaces_enabled);
     }
 
     #[test]

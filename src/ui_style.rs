@@ -620,7 +620,13 @@ impl TabStyle {
             base.border = base.bg.lerp_to_gamma(base.fg, 0.16);
             base.muted = base.bg.lerp_to_gamma(base.fg, 0.65);
         }
-        let color = rgb_c32(cfg.workspace_colors.get(workspace).copied().unwrap_or(cfg.workspace_colors[0]));
+        // With workspaces off, tabs use the neutral accent (col[2]) instead
+        // of a workspace identity color.
+        let color = if cfg.workspaces_enabled {
+            rgb_c32(cfg.workspace_colors.get(workspace).copied().unwrap_or(cfg.workspace_colors[0]))
+        } else {
+            base.accent
+        };
         base.accent = color;
         let background = base.bg.lerp_to_gamma(color, 0.18);
         let selected_background = base.bg.lerp_to_gamma(color, 0.42);
@@ -728,6 +734,7 @@ mod motion_tests {
     #[test]
     fn workspace_tab_styles_follow_only_their_workspace_color() {
         let mut cfg = crate::config::Config::default();
+        cfg.workspaces_enabled = true;
         let first = workspace_style(&cfg, 0, false);
         let second = workspace_style(&cfg, 1, false);
         assert_ne!(first.background, second.background);

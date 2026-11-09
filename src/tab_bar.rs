@@ -78,18 +78,20 @@ pub(crate) fn show(
             geometry.menu_clicked = response.clicked();
             response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
             p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
-            let workspace_width = 64.0;
-            let workspace_rect = egui::Rect::from_min_max(
-                egui::pos2(width - workspace_width, 3.0), egui::pos2(width - 3.0, height - 3.0));
-            let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
-            if response.hovered() {
-                colors.surface(p, workspace_rect, 4.0, false, true);
+            let workspace_width = if cfg.workspaces_enabled { 64.0 } else { 0.0 };
+            if cfg.workspaces_enabled {
+                let workspace_rect = egui::Rect::from_min_max(
+                    egui::pos2(width - workspace_width, 3.0), egui::pos2(width - 3.0, height - 3.0));
+                let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
+                if response.hovered() {
+                    colors.surface(p, workspace_rect, 4.0, false, true);
+                }
+                ui_style::text(ui, workspace_rect, &format!("W{} ▾", workspace + 1), colors.accent, 11.0, false);
+                geometry.workspace_clicked = response.clicked();
+                response.on_hover_text(format!("Workspace {} · Alt+{} · click to switch", workspace + 1,
+                    crate::WORKSPACE_KEYS.chars().nth(workspace).unwrap_or('q').to_ascii_uppercase()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
             }
-            ui_style::text(ui, workspace_rect, &format!("W{} ▾", workspace + 1), colors.accent, 11.0, false);
-            geometry.workspace_clicked = response.clicked();
-            response.on_hover_text(format!("Workspace {} · Alt+{} · click to switch", workspace + 1,
-                crate::WORKSPACE_KEYS.chars().nth(workspace).unwrap_or('q').to_ascii_uppercase()))
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
             let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };
             if clock_width > 0.0 {
                 ui_style::text(

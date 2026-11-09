@@ -64,19 +64,22 @@ Features
   retain title tooltips and can be closed by middle-click or the close shortcut.
 * Partial terminal redraws from Alacritty damage, into persistent per-tab GPU
   textures shared by the live window, previews, and image export.
-* Workspaces - Alt+Q/W/E/R/T/Y/U/I/O/P select ten independent tab sets
-  in each window. Alt+1…9/0 select tabs within the current workspace,
-  creating missing tabs up to that number automatically (0 selects tab 10).
-  Existing tabs keep their numbers; new tabs are appended.
-  Workspaces remember the selected tab and keep their terminals running.
-  Visiting an empty workspace opens its first terminal. The W1…W10 button
-  at the right of the tab bar shows the current workspace and opens a picker.
-  Closing a workspace's last tab returns to another populated workspace;
-  closing the window's final tab closes the window. Bindings are configurable
-  as `goto_workspace_0` through `goto_workspace_9`.
-  Set each workspace's color in Settings → Appearance → Colors. Tabs inherit
-  their workspace color; W1–W9 have distinct defaults. Colors are saved as
-  `workspace_color_1` through `workspace_color_10` in the configuration.
+* Workspaces - opt-in (`workspaces_enabled: true`; Settings → Tabs →
+  Workspaces). Off by default, in which case the Alt+Q…P bindings and the
+  tab-bar button are inert and tabs keep their normal color. When on,
+  Alt+Q/W/E/R/T/Y/U/I/O/P select ten independent tab sets in each window.
+  Alt+1…9/0 select tabs within the current workspace, creating missing tabs
+  up to that number automatically (0 selects tab 10). Existing tabs keep
+  their numbers; new tabs are appended. Workspaces remember the selected tab
+  and keep their terminals running. Visiting an empty workspace opens its
+  first terminal. The W1…W10 button at the right of the tab bar shows the
+  current workspace and opens a picker. Closing a workspace's last tab
+  returns to another populated workspace; closing the window's final tab
+  closes the window. Bindings are configurable as `goto_workspace_0` through
+  `goto_workspace_9`. Set each workspace's color in Settings → Appearance →
+  Colors. Tabs inherit their workspace color; W1–W9 have distinct defaults.
+  Colors are saved as `workspace_color_1` through `workspace_color_10` in the
+  configuration.
 * Entanglement - one command, many tabs: toggle a tab into the group
   (Alt+Shift+*) and keystrokes land in all of them.
 * Tab colorization - mark a tab with a colour so it can be easily
