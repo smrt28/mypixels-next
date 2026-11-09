@@ -63,6 +63,8 @@ fn parse_palette(s: &str) -> Option<[Rgb; 16]> {
 pub struct Config {
     // tablist
     pub tablist_background: Rgb,
+    /// Workspace identity colors, W1 through W10. Tab chrome is derived from these.
+    pub workspace_colors: [Rgb; 10],
     pub tab_color_bg: Rgb,
     pub tab_color_bg_selected: Rgb,
     pub tab_color_fg: Rgb,
@@ -102,7 +104,9 @@ pub struct Config {
     // tab color groups
     pub col: [Rgb; 8],
     // behavior
+    /// Enables the Alt-held visual tab switcher. Numbered shortcuts work independently.
     pub tab_overview_on_alt: bool,
+    pub show_tab_titles: bool,
     pub tab_overview_opacity: f32,
     pub tab_overview_delay_ms: u32,
     /// Switcher preview scale: the tab's frame shrunk by this factor (1.0 =
@@ -209,8 +213,16 @@ impl Default for Config {
             bind(&format!("goto_tab_{i}"), &[&format!("MOD1+{d}")]);
         }
 
+        for (i, key) in "qwertyuiop".chars().enumerate() {
+            bind(&format!("goto_workspace_{i}"), &[&format!("MOD1+{key}")]);
+        }
+
         Self {
             tablist_background: parse_hex("#303030"),
+            workspace_colors: [
+                "#5e9eff", "#f07b72", "#71c58c", "#e7b85a", "#b792ed",
+                "#5fc7d0", "#e998be", "#ec9756", "#bbc96a", "#95a8c4",
+            ].map(parse_hex),
             tab_color_bg: parse_hex("#303030"),
             tab_color_bg_selected: parse_hex("#505020"),
             tab_color_fg: parse_hex("#888888"),
@@ -245,6 +257,7 @@ impl Default for Config {
                 parse_hex("#859900"),
             ],
             tab_overview_on_alt: true,
+            show_tab_titles: true,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
             tab_overview_scale: 0.25,
@@ -395,14 +408,11 @@ impl Config {
             ("accent_color".into(), rgb(&self.accent_color)),
             ("bg_tint_color".into(), rgb(&self.bg_tint_color)),
             ("tablist_background".into(), rgb(&self.tablist_background)),
-            ("tab_color_bg".into(), rgb(&self.tab_color_bg)),
-            ("tab_color_bg_selected".into(), rgb(&self.tab_color_bg_selected)),
-            ("tab_color_fg".into(), rgb(&self.tab_color_fg)),
-            ("tab_color_fg_selected".into(), rgb(&self.tab_color_fg_selected)),
             ("add_button_color".into(), rgb(&self.add_button_color)),
             ("tab_title_max_length".into(), self.tab_title_max_length.to_string()),
             ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
+            ("show_tab_titles".into(), self.show_tab_titles.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
             ("tab_overview_scale".into(), self.tab_overview_scale.to_string()),
@@ -420,6 +430,9 @@ impl Config {
             ("default_height".into(), self.default_height.to_string()),
             ("default_maximize".into(), self.default_maximize.to_string()),
         ];
+        for (i, color) in self.workspace_colors.iter().enumerate() {
+            keys.push((format!("workspace_color_{}", i + 1), rgb(color)));
+        }
         for (i, c) in self.col.iter().enumerate() {
             keys.push((format!("col_{i}"), rgb(c)));
         }
@@ -502,6 +515,11 @@ fn dedupe_top_level(text: &str) -> String {
     out
 }
 
+pub(crate) fn workspace_color_index(key: &str) -> Option<usize> {
+    let index = key.strip_prefix("workspace_color_")?.parse::<usize>().ok()?.checked_sub(1)?;
+    (index < 10).then_some(index)
+}
+
 pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
         let Some(map) = v.as_mapping() else {
             return;
@@ -511,6 +529,9 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 continue;
             };
             match key {
+                key if workspace_color_index(key).is_some() => {
+                    set_rgb(&mut cfg.workspace_colors[workspace_color_index(key).unwrap()], val);
+                }
                 "bindings" => merge_bindings(&mut cfg.bindings, val),
                 "tablist_background" => set_rgb(&mut cfg.tablist_background, val),
                 "tab_color_bg" => set_rgb(&mut cfg.tab_color_bg, val),
@@ -647,6 +668,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "default_maximize" => {
                     if let Some(b) = val.as_bool() {
                         cfg.default_maximize = b;
+                    }
+                },
+                "show_tab_titles" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.show_tab_titles = b;
                     }
                 },
                 "tab_overview_on_alt" => {
@@ -909,6 +935,66 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tab_presentation_preferences_default_on_and_round_trip() {
+        let defaults = Config::default();
+        assert!(defaults.tab_overview_on_alt);
+        assert!(defaults.show_tab_titles);
+        let cfg = Config::from_text("wal_palette: ''\ntab_overview_on_alt: false\nshow_tab_titles: false\n", std::path::Path::new(".")).unwrap();
+        assert!(!cfg.tab_overview_on_alt);
+        assert!(!cfg.show_tab_titles);
+        let saved = replace_top_level_values("", &cfg.ui_keys());
+        let restored = Config::from_text(&saved, std::path::Path::new(".")).unwrap();
+        assert!(!restored.tab_overview_on_alt);
+        assert!(!restored.show_tab_titles);
+    }
+
+    #[test]
+    fn workspace_colors_load_save_and_override_themes_independently() {
+        let base = std::path::Path::new(".");
+        let mut cfg = Config::from_text("theme: dracula\nworkspace_color_1: '#123456'\nworkspace_color_9: '#fedcba'\nworkspace_color_10: '#abc'\n", base).unwrap();
+        assert_eq!(cfg.workspace_colors[0], Rgb(0x12, 0x34, 0x56));
+        assert_eq!(cfg.workspace_colors[8], Rgb(0xfe, 0xdc, 0xba));
+        assert_eq!(cfg.workspace_colors[9], Rgb(0xaa, 0xbb, 0xcc));
+        let defaults = Config::default();
+        assert_eq!(cfg.workspace_colors[1..8], defaults.workspace_colors[1..8]);
+        cfg.workspace_colors[4] = Rgb(5, 127, 250);
+        let saved = replace_top_level_values("# keep comment\nbindings: {new_tab: 'Control+t'}\n", &cfg.ui_keys());
+        let restored = Config::from_text(&saved, base).unwrap();
+        assert_eq!(restored.workspace_colors, cfg.workspace_colors);
+        assert!(saved.contains("# keep comment"));
+        assert!(!saved.contains("tab_color_bg:"));
+        assert!(saved.contains("workspace_color_10: '#aabbcc'"));
+        // Global theme changes preserve workspace identities.
+        crate::theme::apply_name(&mut cfg, "catppuccin-latte").unwrap();
+        assert_eq!(cfg.workspace_colors, restored.workspace_colors);
+    }
+
+    #[test]
+    fn invalid_workspace_color_keys_and_values_keep_defaults() {
+        let cfg = Config::from_text("wal_palette: ''\nworkspace_color_0: '#fff'\nworkspace_color_11: '#fff'\nworkspace_color_bad: '#fff'\nworkspace_color_1: nope\nworkspace_color_2: 123\n", std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.workspace_colors, Config::default().workspace_colors);
+        let colors = Config::default().workspace_colors;
+        for (i, color) in colors[..9].iter().enumerate() {
+            assert!(!colors[..i].contains(color), "W{} duplicates a default workspace color", i + 1);
+        }
+    }
+
+    #[test]
+    fn workspaces_have_distinct_alt_letter_bindings() {
+        let cfg = Config::default();
+        for (i, key) in "qwertyuiop".chars().enumerate() {
+            let key = Key::Character(key.to_string().into());
+            assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::ALT, false),
+                Some(format!("goto_workspace_{i}")));
+            assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::empty(), false), None);
+        }
+        for (i, key) in "1234567890".chars().enumerate() {
+            assert_eq!(find_action(&cfg.bindings, &Key::Character(key.to_string().into()), ModifiersState::ALT, false),
+                Some(format!("goto_tab_{i}")));
+        }
+    }
+
+    #[test]
     fn binding_labels_use_readable_modifiers_and_keys() {
         for (spec, expected) in [
             ("CONTROL+SHIFT+n", "Ctrl+Shift+N"),
@@ -974,7 +1060,8 @@ mod tests {
         let mut cfg = Config::default();
         let legacy: serde_yaml::Value = serde_yaml::from_str("show_tab_overview: MOD1+o\noverview_exit: Escape\noverview_nav_left: Left\n").unwrap();
         merge_bindings(&mut cfg.bindings, &legacy);
-        assert_eq!(find_action(&cfg.bindings, &Key::Character("o".into()), M::ALT, false), None);
+        // The retired overview chord now selects workspace 9 by default.
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("o".into()), M::ALT, false).as_deref(), Some("goto_workspace_8"));
         assert_eq!(find_action(&cfg.bindings, &Key::Named(NamedKey::Escape), M::empty(), false), None);
         assert!(cfg.tab_overview_on_alt, "the Alt-held visual switcher remains enabled");
     }

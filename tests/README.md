@@ -110,3 +110,15 @@ actions, toggle/click-away/Escape dismissal, keyboard ownership, and the egui st
 selection, close and close-cancel behavior, drag reordering, 20-tab overflow,
 middle-click close, and native detach into another window. It leaves visual
 artifacts in `/tmp/mypixels-tab-bar-*`.
+
+`python3 tests/workspace_smoke.py` uses a dedicated FIFO and isolated terminal
+children on the current graphical display. It checks all ten workspace shortcuts,
+independent tab sets, remembered selection, background output and protocol replies,
+hidden child exits, closing the last tab of a workspace, and independent windows.
+It also checks creating missing numbered tabs (including tab 10 and custom
+Ctrl+5 bindings), existing tab order, repeated shortcuts, and switcher behavior.
+Tab preference checks cover startup with the switcher disabled, enabling the
+Alt-hold timer live, disabling an open switcher, and numbered shortcuts in
+number-only mode with the switcher disabled.
+It sends no desktop keyboard input and does not access the clipboard. Set
+`MYPIXELS_WORKSPACE_SCREENSHOT=1` to also save a desktop screenshot with `grim`.

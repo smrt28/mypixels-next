@@ -372,7 +372,9 @@ pub fn app_info(ui: &egui::Ui, st: &mut UiState, cfg: &crate::config::Config) {
             egui::ScrollArea::both().max_height((ui.ctx().content_rect().height() - 160.0).max(60.0)).show(ui, |ui| {
                 egui::Grid::new("shortcut_reference").striped(true).spacing([24.0, 8.0]).show(ui, |ui| {
                     for (action, bindings) in &cfg.bindings {
-                        let label = if let Some(index) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
+                        let label = if let Some(index) = action.strip_prefix("goto_workspace_").and_then(|n| n.parse::<usize>().ok()) {
+                            format!("Go to workspace {}", index + 1)
+                        } else if let Some(index) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
                             format!("Switch to tab {}", index + 1)
                         } else {
                             let words = action.replace('_', " ");
@@ -1854,6 +1856,16 @@ pub fn config_window(
                                     color_row(ui, "Cursor", &mut cfg.cursor_color, &mut ev);
                                     color_row(ui, "Accent", &mut cfg.accent_color, &mut ev);
                                     color_row(ui, "Background tint", &mut cfg.bg_tint_color, &mut ev);
+                                    color_row(ui, "Tab strip", &mut cfg.tablist_background, &mut ev);
+                                    color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
+                                });
+                                ui.add_space(8.0);
+                                ui.label("Workspace colors");
+                                ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
+                                form_grid("colors-workspaces").show(ui, |ui| {
+                                    for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
+                                        color_row(ui, &format!("Workspace W{}", index + 1), color, &mut ev);
+                                    }
                                 });
                             });
                         }
@@ -1876,6 +1888,7 @@ pub fn config_window(
                         SettingsPage::Tabs => {
                             section(ui, "Tab strip", &colors, |ui| {
                                 form_grid("tabs").show(ui, |ui| {
+                                    checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, &mut ev);
                                     row(ui, "Title length", |ui| {
                                         ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed();
                                     });
@@ -1909,16 +1922,6 @@ pub fn config_window(
                                     checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, &mut ev);
                                 });
                             });
-                            section(ui, "Tab colors", &colors, |ui| {
-                                form_grid("colors-tabs").show(ui, |ui| {
-                                    color_row(ui, "Strip", &mut cfg.tablist_background, &mut ev);
-                                    color_row(ui, "Tab", &mut cfg.tab_color_bg, &mut ev);
-                                    color_row(ui, "Tab (active)", &mut cfg.tab_color_bg_selected, &mut ev);
-                                    color_row(ui, "Tab text", &mut cfg.tab_color_fg, &mut ev);
-                                    color_row(ui, "Tab text (active)", &mut cfg.tab_color_fg_selected, &mut ev);
-                                    color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
-                                });
-                            });
                             section(ui, "Tab group colors", &colors, |ui| {
                                 ui.horizontal(|ui| {
                                     for (i, color) in cfg.col.iter_mut().enumerate() {
@@ -1931,7 +1934,7 @@ pub fn config_window(
                             });
                             section(ui, "Tab switcher", &colors, |ui| {
                                 form_grid("tab_switcher").show(ui, |ui| {
-                                    checkbox_row(ui, "Open on Alt hold", &mut cfg.tab_overview_on_alt, &mut ev);
+                                    checkbox_row(ui, "Tab switcher enabled", &mut cfg.tab_overview_on_alt, &mut ev);
                                     row(ui, "Backdrop dim", |ui| {
                                         ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_opacity, 0.0..=1.0)).changed();
                                     });
@@ -2540,6 +2543,31 @@ mod regression {
         pass(&ctx, 900.0, 600.0, true); // resize
         pass(&ctx, 900.0, 600.0, false); // close
         pass(&ctx, 900.0, 600.0, true); // reopen
+    }
+
+    #[test]
+    fn appearance_colors_exposes_workspaces_instead_of_general_tab_colors() {
+        let ctx = Context::default();
+        let mut st = UiState { settings_page: SettingsPage::Appearance, ..Default::default() };
+        let mut cfg = crate::config::Config::default();
+        let mut labels = Vec::new();
+        for _ in 0..3 {
+            let mut full = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 1500.0))),
+                ..Default::default()
+            }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
+            labels = full.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            }).collect();
+            full.textures_delta.clear();
+        }
+        for index in 1..=10 {
+            assert!(labels.contains(&format!("Workspace W{index}")), "missing workspace W{index}");
+        }
+        for retired in ["Tab", "Tab (active)", "Tab text", "Tab text (active)"] {
+            assert!(!labels.iter().any(|label| label == retired));
+        }
     }
 
     #[test]

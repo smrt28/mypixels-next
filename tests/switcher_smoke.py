@@ -27,6 +27,7 @@ bg_tint_color: '#0b1216'
 background_color: '#0b1216'
 foreground_color: '#dce4e7'
 accent_color: '#00dbe6'
+workspace_color_1: '#00dbe6'
 tab_overview_opacity: 0.65
 ''')
 fixture = work / 'fixture.py'

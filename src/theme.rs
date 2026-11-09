@@ -286,7 +286,7 @@ impl Theme {
 }
 
 fn is_ui_color(name: &str) -> bool {
-    matches!(
+    crate::config::workspace_color_index(name).is_some() || matches!(
         name,
         "tablist_background"
             | "tab_color_bg"
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn theme_cannot_change_fonts_or_keybindings() {
         let text = format!(
-            "{}\nterm_font: 'Wrong Font 50'\nbindings: {{close_tab: Return}}\ntab_color_bg: '#123456'\n",
+            "{}\nterm_font: 'Wrong Font 50'\nbindings: {{close_tab: Return}}\ntab_color_bg: '#123456'\nworkspace_color_4: '#abcdef'\n",
             builtin("dracula").unwrap()
         );
         let mut cfg = Config::default();
@@ -677,6 +677,8 @@ mod tests {
         Theme::parse(&text).unwrap().apply(&mut cfg);
         assert_eq!(cfg.term_font, font);
         assert_eq!(cfg.tab_color_bg, Rgb(0x12, 0x34, 0x56));
+        assert_eq!(cfg.workspace_colors[3], Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(cfg.workspace_colors[0], Config::default().workspace_colors[0]);
     }
     #[test]
     fn config_overrides_presets_without_losing_the_rest_of_the_theme() {

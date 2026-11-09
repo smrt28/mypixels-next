@@ -20,6 +20,7 @@ pub(crate) struct TabFace {
 
 pub(crate) struct Geometry {
     pub menu_clicked: bool,
+    pub workspace_clicked: bool,
     pub tabs: Vec<egui::Rect>,
     pub close: Vec<egui::Rect>,
     pub add: egui::Rect,
@@ -27,7 +28,7 @@ pub(crate) struct Geometry {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Self { menu_clicked: false, tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
+        Self { menu_clicked: false, workspace_clicked: false, tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
     }
 }
 
@@ -39,9 +40,10 @@ pub(crate) fn show(
     active: usize,
     clock: Option<&str>,
     menu_open: bool,
+    workspace: usize,
     cfg: &crate::config::Config,
 ) -> Geometry {
-    let chrome = ui_style::TabStyle::new(root, cfg);
+    let chrome = ui_style::TabStyle::new(root, cfg, workspace);
     let colors = chrome.base;
     let width = root.max_rect().width();
     let mut geometry = Geometry {
@@ -76,11 +78,23 @@ pub(crate) fn show(
             geometry.menu_clicked = response.clicked();
             response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
             p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
+            let workspace_width = 64.0;
+            let workspace_rect = egui::Rect::from_min_max(
+                egui::pos2(width - workspace_width, 3.0), egui::pos2(width - 3.0, height - 3.0));
+            let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
+            if response.hovered() {
+                colors.surface(p, workspace_rect, 4.0, false, true);
+            }
+            ui_style::text(ui, workspace_rect, &format!("W{} ▾", workspace + 1), colors.accent, 11.0, false);
+            geometry.workspace_clicked = response.clicked();
+            response.on_hover_text(format!("Workspace {} · Alt+{} · click to switch", workspace + 1,
+                crate::WORKSPACE_KEYS.chars().nth(workspace).unwrap_or('q').to_ascii_uppercase()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };
             if clock_width > 0.0 {
                 ui_style::text(
                     ui,
-                    egui::Rect::from_min_max(egui::pos2(width - clock_width, 0.0), bar.max),
+                    egui::Rect::from_min_max(egui::pos2(width - workspace_width - clock_width, 0.0), egui::pos2(width - workspace_width, height)),
                     clock.unwrap(),
                     colors.muted,
                     11.0,
@@ -92,12 +106,13 @@ pub(crate) fn show(
             let widths: Vec<f32> = tabs
                 .iter()
                 .map(|tab| {
+                    if !cfg.show_tab_titles { return 36.0; }
                     let title = ui.painter().layout_no_wrap(tab.title.clone(), font.clone(), colors.fg);
-                    (title.size().x + 58.0 + if tab.entangled { 10.0 } else { 0.0 }).clamp(96.0, 236.0)
+                    (title.size().x + 58.0 + if tab.entangled { 10.0 } else { 0.0 }).clamp(96.0, (width - brand_width - clock_width - workspace_width - 54.0).clamp(96.0, 236.0))
                 })
                 .collect();
             let content_width = widths.iter().sum::<f32>() + gap * tabs.len().saturating_sub(1) as f32;
-            let viewport_width = content_width.min((width - brand_width - clock_width - 38.0).max(30.0));
+            let viewport_width = content_width.min((width - brand_width - clock_width - workspace_width - 38.0).max(30.0));
             let viewport =
                 egui::Rect::from_min_size(egui::pos2(brand_width + 4.0, 3.0), egui::vec2(viewport_width, body_height));
             let selection = (tabs.get(active).map(|t| t.id), width.to_bits(), content_width.to_bits());
@@ -141,7 +156,7 @@ pub(crate) fn show(
                                 );
                             }
                             let badge = egui::Rect::from_center_size(
-                                egui::pos2(rect.left() + 15.0, rect.center().y),
+                                egui::pos2(if cfg.show_tab_titles { rect.left() + 15.0 } else { rect.center().x }, rect.center().y),
                                 egui::vec2(19.0, (body_height - 6.0).max(14.0)),
                             );
                             let mut badge_style = colors;
@@ -151,46 +166,49 @@ pub(crate) fn show(
                                 egui::pos2(rect.right() - 13.0, rect.center().y),
                                 egui::vec2(20.0, body_height),
                             );
-                            let title = rect.with_min_x(badge.right() + 8.0).with_max_x(close.left() - 3.0);
-                            if tab.entangled {
-                                ui_style::text(
-                                    ui,
-                                    title.with_max_x(title.left() + 10.0),
-                                    "*",
-                                    chrome.entangle,
-                                    13.0,
-                                    true,
-                                );
-                            }
-                            ui_style::text_with_font(
-                                ui,
-                                title.with_min_x(title.left() + if tab.entangled { 10.0 } else { 0.0 }),
-                                &tab.title,
-                                tab.group.unwrap_or(if selected {
-                                    chrome.selected_foreground
-                                } else {
-                                    chrome.foreground
-                                }),
-                                font.clone(),
-                            );
-                            let close_hover = ui.rect_contains_pointer(close);
-                            if selected || response.hovered() {
-                                if close_hover {
-                                    ui.painter().rect_filled(close.shrink(2.0), 4.0, colors.card);
+                            if cfg.show_tab_titles {
+                                let title = rect.with_min_x(badge.right() + 8.0).with_max_x(close.left() - 3.0);
+                                if tab.entangled {
+                                    ui_style::text(
+                                        ui,
+                                        title.with_max_x(title.left() + 10.0),
+                                        "*",
+                                        chrome.entangle,
+                                        13.0,
+                                        true,
+                                    );
                                 }
-                                ui_style::icon(
-                                    ui.painter(),
-                                    Icon::Close,
-                                    close.center(),
-                                    if close_hover { colors.accent } else { colors.muted },
+                                let group_width = if let Some(color) = tab.group {
+                                    ui.painter().circle_filled(egui::pos2(close.left() - 7.0, rect.center().y), 2.5, color);
+                                    10.0
+                                } else { 0.0 };
+                                ui_style::text_with_font(
+                                    ui,
+                                    title.with_min_x(title.left() + if tab.entangled { 10.0 } else { 0.0 })
+                                        .with_max_x(title.right() - group_width),
+                                    &tab.title,
+                                    if selected { chrome.selected_foreground } else { chrome.foreground },
+                                    font.clone(),
                                 );
+                                let close_hover = ui.rect_contains_pointer(close);
+                                if selected || response.hovered() {
+                                    if close_hover {
+                                        ui.painter().rect_filled(close.shrink(2.0), 4.0, colors.card);
+                                    }
+                                    ui_style::icon(
+                                        ui.painter(),
+                                        Icon::Close,
+                                        close.center(),
+                                        if close_hover { colors.accent } else { colors.muted },
+                                    );
+                                }
+                                // Native drag hit targets follow layout, so moving
+                                // neighbors do not retrigger a swap mid-animation.
+                                geometry.close[index] = egui::Rect::from_center_size(
+                                    egui::pos2(target.right() - 13.0, target.center().y), egui::vec2(20.0, body_height))
+                                    .intersect(viewport);
                             }
-                            // Native drag hit targets follow layout, so moving
-                            // neighbors do not retrigger a swap mid-animation.
                             geometry.tabs[index] = target.intersect(viewport);
-                            geometry.close[index] = egui::Rect::from_center_size(
-                                egui::pos2(target.right() - 13.0, target.center().y), egui::vec2(20.0, body_height))
-                                .intersect(viewport);
                             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
                             let mut tooltip = egui::Tooltip::for_enabled(&response);
                             tooltip.popup = tooltip.popup.frame(colors.menu_frame());
@@ -238,6 +256,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn number_only_tabs_are_compact_and_keep_selection_reachable() {
+        for width in [360.0, 1280.0] {
+            let ctx = egui::Context::default();
+            let mut cfg = crate::config::Config::default();
+            let tabs: Vec<_> = (0..10).map(|id| TabFace {
+                id, preview: None, title: format!("hidden caption {id}"),
+                tooltip: format!("full terminal title {id}"),
+                group: Some(egui::Color32::RED), entangled: true, attention: 0.0,
+            }).collect();
+            for show_titles in [false, true, false] {
+                cfg.show_tab_titles = show_titles;
+                let mut geometry = Geometry::default();
+                for _ in 0..5 {
+                    let mut full = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                        ..Default::default()
+                    }, |ui| {
+                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, None, false, 0, &cfg);
+                    });
+                    if !show_titles {
+                        assert!(!full.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+                            if t.galley.text().contains("hidden caption") || t.galley.text() == "*")));
+                    }
+                    full.textures_delta.clear();
+                }
+                let selected = geometry.tabs[9];
+                assert!(selected.left() >= 0.0 && selected.right() < width);
+                assert!(geometry.add.left() >= selected.right() && geometry.add.right() <= width);
+                if show_titles {
+                    assert!(selected.width() >= 90.0);
+                    assert!(geometry.close[9].width() >= 18.0);
+                } else {
+                    assert!((selected.width() - 36.0).abs() < 1.0);
+                    assert!(geometry.close.iter().all(|rect| !rect.is_positive()), "invisible close hit targets");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn many_tabs_keep_the_active_tab_and_add_button_reachable() {
         for width in [360.0, 1280.0] {
             let ctx = egui::Context::default();
@@ -263,7 +321,7 @@ mod tests {
                         },
                         |ui| {
                             geometry =
-                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, &cfg);
+                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, 0, &cfg);
                         },
                     );
                     output.textures_delta.clear();
@@ -271,7 +329,7 @@ mod tests {
                 let selected = geometry.tabs[active];
                 assert!(selected.width() >= 90.0, "active tab is clipped: {selected:?}");
                 assert!(selected.left() >= 0.0 && selected.right() < width);
-                assert!(geometry.close[active].width() >= 18.0, "close control is clipped");
+                assert!(geometry.close[active].width() >= 18.0, "close control is clipped: width={width} active={active} selected={selected:?} close={:?}", geometry.close[active]);
                 assert!(geometry.add.right() <= width && geometry.add.left() >= selected.right());
                 assert!(geometry.add.top() >= 0.0 && geometry.add.bottom() <= 28.0);
             }

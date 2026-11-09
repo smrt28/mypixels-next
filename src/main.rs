@@ -269,6 +269,14 @@ struct SwThumb {
     revision: u64,
 }
 
+const WORKSPACE_KEYS: &str = "qwertyuiop";
+
+#[derive(Default)]
+struct Workspace {
+    tabs: Vec<Tab>,
+    active: usize,
+}
+
 /// Everything that lives "in a window": the surface and its GPU, this
 /// window's egui state, the tab strip as this window displays it, and the
 /// per-window input/selection/switcher state. Windows in one process share
@@ -285,6 +293,9 @@ struct Win {
     egui: Option<egui_ui::Egui>,
     tabs: Vec<Tab>,
     active: usize,
+    workspace: usize,
+    /// Inactive workspaces own live terminals; the current slot is empty.
+    workspaces: Vec<Workspace>,
     dims: Dims,
     /// This window's grid. The App-level rows/cols are the template a new
     /// window is sized from; these are what is actually on screen.
@@ -339,6 +350,28 @@ struct Win {
     /// UI generation, bumped on input and UI changes. Terminal contents and
     /// cursor blink use damage; compositor redraw requests do not bump this.
     frame_gen: u64,
+}
+
+impl Win {
+    fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.iter().chain(self.workspaces.iter().flat_map(|w| w.tabs.iter()))
+    }
+
+    fn other_workspace(&self) -> Option<usize> {
+        self.workspaces.iter().position(|w| !w.tabs.is_empty())
+    }
+
+    fn select_workspace(&mut self, target: usize) {
+        let previous = Workspace {
+            tabs: std::mem::take(&mut self.tabs),
+            active: self.active,
+        };
+        self.workspaces[self.workspace] = previous;
+        let next = std::mem::take(&mut self.workspaces[target]);
+        self.tabs = next.tabs;
+        self.active = next.active;
+        self.workspace = target;
+    }
 }
 
 struct App {
@@ -671,7 +704,6 @@ impl App {
             let blink = Arc::clone(&cursor_blink);
             let last_act = Arc::clone(&last_activity);
             let delay_ms = config.tab_overview_delay_ms;
-            let enabled = config.tab_overview_on_alt;
             let refresh_ms = 150u32; // thumbnail refresh cadence while open
             let blink_ms = 533u128; // cursor on/off cadence
             std::thread::spawn(move || {
@@ -696,7 +728,7 @@ impl App {
                     if !open.load(Ordering::SeqCst) {
                         // Open after the configured Alt hold delay.
                         if let Some(at) = *alt_at.lock().unwrap() {
-                            if enabled && now.duration_since(at).as_millis() >= delay_ms as u128
+                            if now.duration_since(at).as_millis() >= delay_ms as u128
                                 && !show_req.swap(true, Ordering::SeqCst)
                             {
                                 for w in ws.lock().unwrap().iter() { w.request_redraw(); }
@@ -825,6 +857,22 @@ impl App {
         cwd: Option<std::path::PathBuf>,
         cmd: Option<(String, Vec<String>)>,
     ) {
+        let tab = self.spawn_tab(cwd, cmd);
+        // Placement is a setting: `next` (default) lands the tab right of
+        // the current one, `end` after the last, `first` at the start.
+        let win = &mut self.wins[self.cur];
+        let pos = new_tab_index(&self.config.new_tab_position, win.tabs.len(), win.active);
+        win.tabs.insert(pos, tab);
+        win.active = pos;
+        win.frame_gen = win.frame_gen.wrapping_add(1);
+    }
+
+    /// Create a terminal without choosing where it belongs in the tab strip.
+    fn spawn_tab(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<(String, Vec<String>)>,
+    ) -> Tab {
         let id = self.next_id;
         self.next_id += 1;
         let window_size = WindowSize {
@@ -837,7 +885,7 @@ impl App {
             Some(c) => c,
             None => (self.program.clone(), self.args.clone()),
         };
-        let tab = Tab::new(
+        Tab::new(
             id,
             &self.wins[self.cur].dims,
             window_size,
@@ -851,19 +899,52 @@ impl App {
             // `mypixels` typed in it joins that window, not window 1. 1-based
             // because 0 in the environment means "standalone, stay out".
             self.cur as u32 + 1,
-        );
-        // Placement is a setting: `next` (default) lands the tab right of
-        // the current one, `end` after the last, `first` at the start.
-        let win = &mut self.wins[self.cur];
-        let pos = match self.config.new_tab_position.as_str() {
-            "end" => win.tabs.len(),
-            "first" => 0,
-            _ => win.active + 1,
+        )
+    }
+
+    /// Numbered shortcuts append missing tabs, preserving existing numbering
+    /// regardless of the configured placement for manually opened tabs.
+    fn goto_tab(&mut self, target: usize) {
+        while self.wins[self.cur].tabs.len() <= target {
+            let tab = self.spawn_tab(None, None);
+            self.wins[self.cur].tabs.push(tab);
         }
-        .min(win.tabs.len());
-        win.tabs.insert(pos, tab);
-        win.active = pos;
-        win.frame_gen = win.frame_gen.wrapping_add(1);
+        self.wins[self.cur].active = target;
+    }
+
+    fn switch_workspace(&mut self, target: usize) {
+        if target >= WORKSPACE_KEYS.len() || target == self.wins[self.cur].workspace {
+            return;
+        }
+        self.close_switcher();
+        *self.switcher_alt_at.lock().unwrap() = None;
+        self.switcher_show_req.store(false, Ordering::SeqCst);
+        let win = &mut self.wins[self.cur];
+        if let Some(tab) = win.tabs.get(win.active) {
+            tab.term.lock().is_focused = false;
+        }
+        win.select_workspace(target);
+        win.hover_tab = usize::MAX;
+        win.hover_add = false;
+        win.tab_drag = None;
+        win.tab_close_press = None;
+        win.tab_hits.clear();
+        win.tab_close_hits.clear();
+        win.bell_pulse = None;
+        win.wheel_pixels = 0.0;
+        win.click = None;
+        win.mouse_button = None;
+        win.mouse_last = None;
+        if let Some(gpu) = win.gpu.as_mut() {
+            gpu.invalidate_terminals();
+        }
+        if self.wins[self.cur].tabs.is_empty() {
+            self.add_tab();
+        }
+        self.sync_term_size();
+        if let Some(window) = &self.wins[self.cur].window {
+            window.request_redraw();
+        }
     }
 
     /// Handle what other mypixels processes asked of this session.
@@ -884,9 +965,14 @@ impl App {
     }
 
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
-        // A window dying buries its tabs, oldest first, so raising walks
-        // them back in the order they were lost.
-        for tab in std::mem::take(&mut self.wins[i].tabs) {
+        // A window dying buries all its tabs — the current workspace and
+        // the live terminals parked in inactive workspaces — so raising
+        // walks them back in the order they were lost.
+        let mut all = std::mem::take(&mut self.wins[i].tabs);
+        for ws in std::mem::take(&mut self.wins[i].workspaces) {
+            all.extend(ws.tabs);
+        }
+        for tab in all {
             self.bury_tab(tab);
         }
         if let Some(w) = self.wins[i].window.as_ref() {
@@ -927,8 +1013,12 @@ impl App {
         let tab = self.wins[from].tabs.remove(idx);
         log::info!("moved tab {:?} to window {}", tab.display_title(), to + 1);
         self.wins[to].tabs.insert(insert, tab);
-        let emptied = self.wins[from].tabs.is_empty();
-        if !emptied {
+        let emptied = self.wins[from].tabs.is_empty() && self.wins[from].other_workspace().is_none();
+        if self.wins[from].tabs.is_empty() && !emptied {
+            self.cur = from;
+            let target = self.wins[from].other_workspace().unwrap();
+            self.switch_workspace(target);
+        } else if !emptied {
             self.wins[from].active = move_active_follow(flen, active, idx).unwrap_or(0);
         }
         let mut cur = to;
@@ -1052,6 +1142,19 @@ impl App {
                     let v = serde_json::json!([
                         self.wins.iter().enumerate().map(|(i, w)| serde_json::json!({
                             "window": i + 1,
+                            "active_workspace": w.workspace + 1,
+                            "workspaces": (0..WORKSPACE_KEYS.len()).map(|index| {
+                                let (tabs, active) = if index == w.workspace { (&w.tabs, w.active) }
+                                    else { (&w.workspaces[index].tabs, w.workspaces[index].active) };
+                                serde_json::json!({
+                                    "workspace": index + 1,
+                                    "active_tab": if tabs.is_empty() { None } else { Some(active + 1) },
+                                    "tabs": tabs.iter().enumerate().map(|(j, t)| serde_json::json!({
+                                        "tab": j + 1, "title": t.display_title(),
+                                        "cwd": t.cwd_raw().map(|p| p.to_string_lossy().into_owned()),
+                                    })).collect::<Vec<_>>()
+                                })
+                            }).collect::<Vec<_>>(),
                             "active_tab": w.active + 1,
                             "tabs": w.tabs.iter().enumerate().map(|(j, t)| serde_json::json!({
                                 "tab": j + 1,
@@ -1174,6 +1277,10 @@ impl App {
         self.wins[self.cur].frame_gen = self.wins[self.cur].frame_gen.wrapping_add(1);
         self.bury_tab(tab);
         if self.wins[self.cur].tabs.is_empty() {
+            if let Some(target) = self.wins[self.cur].other_workspace() {
+                self.switch_workspace(target);
+                return;
+            }
             // The last tab closes its WINDOW, not the application: a second
             // window must survive closing all of the first one's tabs.
             // (close_window ends the app when this was the last window.)
@@ -1229,7 +1336,7 @@ impl App {
                 cell_width: self.cell_w as u16,
                 cell_height: self.cell_h as u16,
             };
-            for tab in &self.wins[self.cur].tabs {
+            for tab in self.wins[self.cur].all_tabs() {
                 tab.term.lock().resize(self.wins[self.cur].dims);
                 tab.term.lock().set_cell_pixels(self.cell_w as u32, self.cell_h as u32);
                 let _ = tab.sender.send(Msg::Resize(window_size));
@@ -1243,10 +1350,19 @@ impl App {
     /// only need to recompute the values copied into App at startup: fg/bg and,
     /// when the font changed, the cell metrics + glyph pools.
     fn apply_config(&mut self, font_changed: bool) {
+        if !self.config.tab_overview_on_alt {
+            *self.switcher_alt_at.lock().unwrap() = None;
+            self.switcher_show_req.store(false, Ordering::SeqCst);
+            self.switcher_open.store(false, Ordering::SeqCst);
+        }
         self.fg = self.config.foreground_color.to_f32();
         self.bg = crate::config::terminal_bg(&self.config).to_f32();
-        if let Some(gpu) = &mut self.wins[self.cur].gpu {
-            gpu.invalidate_terminals();
+        for win in &mut self.wins {
+            if !self.config.tab_overview_on_alt { win.overview = None; }
+            if let Some(gpu) = &mut win.gpu {
+                gpu.invalidate_terminals();
+            }
+            if let Some(window) = &win.window { window.request_redraw(); }
         }
         if font_changed {
             self.apply_fonts();
@@ -1327,7 +1443,7 @@ impl App {
         // active window's - so a native-sized Kitty image in any window is
         // measured in the current cell, not a stale one.
         for w in self.wins.iter() {
-            for t in &w.tabs {
+            for t in w.all_tabs() {
                 t.term.lock().set_cell_pixels(self.cell_w as u32, self.cell_h as u32);
             }
         }
@@ -1916,12 +2032,7 @@ impl App {
         } else {
             Vec::new()
         };
-        let acc = self.config.accent_color.to_f32();
-        let sw_accent = egui::Color32::from_rgb(
-            (acc[0] * 255.0) as u8,
-            (acc[1] * 255.0) as u8,
-            (acc[2] * 255.0) as u8,
-        );
+        let sw_accent = ui_style::rgb_c32(self.config.workspace_colors[self.wins[self.cur].workspace]);
         let sw_dim = egui_ui::dim_fill(
             &self.config,
             self.bg,
@@ -1974,7 +2085,7 @@ impl App {
                     if show_strip {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
                             &tab_faces, self.wins[self.cur].active, clock.as_deref(),
-                            egui.ui_state.menu_open && egui.ui_state.menu_app, &self.config);
+                            egui.ui_state.menu_open && egui.ui_state.menu_app, self.wins[self.cur].workspace, &self.config);
                         if strip_geometry.menu_clicked {
                             let st = &mut egui.ui_state;
                             if st.menu_open && st.menu_app {
@@ -1996,6 +2107,30 @@ impl App {
                             }
                             ctx.request_repaint();
                         }
+                    }
+                    if strip_geometry.workspace_clicked {
+                        let st = &mut egui.ui_state;
+                        if st.menu_open && !st.menu_app {
+                            st.menu_open = false;
+                            egui_ui::release_focus(&ctx);
+                        } else {
+                            st.menu_items = WORKSPACE_KEYS.chars().enumerate().map(|(i, key)| {
+                                let count = if i == self.wins[self.cur].workspace {
+                                    self.wins[self.cur].tabs.len()
+                                } else { self.wins[self.cur].workspaces[i].tabs.len() };
+                                let selected = if i == self.wins[self.cur].workspace { "● " } else { "" };
+                                (format!("{selected}Workspace {} · {} tabs · Alt+{}", i + 1, count, key.to_ascii_uppercase()),
+                                    format!("goto_workspace_{i}"), true)
+                            }).collect();
+                            st.menu_seps.clear();
+                            st.menu_pos = [(window.inner_size().width as f32 / ctx.pixels_per_point() - 340.0).max(3.0),
+                                self.tab_h / ctx.pixels_per_point()];
+                            st.menu_app = false;
+                            st.menu_open = true;
+                            st.menu_out = None;
+                            st.menu_age = 0;
+                        }
+                        ctx.request_repaint();
                     }
                     let mut config_open = egui.ui_state.panel_is(egui_ui::RightPanel::Settings);
                     let ev = egui_ui::config_window(
@@ -2760,7 +2895,16 @@ impl App {
         if specs.is_empty() {
             return;
         }
-        for line in &specs {
+        for spec in &specs {
+            // Explicit routing keeps multi-window tests independent of which
+            // window happened to receive the most recent compositor event.
+            let line = if let Some(rest) = spec.strip_prefix("window:") {
+                let Some((number, line)) = rest.split_once(':') else { continue };
+                let Some(index) = number.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) else { continue };
+                if index >= self.wins.len() { continue; }
+                self.cur = index;
+                line
+            } else { spec.as_str() };
             if line == "spy" {
                 // Test hook: dump tab state
                 let state: Vec<String> = self.wins[self.cur].
@@ -2792,13 +2936,14 @@ impl App {
                 } else {
                     String::new()
                 };
-                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {}", self.wins[self.cur].active, surf, cursor, state.join(","), ren);
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {} workspace={} switcher={}", self.wins[self.cur].active, surf, cursor, state.join(","), ren, self.wins[self.cur].workspace, self.wins[self.cur].overview.is_some());
                 continue;
             }
             if line == "switcher" {
                 // Test hook: open the Alt-held switcher directly (bypass the
                 // hold delay, which needs real ModifiersChanged events).
-                if self.wins[self.cur].overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
+                if self.config.tab_overview_on_alt
+                    && self.wins[self.cur].overview.map(|o| o.mode) != Some(OverviewMode::Switcher)
                     && !self.wins[self.cur].tabs.is_empty()
                     && !self.wins[self.cur].renaming
                 {
@@ -2822,6 +2967,13 @@ impl App {
             if line == "history" {
                 // Test hook: toggle the command-history panel.
                 self.do_action("show_history", event_loop);
+                continue;
+            }
+            if line == "alt_hold" {
+                self.modifiers = ModifiersState::ALT;
+                if self.config.tab_overview_on_alt {
+                    *self.switcher_alt_at.lock().unwrap() = Some(Instant::now());
+                }
                 continue;
             }
             if line == "alt_up" {
@@ -3213,10 +3365,11 @@ impl App {
             std::mem::take(&mut *self.bell_pings.lock().unwrap());
         for (tab_id, at) in pings {
             for (wi, w) in self.wins.iter_mut().enumerate() {
-                if let Some(ti) = w.tabs.iter().position(|t| t.id == tab_id) {
-                    let seen = wi == self.cur && w.active == ti && w.focused;
+                if w.all_tabs().any(|t| t.id == tab_id) {
+                    let ti = w.tabs.iter().position(|t| t.id == tab_id);
+                    let seen = wi == self.cur && ti == Some(w.active) && w.focused;
                     if !seen {
-                        w.bell_pulse = Some((ti, at));
+                        w.bell_pulse = ti.map(|ti| (ti, at));
                         if let Some(win) = w.window.as_ref() {
                             win.request_user_attention(Some(
                                 winit::window::UserAttentionType::Critical,
@@ -3302,7 +3455,7 @@ impl App {
             let tab = match self
                 .wins
                 .iter()
-                .find_map(|w| w.tabs.iter().find(|t| t.id == tab_id))
+                .find_map(|w| w.all_tabs().find(|t| t.id == tab_id))
             {
                 Some(t) => t,
                 None => continue,
@@ -3554,7 +3707,7 @@ impl App {
                     let _ = f.write_all(&payload);
                 }
             }
-            let live = self.wins.iter().any(|w| w.tabs.iter().any(|t| t.id == tab_id));
+            let live = self.wins.iter().any(|w| w.all_tabs().any(|t| t.id == tab_id));
             if !live {
                 continue;
             }
@@ -3564,7 +3717,7 @@ impl App {
                 if let Some(tab) = self
                     .wins
                     .iter()
-                    .flat_map(|w| w.tabs.iter())
+                    .flat_map(|w| w.all_tabs())
                     .find(|t| t.id == tab_id)
                 {
                     tab.write(&reply);
@@ -3619,7 +3772,7 @@ impl App {
             if let Some(tab) = self
                 .wins
                 .iter()
-                .flat_map(|w| w.tabs.iter())
+                .flat_map(|w| w.all_tabs())
                 .find(|t| t.id == tab_id)
             {
                 tab.write(text.as_bytes());
@@ -3661,7 +3814,7 @@ impl App {
             self.cell_w.round() as u32
         );
         for w in self.wins.iter_mut() {
-            for t in w.tabs.iter_mut() {
+            for t in w.all_tabs() {
                 if ids.contains(&t.id) {
                     t.write(reply.as_bytes());
                 }
@@ -3674,7 +3827,7 @@ impl App {
         for event in events {
             match event {
                 clipboard::Event::Paste { target, result: Ok(text) } => {
-                    if let Some(tab) = self.wins[self.cur].tabs.iter().find(|t| t.id == target) { tab.paste(&text); }
+                    if let Some(tab) = self.wins.iter().flat_map(|w| w.all_tabs()).find(|t| t.id == target) { tab.paste(&text); }
                 }
                 clipboard::Event::Paste { result: Err(e), .. } | clipboard::Event::Error(e) => self.show_error(e),
             }
@@ -3978,9 +4131,7 @@ impl App {
                 match c.chars().next().and_then(|ch| ch.to_digit(10)) {
                     Some(d) => {
                         let idx = if d == 0 { 9 } else { (d - 1) as usize };
-                        if idx < n {
-                            self.wins[self.cur].active = idx;
-                        }
+                        self.goto_tab(idx);
                         true
                     },
                     None => false,
@@ -4004,6 +4155,11 @@ impl App {
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let n = self.wins[self.cur].tabs.len();
         match action {
+            a if a.starts_with("goto_workspace_") => {
+                if let Ok(target) = a["goto_workspace_".len()..].parse::<usize>() {
+                    self.switch_workspace(target);
+                }
+            }
             "new_tab" => self.add_tab(),
             "new_window" => self.make_window(event_loop, None, None, true),
             "send_tab_to_window" => {
@@ -4185,11 +4341,8 @@ impl App {
             },
             "goto_tab_0" | "goto_tab_1" | "goto_tab_2" | "goto_tab_3" | "goto_tab_4"
             | "goto_tab_5" | "goto_tab_6" | "goto_tab_7" | "goto_tab_8" | "goto_tab_9" => {
-                let i = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
-                let target = i;
-                if target < n {
-                    self.wins[self.cur].active = target;
-                }
+                let target = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
+                self.goto_tab(target);
             },
             "enlarge_font" => self.zoom_term(true),
             "reset_font" => {
@@ -4587,6 +4740,8 @@ impl App {
                 egui: None,
                 tabs: Vec::new(),
                 active: 0,
+                workspace: 0,
+                workspaces: (0..WORKSPACE_KEYS.len()).map(|_| Workspace::default()).collect(),
                 dims: Dims { cols, rows },
                 cols,
                 rows,
@@ -5185,6 +5340,15 @@ fn move_active_follow(len: usize, active: usize, removed: usize) -> Option<usize
     }
 }
 
+fn new_tab_index(position: &str, len: usize, active: usize) -> usize {
+    match position {
+        "end" => len,
+        "first" => 0,
+        // An empty window has active = 0 but no tab to insert after.
+        _ => (active + 1).min(len),
+    }
+}
+
 fn swap_follow(a: usize, b: usize, active: usize) -> usize {
     if active == a {
         b
@@ -5655,6 +5819,7 @@ impl ApplicationHandler for App {
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
                 if self.switcher_show_req.swap(false, Ordering::SeqCst)
+                    && self.config.tab_overview_on_alt
                     && (self.wins.len() == 1 || self.wins[self.cur].focused)
                     && self.switcher_alt_at.lock().unwrap().is_some()
                     && !self.wins[self.cur].tabs.is_empty()
@@ -5696,11 +5861,42 @@ impl ApplicationHandler for App {
                             self.kill_grave(pos);
                             continue;
                         }
-                        if let Some(pos) = self.wins[self.cur].tabs.iter().position(|t| t.id == *id) {
-                            self.close_tab_at(pos, event_loop);
+                        // The dying tab may live in another window, or be
+                        // parked in an inactive workspace; find it first.
+                        let visible = self.wins.iter().enumerate().find_map(|(wi, w)| {
+                            w.tabs.iter().position(|t| t.id == *id).map(|ti| (wi, ti))
+                        });
+                        if let Some((wi, ti)) = visible {
+                            let original_window = self.wins[self.cur].window.as_ref().map(|w| w.id());
+                            self.cur = wi;
+                            self.close_tab_at(ti, event_loop);
+                            if let Some(index) = self.wins.iter().position(|w| w.window.as_ref().map(|w| w.id()) == original_window) {
+                                self.cur = index;
+                            }
+                        } else {
+                            let mut removed = None;
+                            for w in &mut self.wins {
+                                for workspace in &mut w.workspaces {
+                                    if let Some(ti) = workspace.tabs.iter().position(|t| t.id == *id) {
+                                        workspace.active = move_active_follow(workspace.tabs.len(), workspace.active, ti).unwrap_or(0);
+                                        removed = Some(workspace.tabs.remove(ti));
+                                        break;
+                                    }
+                                }
+                                if removed.is_some() { break; }
+                            }
+                            if let Some(tab) = removed {
+                                self.bury_tab(tab);
+                            }
                         }
                     }
                     if self.wins.is_empty() || self.wins[self.cur].tabs.is_empty() {
+                        return;
+                    }
+                    if self.wins[self.cur].window.as_ref().map(|w| w.id()) != Some(window.id()) {
+                        for win in &self.wins {
+                            if let Some(window) = &win.window { window.request_redraw(); }
+                        }
                         return;
                     }
                 }
@@ -6136,7 +6332,8 @@ impl ApplicationHandler for App {
                     // the configuration window is open: Alt is a plain key
                     // in its text fields, and a held "Altica" must not raise
                     // the switcher behind the window.
-                    if !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Settings)) {
+                    if self.config.tab_overview_on_alt
+                        && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Settings)) {
                         *self.switcher_alt_at.lock().unwrap() = Some(std::time::Instant::now());
                     }
                     self.switcher_show_req.store(false, Ordering::SeqCst);
@@ -6195,7 +6392,7 @@ impl ApplicationHandler for App {
         // before winit fires Exiting. And say goodbye to every window's
         // tabs, not just the current one's.
         for w in self.wins.iter_mut() {
-            for tab in w.tabs.iter() {
+            for tab in w.all_tabs() {
                 let _ = tab.sender.send(Msg::Shutdown);
             }
         }
@@ -6569,6 +6766,34 @@ mod mouse_report_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_tab_placement_handles_empty_windows() {
+        for position in ["next", "end", "first"] {
+            let mut tabs = Vec::new();
+            let index = new_tab_index(position, tabs.len(), 0);
+            tabs.insert(index, "first tab");
+            assert_eq!(index, 0, "{position}");
+            assert_eq!(tabs[index], "first tab");
+        }
+    }
+
+    #[test]
+    fn new_tab_placement_respects_position_in_populated_windows() {
+        for (position, active, expected) in [
+            ("next", 0, 1),
+            ("next", 1, 2),
+            ("next", 2, 3),
+            ("end", 0, 3),
+            ("first", 2, 0),
+        ] {
+            let mut tabs = vec!["a", "b", "c"];
+            let index = new_tab_index(position, tabs.len(), active);
+            tabs.insert(index, "new tab");
+            assert_eq!(index, expected, "{position}, active={active}");
+            assert_eq!(tabs[index], "new tab");
+        }
+    }
 
     #[test]
     fn launches_default_to_windows_with_explicit_tab_override() {

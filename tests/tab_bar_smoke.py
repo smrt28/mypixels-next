@@ -27,6 +27,7 @@ background_color: '#0b1216'
 bg_tint_color: '#0b1216'
 foreground_color: '#dce4e7'
 accent_color: '#00dbe6'
+workspace_color_1: '#00dbe6'
 ''')
 fixture = work / 'fixture.py'
 fixture.write_text(r'''

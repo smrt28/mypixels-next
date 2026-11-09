@@ -156,7 +156,7 @@ fn handle(
             "result": { "tools": [
                 {
                     "name": "list_windows",
-                    "description": "List this mypixels session's windows and their tabs: 1-based window and tab numbers, titles, working directories, and which tab is active.",
+                    "description": "List this mypixels session's windows, workspaces, and tabs: 1-based numbers, titles, working directories, and active workspace and tab. The top-level tabs list is the current workspace; workspaces includes all ten tab sets.",
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {

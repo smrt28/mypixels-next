@@ -42,10 +42,17 @@ palette:
   # ...
 ```
 
-Tab-strip and switcher colors are derived from these (blend-toward-foreground,
-so light themes keep contrast); a theme may also set them directly with the
-same key names the config uses (`tab_color_bg`, ...). Fonts, bindings and
-geometry can't be themed — color only, on purpose.
+Tab backgrounds, text, borders, and selection highlights are derived from each
+workspace's color, with contrast adapted to the theme. W1–W9 have distinct
+default colors. Configure them in Settings → Appearance → Colors, or with
+`workspace_color_1: '#5e9eff'` through `workspace_color_10` in the config.
+Workspace colors persist when switching terminal themes; a theme can explicitly
+supply these keys, and explicit config values take precedence when loading.
+Legacy global `tab_color_bg`, `tab_color_bg_selected`, `tab_color_fg`, and
+`tab_color_fg_selected` keys no longer determine tab appearance. Tab strip and
+add button colors remain configurable via `tablist_background` and
+`add_button_color`. Fonts, bindings and geometry can't be themed — color only,
+on purpose.
 
 ### Short palettes are completed, not rejected
 

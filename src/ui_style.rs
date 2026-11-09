@@ -608,7 +608,7 @@ pub(crate) struct TabStyle {
 }
 
 impl TabStyle {
-    pub fn new(ui: &egui::Ui, cfg: &crate::config::Config) -> Self {
+    pub fn new(ui: &egui::Ui, cfg: &crate::config::Config, workspace: usize) -> Self {
         static DEFAULTS: std::sync::LazyLock<crate::config::Config> =
             std::sync::LazyLock::new(crate::config::Config::default);
         let defaults = &*DEFAULTS;
@@ -620,17 +620,18 @@ impl TabStyle {
             base.border = base.bg.lerp_to_gamma(base.fg, 0.16);
             base.muted = base.bg.lerp_to_gamma(base.fg, 0.65);
         }
+        let color = rgb_c32(cfg.workspace_colors.get(workspace).copied().unwrap_or(cfg.workspace_colors[0]));
+        base.accent = color;
+        let background = base.bg.lerp_to_gamma(color, 0.18);
+        let selected_background = base.bg.lerp_to_gamma(color, 0.42);
+        let foreground = contrasting_text(color.lerp_to_gamma(base.fg, 0.75), background);
         Self {
-            foreground: resolve(cfg.tab_color_fg, defaults.tab_color_fg, base.muted),
-            selected_foreground: resolve(cfg.tab_color_fg_selected, defaults.tab_color_fg_selected, base.fg),
-            background: resolve(cfg.tab_color_bg, defaults.tab_color_bg, base.bg.lerp_to_gamma(base.fg, 0.055)),
-            selected_background: resolve(
-                cfg.tab_color_bg_selected,
-                defaults.tab_color_bg_selected,
-                base.bg.lerp_to_gamma(base.accent, 0.11),
-            ),
-            entangle: resolve(cfg.tab_color_entangle, defaults.tab_color_entangle, base.accent),
-            index: resolve(cfg.tab_color_idx, defaults.tab_color_idx, base.fg),
+            foreground,
+            selected_foreground: contrasting_text(color.lerp_to_gamma(base.fg, 0.85), selected_background),
+            background,
+            selected_background,
+            entangle: color,
+            index: foreground,
             add: resolve(cfg.add_button_color, defaults.add_button_color, base.muted),
             base,
         }
@@ -642,7 +643,7 @@ impl TabStyle {
             rect,
             5.0,
             if hovered { background.lerp_to_gamma(self.base.fg, 0.035) } else { background },
-            egui::Stroke::new(1.0, self.base.border),
+            egui::Stroke::new(1.0, self.base.bg.lerp_to_gamma(self.base.accent, 0.45)),
             egui::StrokeKind::Inside,
         );
     }
@@ -712,6 +713,63 @@ pub(crate) fn toggle(ui: &mut egui::Ui, label: &str, v: &mut bool) -> bool {
 #[cfg(test)]
 mod motion_tests {
     use super::*;
+
+    fn workspace_style(cfg: &crate::config::Config, workspace: usize, light: bool) -> TabStyle {
+        let ctx = egui::Context::default();
+        if light { ctx.set_visuals(egui::Visuals::light()); }
+        let mut style = None;
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            style = Some(TabStyle::new(ui, cfg, workspace));
+        });
+        full.textures_delta.clear();
+        style.unwrap()
+    }
+
+    #[test]
+    fn workspace_tab_styles_follow_only_their_workspace_color() {
+        let mut cfg = crate::config::Config::default();
+        let first = workspace_style(&cfg, 0, false);
+        let second = workspace_style(&cfg, 1, false);
+        assert_ne!(first.background, second.background);
+        assert_ne!(first.selected_background, second.selected_background);
+        assert_ne!(first.base.accent, second.base.accent);
+        cfg.workspace_colors[1] = crate::config::Rgb(30, 200, 80);
+        let changed = workspace_style(&cfg, 1, false);
+        assert_ne!(changed.background, second.background);
+        assert_ne!(changed.selected_background, second.selected_background);
+        assert_eq!(changed.base.accent, rgb_c32(cfg.workspace_colors[1]));
+        assert_eq!(workspace_style(&cfg, 0, false).selected_background, first.selected_background);
+        // Legacy global tab colors must not override workspace-derived chrome.
+        cfg.tab_color_bg = crate::config::Rgb(255, 0, 0);
+        cfg.tab_color_bg_selected = crate::config::Rgb(0, 255, 0);
+        cfg.tab_color_fg = crate::config::Rgb(0, 0, 255);
+        cfg.tab_color_fg_selected = crate::config::Rgb(255, 0, 255);
+        let legacy = workspace_style(&cfg, 1, false);
+        assert_eq!(legacy.background, changed.background);
+        assert_eq!(legacy.selected_background, changed.selected_background);
+        assert_eq!(legacy.foreground, changed.foreground);
+        assert_eq!(legacy.selected_foreground, changed.selected_foreground);
+    }
+
+    #[test]
+    fn workspace_text_is_readable_on_light_and_dark_tab_fills() {
+        let mut cfg = crate::config::Config::default();
+        for light in [false, true] {
+            for color in cfg.workspace_colors.into_iter().chain([crate::config::Rgb(0, 0, 0), crate::config::Rgb(255, 255, 255)]) {
+                cfg.workspace_colors[0] = color;
+                let style = workspace_style(&cfg, 0, light);
+                for (fg, bg) in [(style.foreground, style.background), (style.selected_foreground, style.selected_background)] {
+                    let luminance = |c| {
+                        let c = egui::Rgba::from(c);
+                        0.2126 * c.r() + 0.7152 * c.g() + 0.0722 * c.b()
+                    };
+                    let (fg, bg) = (luminance(fg), luminance(bg));
+                    let contrast = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
+                    assert!(contrast >= 4.5, "unreadable tab text: light={light} workspace={color:?} contrast={contrast}");
+                }
+            }
+        }
+    }
 
     fn positions(ctx: &egui::Context, time: f64, swapped: bool) -> (f32, f32) {
         let mut result = (0.0, 0.0);
