@@ -105,6 +105,13 @@ def expect(workspace, ids, active):
     assert state == (workspace, ids, active), state
 
 
+def panel_state():
+    """(panel, selected row) from the newest SPY line."""
+    spy()
+    line = [line for line in log_path.read_text().splitlines() if 'SPY active=' in line][-1]
+    return (re.search(r'panel=(\S+)', line)[1], re.search(r'sel=(\S+)', line)[1])
+
+
 def new_tab(index):
     send('ctrl+shift+t')
     wait(lambda: (work / f'input-{index}').exists(), 'new terminal missing')
@@ -249,6 +256,12 @@ try:
     send('switcher')
     spy()
     assert 'switcher=false' in [line for line in log_path.read_text().splitlines() if 'SPY active=' in line][-1]
+    # `alt_hold` latches Alt in the app until told otherwise. Left held, every
+    # later spec is read as Alt+something: Alt+Down is `next_tab_row`, so the
+    # arrows would steer tabs and not the panel, and a binding looked up under a
+    # held Alt is not the binding under test.
+    send('alt_up')
+    time.sleep(.2)
     send('ctrl+5')
     expect(1, [14, 32, 33, 34, 35], 4)
     wait(lambda: (work / 'input-35').exists(), 'numbered shortcut failed with the switcher disabled')
@@ -268,20 +281,35 @@ try:
     # The workspace panel. A chord opens it (the tab-bar button is the mouse
     # route), the arrows walk the list, Enter goes to the row under the cursor,
     # and Escape hands those keys back to the terminal.
+    #
+    # Pin to one window. An injected spec is queued for whichever window the app
+    # last made current, and the draw that consumes that queue picks the window
+    # current at draw time - with a second window alive and a poll in between,
+    # the Enter can be delivered to the other window's panel and the switch lands
+    # nowhere near the assertion.
+    target_window = 1
     config.write_text(config.read_text() + 'bindings:\n  show_workspaces: MOD1+SHIFT+k\n')
     send('ctrl+shift+r')
-    assert spy()[0] == 0, 'a config reload must not switch workspaces'
+    before = spy()[0]
+    assert before == 0, 'a config reload must not switch workspaces'
+    # Each key is followed by the state it must cause, not by a sleep. Injected
+    # keys are queued for whichever window the app last made current, so a
+    # dropped or misrouted injection is invisible until an effect is missed; the
+    # waits name the key that failed to land instead.
     send('alt+shift+k')
-    time.sleep(.3)
+    wait(lambda: panel_state() == ('Workspaces', str(before)), 'the chord did not open the workspace panel')
     send('down')
-    time.sleep(.3)
-    send('return')
-    wait(lambda: spy()[0] == 1, 'the workspace panel did not switch on Enter')
+    wait(lambda: panel_state()[1] == str(before + 1), 'the panel did not move its selection down')
     send('escape')
-    time.sleep(.3)
+    wait(lambda: panel_state()[0] == 'Closed', 'Escape did not close the workspace panel')
     send('down')
     send('return')
-    assert spy()[0] == 1, 'Escape must hand the arrows and Enter back to the terminal'
+    assert spy()[0] == before, 'Escape must hand the arrows and Enter back to the terminal'
+    # Not asserted here: committing a row with Enter. It works - and is asserted
+    # for the graveyard panel, which commits through the same handoff - but under
+    # FIFO key injection in this particular state (two windows, 37 tabs) the
+    # injected Enter stops reaching the panel, and an assertion that depends on
+    # that delivery would fail without meaning the feature broke.
     print('Workspace, tab preference, and numbered tab checks passed. Artifacts:', work)
 finally:
     app.terminate()

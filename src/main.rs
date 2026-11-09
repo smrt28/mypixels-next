@@ -3087,7 +3087,22 @@ impl App {
                 } else {
                     String::new()
                 };
-                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {} workspace={} switcher={}", self.wins[self.cur].active, surf, cursor, state.join(","), ren, self.wins[self.cur].workspace, self.wins[self.cur].overview.is_some());
+                // The panels are keyboard surfaces now, so a spy that reports
+                // only the terminal cannot tell a dropped key from an ignored
+                // one. Naming the open panel and its selected row lets a test
+                // wait for "the panel is open and the arrow landed" instead of
+                // sleeping and hoping.
+                let panel = match self.wins[self.cur].egui.as_ref().map(|e| e.ui_state.right_panel) {
+                    Some(p) => format!("{p:?}"),
+                    None => "none".into(),
+                };
+                let sel = self.wins[self.cur]
+                    .egui
+                    .as_ref()
+                    .and_then(|e| e.ui_state.ws_sel)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".into());
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {} workspace={} switcher={} panel={} sel={}", self.wins[self.cur].active, surf, cursor, state.join(","), ren, self.wins[self.cur].workspace, self.wins[self.cur].overview.is_some(), panel, sel);
                 continue;
             }
             if line == "switcher" {
