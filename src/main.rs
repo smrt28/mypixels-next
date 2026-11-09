@@ -1652,7 +1652,19 @@ impl App {
         // (covers tab switching, which produces no Focused event).
         {
             let active = &self.wins[self.cur].tabs[self.wins[self.cur].active];
-            active.term.lock().is_focused = window.has_focus();
+            let mut term = active.term.lock();
+            let now = window.has_focus();
+            if term.is_focused != now {
+                term.is_focused = now;
+                // DECSET 1004: the foreground app tracks focus itself (codex's
+                // unfocused notifications among them). Only the transition is
+                // reported; this block runs on every frame.
+                if term.focus_reporting() {
+                    let report = if now { b"\x1b[I" } else { b"\x1b[O" };
+                    drop(term);
+                    active.write(report);
+                }
+            }
         }
         let blink = self.cursor_blink.load(Ordering::SeqCst);
         // The overview is an overlay on the live terminal, so the terminal is
@@ -5728,9 +5740,9 @@ impl ApplicationHandler for App {
                     // stop asking.
                     window.request_user_attention(None);
                 }
-                if let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) {
-                    tab.term.lock().is_focused = focused;
-                }
+                // The per-frame focus block below sends the DECSET 1004
+                // report; setting is_focused here would swallow the
+                // transition. This redraw is what runs that block.
                 window.request_redraw();
             },
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {

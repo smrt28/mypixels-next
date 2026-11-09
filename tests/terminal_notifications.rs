@@ -42,3 +42,14 @@ fn notifications_dispatch_once_without_rendering_text_or_ringing_bel() {
     assert!(!events.iter().any(|event| matches!(event, Event::Bell)));
     assert_eq!(term.grid().cursor.point.column.0, 0);
 }
+
+#[test]
+fn focus_reporting_tracks_decset_1004() {
+    let mut term = Term::new(Config::default(), &TermSize::new(40, 10), alacritty_terminal::event::VoidListener);
+    let mut parser: Processor = Processor::default();
+    assert!(!term.focus_reporting());
+    parser.advance(&mut term, b"\x1b[?1004h");
+    assert!(term.focus_reporting());
+    parser.advance(&mut term, b"\x1b[?1004l");
+    assert!(!term.focus_reporting());
+}

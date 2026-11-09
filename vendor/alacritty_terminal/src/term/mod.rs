@@ -487,6 +487,11 @@ impl<T> Term<T> {
         self.damage_internal(false)
     }
 
+    /// Whether the application asked for focus in/out reports (DECSET 1004).
+    pub fn focus_reporting(&self) -> bool {
+        self.mode.contains(TermMode::FOCUS_IN_OUT)
+    }
+
     fn damage_internal(&mut self, include_cursor: bool) -> TermDamage<'_> {
         // Ensure the entire terminal is damaged after entering insert mode.
         // Leaving is handled in the ansi handler.
