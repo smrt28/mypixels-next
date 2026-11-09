@@ -28,6 +28,7 @@ background_color: '#0b1216'
 foreground_color: '#dce4e7'
 accent_color: '#00dbe6'
 workspace_color_1: '#00dbe6'
+workspaces_enabled: true
 tab_overview_opacity: 0.65
 ''')
 fixture = work / 'fixture.py'
@@ -116,14 +117,25 @@ try:
     time.sleep(.3)
     opened()
     run('xdotool', 'mousemove', '--window', wid, '10', '80')
-    def switcher_visible():
-        image = shot('eight-tabs')
+    def painted(image, match):
         # The first Area pass only measures the surface. Wait for a painted
         # selection rather than assuming preview creation finishes in .9s.
-        cyan = any((lambda p: p[0] < 80 and p[1] > 180 and p[2] > 180)(image.getpixel((x, y)))
-                   for y in range(100, image.height - 80, 2) for x in range(0, image.width, 2))
-        return image if cyan else None
-    image = wait(switcher_visible, 'selected card outline missing')
+        hit = any(match(image.getpixel((x, y)))
+                  for y in range(100, image.height - 80, 2) for x in range(0, image.width, 2))
+        return image if hit else None
+
+    # workspace_colors[0], as configured above.
+    def identity(p):
+        return p[0] < 80 and p[1] > 180 and p[2] > 180
+
+    # col[2], the accent the switcher uses when workspaces are off.
+    def fallback(p):
+        return p[0] > 170 and p[1] < 90 and p[2] < 90
+
+    def switcher_visible(color):
+        return lambda: painted(shot('eight-tabs'), color)
+
+    image = wait(switcher_visible(identity), 'selected card outline missing')
     key('Tab')
     key('shift+Tab')
     key('Right')
@@ -183,6 +195,17 @@ try:
     run('xdotool', 'keyup', 'Alt_L')
     key('q')
     wait(lambda: (work / 'input-7').read_bytes() == b'q', 'small-window navigation failed')
+    # With workspaces off there is no workspace identity to draw, and the
+    # switcher outlines the selected card with the UI accent instead. That is the
+    # default configuration, so the fallback is checked rather than assumed.
+    config.write_text(config.read_text().replace('workspaces_enabled: true', 'workspaces_enabled: false'))
+    key('ctrl+shift+r')
+    time.sleep(.4)
+    run('xdotool', 'windowsize', wid, '1200', '800')
+    time.sleep(.3)
+    opened()
+    wait(switcher_visible(fallback), 'the switcher lost its outline with workspaces off')
+    run('xdotool', 'keyup', 'Alt_L')
     print('PASS: eight live previews, Tab/Shift-Tab/Enter, Escape cancellation, card clicks, small-window navigation; artifacts:', work, flush=True)
 finally:
     app.terminate()
