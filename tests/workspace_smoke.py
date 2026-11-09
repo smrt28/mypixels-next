@@ -239,6 +239,23 @@ try:
     wait(lambda: (work / 'input-31').exists(), 'custom numbered shortcut terminals missing')
     send('alt+q')
     expect(0, [0, 1, 15, 16, 17], 1)
+    # The switcher and workspaces have to compose. With workspaces on, visiting
+    # another workspace is part of the same Alt-held look-around, so the switcher
+    # stays up while Alt is down, and its tiles are the ones that belong there.
+    ws0_tabs = spy()[1]
+    send('alt_hold')
+    time.sleep(.2)
+    send('switcher')
+    assert switcher_visible(), 'the switcher did not open for the workspace phase'
+    send('alt+shift+3')
+    wait(lambda: spy()[0] == 2, 'Alt+Shift+3 did not switch workspace with the switcher open')
+    assert switcher_visible(), 'a workspace switch closed the switcher while Alt was held'
+    assert spy()[1] != ws0_tabs, 'the switcher kept the tabs of the workspace left behind'
+    send('alt+shift+1')
+    wait(lambda: spy()[0] == 0, 'Alt+Shift+1 did not switch back with the switcher open')
+    assert spy()[1] == ws0_tabs, 'the switcher did not come back to the tabs it started on'
+    send('alt_up')
+    wait(lambda: not switcher_visible(), 'Alt release must still close the switcher')
     target_window = 2
     expect(1, [14], 0)
     for index in range(15, 32):

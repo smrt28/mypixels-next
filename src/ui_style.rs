@@ -215,17 +215,42 @@ pub(crate) fn preview_image(ui: &egui::Ui, rect: egui::Rect, image: Option<(egui
 /// A single-line galley with an ellipsis, so long commands never move the
 /// clock column or enlarge the sidebar. The full command remains in a tooltip.
 pub(crate) fn text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool) {
-    draw_text(ui, rect, text, color, size, strong, false)
+    draw_text(ui, rect, text, color, size, strong, Place::Left)
 }
 
 /// As `text`, centred in the rect. Indicator cells have no left edge to hang a
 /// label from: a workspace number reads as a mark, so it sits in the middle of
 /// the space the strip gave it.
 pub(crate) fn text_centered(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool) {
-    draw_text(ui, rect, text, color, size, strong, true)
+    draw_text(ui, rect, text, color, size, strong, Place::Center)
 }
 
-fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool, center: bool) {
+/// As `text`, flush with the rect's right edge. A line's left side names the
+/// thing and its right side carries the status, which is why the switcher header
+/// puts its workspace there: the count stays where the eye starts and the answer
+/// to "which one" waits at the end.
+pub(crate) fn text_right(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool) {
+    draw_text(ui, rect, text, color, size, strong, Place::Right)
+}
+
+/// How wide `text` would be in the font `text*` draws with. Measuring rather than
+/// estimating lets a label decide its own form instead of a hard-coded guess about
+/// the font's advance.
+pub(crate) fn text_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    egui::WidgetText::from(egui::RichText::new(text).font(egui::FontId::monospace(size)))
+        .into_galley(ui, None, f32::INFINITY, egui::FontId::monospace(size))
+        .size()
+        .x
+}
+
+/// Where text sits inside its rect when the rect is wider than the glyphs.
+enum Place {
+    Left,
+    Center,
+    Right,
+}
+
+fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, size: f32, strong: bool, place: Place) {
     if rect.width() <= 0.0 {
         return;
     }
@@ -239,7 +264,11 @@ fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, 
         rect.width(),
         egui::FontId::monospace(size),
     );
-    let x = if center { (rect.center().x - galley.size().x * 0.5).max(rect.left()) } else { rect.left() };
+    let x = match place {
+        Place::Left => rect.left(),
+        Place::Center => (rect.center().x - galley.size().x * 0.5).max(rect.left()),
+        Place::Right => (rect.right() - galley.size().x).max(rect.left()),
+    };
     let pos = egui::pos2(x, rect.center().y - galley.size().y * 0.5);
     ui.painter().with_clip_rect(ui.clip_rect().intersect(rect)).galley(pos, galley, color);
 }

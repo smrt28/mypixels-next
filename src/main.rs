@@ -923,14 +923,32 @@ impl App {
         if target >= WORKSPACES || target == self.wins[self.cur].workspace {
             return;
         }
-        self.close_switcher();
-        *self.switcher_alt_at.lock().unwrap() = None;
-        self.switcher_show_req.store(false, Ordering::SeqCst);
+        // The Alt-held switcher survives a workspace switch while Alt is still
+        // down. The gesture is "hold Alt and look around", and with workspaces
+        // on, another workspace is part of what is being looked around in -
+        // closing it made the chords that work with the panel unusable here.
+        // What cannot survive is the tile it was highlighting: `selected` and
+        // `original` index the tab list of the workspace being left.
+        let in_gesture = self.modifiers.alt_key() && self.switcher_open_here();
+        if !in_gesture {
+            self.close_switcher();
+            *self.switcher_alt_at.lock().unwrap() = None;
+            self.switcher_show_req.store(false, Ordering::SeqCst);
+        }
         let win = &mut self.wins[self.cur];
         if let Some(tab) = win.tabs.get(win.active) {
             tab.term.lock().is_focused = false;
         }
         win.select_workspace(target);
+        if in_gesture {
+            // Land on this workspace's own front tab. Escape from here restores
+            // it, rather than a tab index that belonged to the workspace the
+            // user just left.
+            if let Some(ov) = win.overview.as_mut() {
+                ov.selected = win.active;
+                ov.original = win.active;
+            }
+        }
         win.hover_tab = usize::MAX;
         win.hover_add = false;
         win.tab_drag = None;
@@ -1350,6 +1368,16 @@ impl App {
     /// The workspace panel's rows: all ten slots of this window. The current
     /// workspace's tabs live in `Win::tabs`; the others are parked in their own
     /// list, so the current one is read from where it actually is.
+    ///
+    /// TODO: preview each workspace with its front tab, the way the Alt-held
+    /// switcher previews a tab. `title` already resolves to exactly that tab
+    /// (`tabs.get(active)`), so a thumbnail would show the same thing the caption
+    /// names. The work is in the thumbnail cache, which is scoped to the current
+    /// workspace: `sw_thumbs` is both kept alive by and captured from `Win::tabs`
+    /// alone (the `ids` retain and the capture order in the frame's preview pass),
+    /// so a tab parked in `Win::workspaces[i]` has no texture to show. It also
+    /// wants a budget - up to nine more live textures, for slots that are usually
+    /// empty, is why the panel lists rather than previews.
     fn ws_rows(&self) -> Vec<egui_ui::WsRow> {
         let win = &self.wins[self.cur];
         (0..WORKSPACES).map(|i| {
@@ -2166,6 +2194,10 @@ impl App {
         } else {
             ui_style::rgb_c32(self.config.col[2])
         };
+        // Which workspace the switcher's tiles came from, for its header. With
+        // workspaces off there is one set of tabs and nothing to name.
+        let sw_workspace = self.config.workspaces_enabled
+            .then_some(self.wins[self.cur].workspace);
         let sw_dim = egui_ui::dim_fill(
             &self.config,
             self.bg,
@@ -2284,6 +2316,7 @@ impl App {
                             sw_accent,
                             &sw_cards,
                             egui::vec2(sw_preview_w.round(), sw_preview_h.round()),
+                            sw_workspace,
                             &mut egui.switcher_pick,
                         );
                     }

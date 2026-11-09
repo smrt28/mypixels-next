@@ -5,7 +5,7 @@
 //! retain their own keyboard behavior. The app routes terminal keys directly.
 
 use egui::{Context, FullOutput, ViewportId};
-use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row, action_row_tinted};
+use crate::ui_style::{TermStyle, Icon, text, text_right, text_width, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row, action_row_tinted};
 
 /// The egui side of the app: context, winit event state and the wgpu
 /// renderer that paints egui's tessellation.
@@ -1712,6 +1712,9 @@ pub fn switcher_screen(
     accent: egui::Color32,
     cards: &[SwitcherCard],
     preview: egui::Vec2,
+    // Which workspace these tiles came from, while workspaces are on. `None`
+    // leaves the header as it was: with one set of tabs there is nothing to name.
+    workspace: Option<usize>,
     pick: &mut Option<usize>,
 ) {
     if !open || cards.is_empty() {
@@ -1773,6 +1776,7 @@ pub fn switcher_screen(
                         colors.fg,
                     );
                     let divider = title_x + title.size().x + 22.0;
+                    let count = format!("{} open terminal{}", cards.len(), if cards.len() == 1 { "" } else { "s" });
                     ui.painter().vline(
                         divider,
                         header.center().y - 11.0..=header.center().y + 11.0,
@@ -1781,11 +1785,39 @@ pub fn switcher_screen(
                     text(
                         ui,
                         header.with_min_x(divider + 20.0),
-                        &format!("{} open terminal{}", cards.len(), if cards.len() == 1 { "" } else { "s" }),
+                        &count,
                         colors.muted,
                         14.0,
                         false,
                     );
+                    // The header's other half: which workspace these previews are
+                    // the tabs of. Ten grids of live terminals look alike, so the
+                    // count alone leaves the user guessing which set Alt is about
+                    // to commit. Tinted with the identity color - the same one the
+                    // selected card is outlined in - to agree with the indicator
+                    // the tab bar shows.
+                    if let Some(workspace) = workspace {
+                        let full = format!("Workspace {}", workspace + 1);
+                        // A name is worth its room, and the narrowest surface does
+                        // not have it. A bare number is the same fact, shorter, so
+                        // the header never truncates or overruns the count.
+                        let label = if header.right() - (divider + 20.0 + text_width(ui, &count, 14.0) + 24.0)
+                            >= text_width(ui, &full, 14.0)
+                        {
+                            full
+                        } else {
+                            (workspace + 1).to_string()
+                        };
+                        let label_w = text_width(ui, &label, 14.0);
+                        text_right(ui, header, &label, colors.accent, 14.0, false);
+                        // One rule, on its left: nothing else shares the right end
+                        // of the line, and the count is a different kind of fact.
+                        ui.painter().vline(
+                            header.right() - label_w - 14.0,
+                            header.center().y - 11.0..=header.center().y + 11.0,
+                            egui::Stroke::new(1.0, colors.border),
+                        );
+                    }
                     ui.add_space(12.0);
                     egui::ScrollArea::vertical()
                         .id_salt("switcher_grid")
@@ -3317,6 +3349,55 @@ mod regression {
         );
     }
 
+    /// The switcher's first line names the workspace on its right, and only while
+    /// workspaces are on. Checked at both the widest and the narrowest surface, so
+    /// the label cannot run into the open-terminal count when the room is gone.
+    #[test]
+    fn switcher_header_names_the_workspace_without_reaching_the_count() {
+        let cards: Vec<SwitcherCard> = (0..8).map(|i| SwitcherCard {
+            id: i,
+            title: format!("tab {i}"),
+            status: SwitcherStatus::Unknown,
+            active: false,
+            marker: false,
+            cwd: None,
+            thumb: None,
+        }).collect();
+        for workspace in [Some(9), None] {
+            for (w, h) in [(1920.0, 1080.0), (560.0, 480.0)] {
+                let ctx = Context::default();
+                let (tw, th) = thumbnail_size(w, 1.78, 0.25);
+                let mut output = None;
+                for _ in 0..3 {
+                    let mut full = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+                        ..Default::default()
+                    }, |ui| switcher_screen(ui, true, 0, egui::Color32::from_black_alpha(150),
+                        egui::Color32::CYAN, &cards, egui::vec2(tw.round(), th.round()), workspace, &mut None));
+                    full.textures_delta.clear();
+                    output = Some(full);
+                }
+                let full = output.unwrap();
+                let placed = |wanted: &dyn Fn(&str) -> bool| -> Option<(egui::Rect, egui::Rect)> {
+                    full.shapes.iter().find_map(|cs| match &cs.shape {
+                        egui::Shape::Text(t) if wanted(t.galley.text()) => Some((
+                            egui::Rect::from_min_size(t.pos, t.galley.size()), cs.clip_rect)),
+                        _ => None,
+                    })
+                };
+                let count = placed(&|t: &str| t.starts_with("8 open terminal"));
+                let name = placed(&|t: &str| t == "Workspace 10" || t == "10");
+                assert!(count.is_some(), "the count vanished at {w}x{h}");
+                assert_eq!(name.is_some(), workspace.is_some(), "workspace label wrong for {workspace:?} at {w}x{h}");
+                if let (Some((count, _)), Some((label, clip))) = (count, name) {
+                    assert!(clip.contains_rect(label), "workspace label clipped at {w}x{h}: {label:?} in {clip:?}");
+                    assert!(label.min.x >= count.max.x, "workspace label reached the count at {w}x{h}: {label:?} vs {count:?}");
+                    assert!(label.max.x <= clip.max.x, "workspace label overflowed at {w}x{h}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn switcher_keeps_selection_and_previews_inside_the_surface() {
         let ctx = Context::default();
@@ -3341,7 +3422,7 @@ mod regression {
                     let mut full = ctx.run_ui(egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
                         ..Default::default()
-                    }, |ui| switcher_screen(ui, true, selected, egui::Color32::from_black_alpha(150), egui::Color32::CYAN, &cards, egui::vec2(tw as f32, th as f32), &mut None));
+                    }, |ui| switcher_screen(ui, true, selected, egui::Color32::from_black_alpha(150), egui::Color32::CYAN, &cards, egui::vec2(tw as f32, th as f32), None, &mut None));
                     full.textures_delta.clear();
                     output = Some(full);
                 }
