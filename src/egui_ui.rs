@@ -5,7 +5,7 @@
 //! retain their own keyboard behavior. The app routes terminal keys directly.
 
 use egui::{Context, FullOutput, ViewportId};
-use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, actions, section, form_grid, rgb_c32, preview_image, action_row};
+use crate::ui_style::{TermStyle, Icon, text, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row};
 
 /// The egui side of the app: context, winit event state and the wgpu
 /// renderer that paints egui's tessellation.
@@ -919,9 +919,10 @@ pub fn graveyard_panel(
     // still runs in the terminal.
     let keys = ui.input(|i| {
         (i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowDown),
-         i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowRight))
+         i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowRight),
+         i.key_pressed(egui::Key::Delete))
     });
-    let (nav, commit) = keys;
+    let (nav, commit, delete) = keys;
     if nav && !st.grave_rows.is_empty() {
         let len = st.grave_rows.len();
         let cur = st.grave_sel.map(|s| s.min(len - 1)).unwrap_or(if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) { len - 1 } else { 0 });
@@ -934,6 +935,11 @@ pub fn graveyard_panel(
     if commit {
         if let Some(sel) = st.grave_sel.filter(|s| *s < st.grave_rows.len()) {
             st.grave_out = Some((sel, "raise".to_string()));
+        }
+    }
+    if delete {
+        if let Some(sel) = st.grave_sel.filter(|s| *s < st.grave_rows.len()) {
+            st.grave_out = Some((sel, "kill".to_string()));
         }
     }
     let count = st.grave_rows.len();
@@ -983,7 +989,7 @@ pub fn graveyard_panel(
                     egui::pos2(ui.cursor().left(), ui.cursor().top()),
                     egui::vec2(ui.available_width(), 16.0),
                 );
-                text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter raise \u{b7} Esc close",
+                text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter raise \u{b7} Del kill \u{b7} Esc close",
                     muted, 11.0, false);
                 ui.add_space(14.0);
                 if count == 0 {
@@ -1025,6 +1031,37 @@ pub fn graveyard_panel(
                             }
                             let selected = st.grave_sel == Some(index);
                             colors.card_surface(ui.painter(), rect.shrink2(egui::vec2(0.0, 3.0)), selected, response.hovered());
+                            // Subtle per-row controls, revealed with the row.
+                            // Registered after the row's own interaction, so a
+                            // button click never selects the row as well.
+                            let btn = 28.0;
+                            let kill_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.right() - 10.0 - btn, rect.top() + 13.0),
+                                egui::vec2(btn, btn),
+                            );
+                            let raise_rect = egui::Rect::from_min_size(
+                                egui::pos2(kill_rect.left() - 6.0 - btn, rect.top() + 13.0),
+                                egui::vec2(btn, btn),
+                            );
+                            // Reveal is driven by a geometric pointer-in-row check,
+                            // not response.hovered(): hovering a button puts that
+                            // button on top, which de-hovers the row and would
+                            // collapse reveal, dropping the button to hover-only
+                            // sense so the row wins the click tie-break.
+                            let pointer_in_row = ui.ctx().input(|i| {
+                                i.pointer.interact_pos().is_some_and(|pos| rect.contains(pos))
+                            });
+                            let reveal = crate::ui_style::transition(
+                                ui.ctx(),
+                                ui.scope_id().with(("grave_btns", row.id)),
+                                pointer_in_row || selected,
+                            );
+                            if icon_button_faded(ui, raise_rect, Icon::Rerun, "Raise tab", &colors, reveal).clicked() {
+                                st.grave_out = Some((index, "raise".to_string()));
+                            }
+                            if icon_button_faded(ui, kill_rect, Icon::Close, "Kill for good", &colors, reveal).clicked() {
+                                st.grave_out = Some((index, "kill".to_string()));
+                            }
                             let preview = thumbs.iter().find(|(id, _, _)| *id == row.id)
                                 .map(|(_, handle, size)| (*handle, *size));
                             let well = egui::Rect::from_min_size(
@@ -1035,7 +1072,7 @@ pub fn graveyard_panel(
                             let text_x = well.right() + 12.0;
                             text(ui, egui::Rect::from_min_max(
                                 egui::pos2(text_x, rect.top() + 12.0),
-                                egui::pos2(rect.right() - 12.0, rect.top() + 32.0),
+                                egui::pos2(raise_rect.left() - 8.0, rect.top() + 32.0),
                             ), &row.title, fg, 14.0, true);
                             text(ui, egui::Rect::from_min_max(
                                 egui::pos2(text_x, rect.top() + 36.0),

@@ -3830,11 +3830,10 @@ impl App {
         })
     }
 
-    /// While the panel is the only surface, just its navigation keys reach
-    /// egui; a command typed with the panel open must still land in the
-    /// terminal.
+    /// While the panel is the only surface, just its own keys reach egui;
+    /// a command typed with the panel open must still land in the terminal.
     fn graveyard_passes_key(&self, key: &Key) -> bool {
-        !self.grave_only_owner() || Self::is_grave_nav_key(key)
+        !self.grave_only_owner() || self.grave_wants_key(key)
     }
 
     /// The panel is the only surface and this key is one of its own: it is
@@ -3842,14 +3841,29 @@ impl App {
     /// reach the terminal (the egui wrapper does not report plain keys as
     /// consumed, which would leak them).
     fn graveyard_claims_key(&self, key: &Key) -> bool {
-        self.grave_only_owner() && Self::is_grave_nav_key(key)
+        self.grave_only_owner() && self.grave_wants_key(key)
+    }
+
+    /// The panel's own keys. Navigation is always its; the commit keys
+    /// (Enter raises, Delete kills for good) are its only while a row is
+    /// selected, so a bare Enter or Delete with the panel open stays the
+    /// terminal's.
+    fn grave_wants_key(&self, key: &Key) -> bool {
+        match key {
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Delete) => {
+                self.wins[self.cur].egui
+                    .as_ref()
+                    .is_some_and(|e| e.ui_state.grave_sel.is_some())
+            }
+            _ => Self::is_grave_nav_key(key),
+        }
     }
 
     fn is_grave_nav_key(key: &Key) -> bool {
         matches!(key,
             Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown)
             | Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowRight)
-            | Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape)
+            | Key::Named(NamedKey::Escape)
             | Key::Named(NamedKey::Home) | Key::Named(NamedKey::End))
     }
 

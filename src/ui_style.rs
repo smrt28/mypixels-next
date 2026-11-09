@@ -251,6 +251,36 @@ pub(crate) fn icon_button(
     response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Row-level control revealed with its row: `reveal` (0..1) fades it in, it
+/// rests muted, and takes the standard hot treatment on hover. Inert while
+/// faded out, so a hidden button never eats a click meant for the row.
+pub(crate) fn icon_button_faded(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    glyph: Icon,
+    label: &str,
+    c: &TermStyle,
+    reveal: f32,
+) -> egui::Response {
+    let live = reveal > 0.5;
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with(label),
+        if live { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, live, label));
+    if reveal <= 0.01 {
+        return response;
+    }
+    let hot = response.hovered() || response.has_focus();
+    if hot {
+        ui.painter().rect(rect, 16.0, c.card, egui::Stroke::new(1.0, c.border), egui::StrokeKind::Inside);
+    }
+    let rest = egui::Color32::from_rgba_unmultiplied(c.muted.r(), c.muted.g(), c.muted.b(), (c.muted.a() as f32 * reveal) as u8);
+    icon(ui.painter(), glyph, rect.center(), if hot { c.accent } else { rest });
+    response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Small vector icons avoid missing-glyph boxes in the bundled egui font.
 pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.4, color);
