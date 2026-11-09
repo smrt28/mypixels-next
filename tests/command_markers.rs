@@ -2,7 +2,7 @@
 //! overwrite the grid, and must use cell positions rather than byte offsets.
 use std::sync::{Arc, Mutex};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{CommandOutput, Event, EventListener};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -74,5 +74,105 @@ fn empty_input_is_distinct_from_an_unavailable_command() {
             let marks = commands(stream.as_bytes(), 80);
             assert_eq!(marks.last().unwrap().2.as_deref(), Some(""), "input={input:?}, newline={newline:?}");
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct Outputs(Arc<Mutex<Vec<(Option<CommandOutput>, bool)>>>);
+
+impl EventListener for Outputs {
+    fn send_event(&self, event: Event) {
+        if let Event::Semantic { code: 3, output, alt, .. } = event {
+            self.0.lock().unwrap().push((output, alt));
+        }
+    }
+}
+
+fn outputs(stream: &str, columns: usize, history: usize) -> Vec<(Option<CommandOutput>, bool)> {
+    let marks = Outputs::default();
+    // Test both a single PTY read and arbitrary read boundaries.
+    for chunk_size in [stream.len(), 1] {
+        let config = Config { scrolling_history: history, ..Config::default() };
+        let mut term = Term::new(config, &TermSize::new(columns, 8), marks.clone());
+        let mut parser: Processor = Processor::default();
+        for chunk in stream.as_bytes().chunks(chunk_size) {
+            parser.advance(&mut term, chunk);
+        }
+    }
+    let result = marks.0.lock().unwrap().clone();
+    result
+}
+
+#[test]
+fn output_excludes_multiline_prompts_and_wrapped_command_input() {
+    let stream = concat!(
+        "\x1b]133;A\x07界 project\r\n❯ \x1b]133;B\x07",
+        "printf '%s' 'a very long command that wraps over several rows'\r\n",
+        "\x1b]133;C\x07héllo 界 e\u{301}\r\nsecond output line\r\n",
+        "\x1b]133;D;0\x07\x1b]133;A\x07next project\r\n❯ \x1b]133;B\x07",
+    );
+    for (output, alt) in outputs(stream, 20, 100) {
+        let output = output.unwrap();
+        assert_eq!(output.text, "héllo 界 e\u{301}\nsecond output line");
+        assert!(!output.truncated_head);
+        assert!(!alt);
+    }
+}
+
+#[test]
+fn partial_line_output_is_saved_before_the_next_prompt() {
+    for (result, suffix) in [("", ""), ("hello", ""), ("hello", "\r\n")] {
+        let stream = format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07command\x1b]133;C\x07{result}{suffix}\x1b]133;D;0\x07\x1b]133;A\x07NEXT PROMPT $ "
+        );
+        for (output, _) in outputs(&stream, 80, 100) {
+            assert_eq!(output.unwrap().text, result);
+        }
+    }
+}
+
+#[test]
+fn output_keeps_the_final_cell_at_a_pending_wrap() {
+    let stream = "\x1b]133;A\x07$ \x1b]133;B\x07command\r\n\x1b]133;C\x071234567890\x1b]133;D;0\x07";
+    for (output, _) in outputs(stream, 10, 100) {
+        assert_eq!(output.unwrap().text, "1234567890");
+    }
+}
+
+#[test]
+fn multiple_commands_in_one_read_have_separate_output() {
+    let stream = concat!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07",
+        "\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07two\x1b]133;D;0\x07",
+        "\x1b]133;A\x07$ \x1b]133;B\x07",
+    );
+    let outputs = outputs(stream, 80, 100);
+    let text: Vec<_> = outputs.iter().map(|(o, _)| o.as_ref().unwrap().text.as_str()).collect();
+    assert_eq!(text, ["one", "two", "one", "two"]);
+}
+
+#[test]
+fn evicted_output_reports_truncation_and_retains_the_tail() {
+    let stream = format!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07command\r\n\x1b]133;C\x07{}tail\x1b]133;D;0\x07",
+        "output\r\n".repeat(30)
+    );
+    for (output, _) in outputs(&stream, 80, 2) {
+        let output = output.unwrap();
+        assert!(output.truncated_head);
+        assert!(output.text.ends_with("tail"));
+        assert!(!output.text.contains("command"));
+    }
+}
+
+#[test]
+fn alternate_screen_redraws_are_not_captured_as_output() {
+    let stream = concat!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07tui\r\n\x1b]133;C\x07",
+        "\x1b[?1049hTUI\x1b[?1049l\x1b]133;D;0\x07",
+    );
+    for (output, alt) in outputs(stream, 80, 100) {
+        assert!(alt);
+        assert!(output.is_none());
     }
 }

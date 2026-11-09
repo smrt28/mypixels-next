@@ -29,6 +29,7 @@ pub struct SemanticMark {
     pub col: usize,
     pub alt: bool,
     pub command: Option<String>,
+    pub output: Option<alacritty_terminal::event::CommandOutput>,
     pub when: std::time::SystemTime,
 }
 
@@ -105,10 +106,10 @@ impl EventListener for SpikeListener {
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
             },
-            Event::Semantic { code, exit, line, row, col, alt, command } => {
+            Event::Semantic { code, exit, line, row, col, alt, command, output } => {
                 log::debug!("sem mark tab {} code {} exit {:?} line {} row {} col {} alt {}", self.tab_id, code, exit, line, row, col, alt);
                 self.sems.lock().unwrap().push(SemanticMark {
-                    tab_id: self.tab_id, code, exit, line, row, col, alt, command,
+                    tab_id: self.tab_id, code, exit, line, row, col, alt, command, output,
                     when: std::time::SystemTime::now(),
                 });
                 self.notify_window();

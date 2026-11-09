@@ -115,7 +115,7 @@ hide_single_tab: false
         assert ImageChops.difference(before, after).crop((760, 40, 1080, 120)).getbbox() is None, 'dismissing menu also closed history'
         run('xdotool', 'key', 'ctrl+shift+l')
         output = wait(lambda: run('xsel', '-b', '-o').decode() or None, 'output clipboard empty')
-        assert 'CAPTURED-HISTORY' in output, output
+        assert output == 'CAPTURED-HISTORY\n', repr(output)
         assert log_path.read_text().count('code 2 ') == 1, 'sourcing integration twice duplicated execution hooks'
         # Re-run uses the command captured from the grid at C. A multiline
         # prompt or a stale '(running)' row must not replace the command.

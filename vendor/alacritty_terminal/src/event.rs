@@ -6,6 +6,13 @@ use std::sync::Arc;
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
 
+/// Command output copied at OSC 133 D, before the next prompt can overwrite it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandOutput {
+    pub text: String,
+    pub truncated_head: bool,
+}
+
 /// Terminal event.
 ///
 /// These events instruct the UI over changes that can't be handled by the terminal emulation layer
@@ -80,6 +87,8 @@ pub enum Event {
         alt: bool,
         /// Command input copied at C, before output can overwrite the grid.
         command: Option<String>,
+        /// Text between C and D, excluding prompt and input cells.
+        output: Option<CommandOutput>,
     },
 
     /// One complete APC string (mypixels patch; the Kitty graphics

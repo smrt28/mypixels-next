@@ -9,7 +9,7 @@ content, state, and layout rather than copies of these treatments.
 Menus use `TermStyle::menu_frame` for the theme-derived background, thin border,
 nine-point corners and padding. Wrap their content in `menu_contents` for shared
 typography and density; use `menu_item` and `menu_separator` for rows and groups.
-Application, terminal context and history overflow menus all use these components.
+Application and terminal context menus use these components.
 Long menus scroll within the window. `action_row` is the underlying reusable
 control, also used by history details: optional vector icon, truncated label,
 right-aligned shortcut, muted disabled state, and accent outline on hover/focus.

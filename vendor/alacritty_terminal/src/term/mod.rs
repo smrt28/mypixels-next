@@ -337,6 +337,9 @@ pub struct Term<T> {
 
     /// OSC 133 B input anchor, as an eviction-proof row ID and cell column.
     shell_input_start: Option<(usize, usize)>,
+    /// OSC 133 C output anchor and alternate-screen use during execution.
+    shell_output_start: Option<(usize, usize)>,
+    shell_output_alt: bool,
 }
 
 /// Configuration options for the [`Term`].
@@ -453,6 +456,8 @@ impl<T> Term<T> {
             mode: Default::default(),
             cell_px: (1, 1),
             shell_input_start: None,
+            shell_output_start: None,
+            shell_output_alt: false,
         }
     }
 
@@ -750,6 +755,7 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
+        self.shell_output_alt |= self.shell_output_start.is_some();
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
@@ -1257,6 +1263,12 @@ impl<T: EventListener> Handler for Term<T> {
         // screen right now (see Event::Semantic).
         let row = self.grid.scrolled_out() + self.grid.cursor.point.line.0.max(0) as usize;
         let alt = self.mode.intersects(TermMode::ALT_SCREEN);
+        // A pending wrap places the next output cell on the following row.
+        let output_cursor = if self.grid.cursor.input_needs_wrap {
+            (row + 1, 0)
+        } else {
+            (row, col)
+        };
         // Copy input HERE: a fast command can clear the screen, enter a
         // TUI, or evict its input before the UI thread drains this event.
         let command = if code == 2 && !alt {
@@ -1284,12 +1296,46 @@ impl<T: EventListener> Handler for Term<T> {
         } else {
             None
         };
+        // Copy output at D, while the grid still ends at the command's
+        // final cell. Reading it on the UI thread can include the next
+        // prompt (especially when output has no trailing newline).
+        let output = if code == 3 && !alt && !self.shell_output_alt {
+            self.shell_output_start.take().map(|start| {
+                let base = self.grid.scrolled_out().saturating_sub(self.grid.history_size());
+                let truncated_head = start.0 < base || start > output_cursor;
+                let start = start.max((base, 0));
+                let text = if start >= output_cursor || start.1 >= self.columns() {
+                    String::new()
+                } else {
+                    let end = if output_cursor.1 == 0 {
+                        (output_cursor.0 - 1, self.columns() - 1)
+                    } else {
+                        (output_cursor.0, output_cursor.1 - 1)
+                    };
+                    let point = |(r, c): (usize, usize)| {
+                        Point::new(Line((r - base) as i32 - self.grid.history_size() as i32), Column(c))
+                    };
+                    self.bounds_to_string(point(start), point(end))
+                };
+                crate::event::CommandOutput { text, truncated_head }
+            })
+        } else {
+            None
+        };
+        let alt = alt || (code == 3 && self.shell_output_alt);
+        if code == 0 || code == 3 {
+            self.shell_output_start = None;
+            self.shell_output_alt = false;
+        } else if code == 2 {
+            self.shell_output_start = (!alt).then_some(output_cursor);
+            self.shell_output_alt = alt;
+        }
         if code == 0 || code == 3 {
             self.shell_input_start = None;
         } else if code == 1 && !alt {
             self.shell_input_start = Some((row, col));
         }
-        self.event_proxy.send_event(Event::Semantic { code, exit, line, col, row, alt, command });
+        self.event_proxy.send_event(Event::Semantic { code, exit, line, col, row, alt, command, output });
     }
 
     /// A character to be displayed.
@@ -2092,6 +2138,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.title = None;
         self.selection = None;
         self.shell_input_start = None;
+        self.shell_output_start = None;
+        self.shell_output_alt = false;
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
