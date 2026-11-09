@@ -50,6 +50,30 @@ def key(value):
     time.sleep(.12)
 
 
+def nav():
+    """Category cell centers as the app reported them, so a selector relayout
+    cannot silently move a click onto a different control."""
+    line = [l for l in log_path.read_text().splitlines() if 'settings nav: ' in l][-1]
+    return {name: (float(x), float(y))
+            for name, x, y in re.findall(r'(\w+)=(-?[0-9.]+),(-?[0-9.]+)', line)}
+
+
+def page(name):
+    x, y = nav()[name]
+    click(x, y)
+
+
+# The default-width field, first row of Window dimensions, measured down from the
+# selector the body sits under.
+WIDTH_ROW = 188
+
+
+def click_width():
+    # x is the default-width field within the panel; y comes from the selector,
+    # which is what actually moves when the layout changes.
+    click(width - 448 + 243, nav()['Appearance'][1] + WIDTH_ROW)
+
+
 def click(x, y):
     run('xdotool', 'mousemove', '--window', wid, str(round(x)), str(round(y)), 'click', '1')
     time.sleep(.25)
@@ -79,7 +103,7 @@ try:
         time.sleep(.3)
         terminal_keys()
         # Clicking a filter or a settings page must not give the sidebar Tab.
-        click(width - 330, strip + 83) if panel == 'history' else click(width - 448 + 156, strip + 105)
+        click(width - 330, strip + 83) if panel == 'history' else page('Window')
         terminal_keys()
         # App bindings still work while a sidebar is open.
         key('ctrl+shift+t')
@@ -93,7 +117,7 @@ try:
             assert capture.read_bytes() == expected, 'history search leaked into terminal'
             key('Escape')  # Leave the editor; history stays open.
         else:
-            click(width - 448 + 235, strip + 244)
+            click_width()
             key('ctrl+a')
             run('xdotool', 'type', '1234')
             key('Return')
@@ -101,7 +125,7 @@ try:
         terminal_keys()
         run('import', '-window', wid, str(work / f'{panel}.png'))
     # A global panel shortcut works even from a focused settings editor.
-    click(width - 448 + 235, strip + 244)
+    click_width()
     key('alt+shift+h')
     terminal_keys()
     assert all(not p.read_bytes() for p in work.glob('input-*') if p != capture), 'input reached an inactive tab'

@@ -61,6 +61,10 @@ pub struct UiState {
     pub theme_choice: Vec<String>,
     pub theme_fetched: bool,
     pub settings_page: SettingsPage,
+    /// Last geometry logged for the category selector, so the line is written
+    /// when the layout moves rather than on every frame. The smoke tests click
+    /// a category by name from this line instead of guessing an offset.
+    settings_nav_log: String,
     /// The keybinding row waiting for a chord. The app owns the next key
     /// while this is set; Escape clears it. Held here (not in the app) so the
     /// row can show its own waiting state and the keyboard arbiter can see it.
@@ -260,15 +264,30 @@ impl UiState {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsPage {
     #[default]
     Appearance,
     Window,
     Tabs,
+    /// Ways to move between terminals: the Alt-held switcher and workspaces.
+    /// Neither is a tab-strip setting, whatever they happen to draw.
+    Navigation,
     Terminal,
     Keys,
 }
+
+/// The categories, in the order the selector shows them. Both the selector and
+/// the tests read this, so adding a page means adding a line here and an arm to
+/// the dispatch - not hunting for a literal list in three places.
+const SETTINGS_PAGES: &[(SettingsPage, &str)] = &[
+    (SettingsPage::Appearance, "Appearance"),
+    (SettingsPage::Window, "Window"),
+    (SettingsPage::Tabs, "Tabs"),
+    (SettingsPage::Navigation, "Navigation"),
+    (SettingsPage::Terminal, "Terminal"),
+    (SettingsPage::Keys, "Keys"),
+];
 
 /// The history panel's list filter, in chip order.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -1977,27 +1996,44 @@ pub fn config_window(
             if icon_button(ui, close, Icon::Dismiss, "Close settings", &colors).clicked() { *open = false; }
             ui.label(egui::RichText::new("Make this terminal your own.").small().color(colors.muted));
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                for (page, label) in [
-                    (SettingsPage::Appearance, "Appearance"),
-                    (SettingsPage::Window, "Window"),
-                    (SettingsPage::Tabs, "Tabs"),
-                    (SettingsPage::Terminal, "Terminal"),
-                    (SettingsPage::Keys, "Keys"),
-                ] {
-                    let selected = st.settings_page == page;
-                    let response = ui.add(egui::Button::new(egui::RichText::new(label).color(if selected { colors.accent } else { colors.muted }))
-                        .corner_radius(17.0).min_size(egui::vec2(0.0, 34.0))
-                        .fill(if selected { colors.bg.lerp_to_gamma(colors.accent, 0.16) } else { colors.card })
-                        .stroke(egui::Stroke::new(1.0, if selected { colors.accent } else { colors.border })));
-                    if response.clicked() {
-                        st.settings_page = page;
-                        st.font_popup = None;
-                        st.key_capture = None;
+            // Two columns, three rows. Six labels cannot share one row at the
+            // 412 px minimum without truncating one, and letting them wrap would
+            // move a label every time the panel is resized. Six fills an even
+            // grid, so nothing has to span or stretch.
+            let cell = ((ui.available_width() - 8.0) / 2.0).max(120.0);
+            let mut nav = String::new();
+            for group in SETTINGS_PAGES.chunks(2) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for &(page, name) in group {
+                        let selected = st.settings_page == page;
+                        let label = egui::RichText::new(name)
+                            .color(if selected { colors.accent } else { colors.muted });
+                        let response = ui.add(egui::Button::new(if selected { label.strong() } else { label })
+                            .corner_radius(17.0).min_size(egui::vec2(cell, 34.0))
+                            .fill(if selected { colors.bg.lerp_to_gamma(colors.accent, 0.16) } else { colors.card })
+                            .stroke(egui::Stroke::new(1.0, if selected { colors.accent } else { colors.border })));
+                        nav.push_str(&format!("{name}={:.0},{:.0} ", response.rect.center().x, response.rect.center().y));
+                        if response.clicked() {
+                            st.settings_page = page;
+                            // A popup belongs to the page that opened it. Left
+                            // open it floats over a page with no row to close
+                            // it, and its widget id is gone next frame. An armed
+                            // chord capture is the same hazard in the app.
+                            st.font_popup = None;
+                            st.key_capture = None;
+                        }
                     }
-                }
-            });
+                });
+            }
+            let nav = nav.trim_end().to_string();
+            if st.settings_nav_log != nav {
+                st.settings_nav_log = nav.clone();
+                // The geometry of the selector, for the headless tests: they
+                // click a category by name instead of guessing an x-offset that
+                // a layout change would silently move.
+                log::info!("settings nav: {nav}");
+            }
             ui.add_space(12.0);
             egui::ScrollArea::vertical()
                 .id_salt(("settings_body", st.settings_page as u8))
@@ -2006,164 +2042,12 @@ pub fn config_window(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 12.0;
                     match st.settings_page {
-                        SettingsPage::Appearance => {
-                            section(ui, "Fonts", &colors, |ui| {
-                                form_grid("fonts").show(ui, |ui| {
-                                    font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, &mut ev);
-                                    row(ui, "Line spacing", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.line_spacing)
-                                            .speed(0.05).range(-0.9..=3.0).fixed_decimals(2))
-                                            .on_hover_text("0 = current spacing; +0.1 adds 10% row height; -0.1 removes 10%.")
-                                            .changed();
-                                    });
-                                    font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, &mut ev);
-                                });
-                            });
-                            section(ui, "Colors", &colors, |ui| {
-                                if !st.theme_fetched {
-                                    st.theme_choice = crate::theme::available();
-                                    st.theme_fetched = true;
-                                }
-                                form_grid("colors-terminal").show(ui, |ui| {
-                                    row(ui, "Theme", |ui| {
-                                        let written = if cfg.theme.is_empty() { "default".to_string() } else { cfg.theme.clone() };
-                                        let mut names = st.theme_choice.clone();
-                                        if !names.contains(&written) { names.push(written.clone()); }
-                                        let mut chosen = written.clone();
-                                        egui::ComboBox::from_id_salt("theme_preset").popup_style((**ui.style()).clone().into())
-                                            .width(170.0).selected_text(&written)
-                                            .show_ui(ui, |ui| {
-                                                for name in &names { ui.selectable_value(&mut chosen, name.clone(), name); }
-                                            });
-                                        if chosen != written {
-                                            cfg.theme = chosen.clone();
-                                            if let Err(e) = crate::theme::apply_name(cfg, &chosen) { log::warn!("theme {chosen}: {e}"); }
-                                            ev.apply = true;
-                                        }
-                                    });
-                                    color_row(ui, "Background", &mut cfg.background_color, &mut ev);
-                                    color_row(ui, "Foreground", &mut cfg.foreground_color, &mut ev);
-                                    color_row(ui, "Selection", &mut cfg.selection_color, &mut ev);
-                                    color_row(ui, "Cursor", &mut cfg.cursor_color, &mut ev);
-                                    color_row(ui, "Accent", &mut cfg.accent_color, &mut ev);
-                                    color_row(ui, "Background tint", &mut cfg.bg_tint_color, &mut ev);
-                                    color_row(ui, "Tab strip", &mut cfg.tablist_background, &mut ev);
-                                    color_row(ui, "Add button", &mut cfg.add_button_color, &mut ev);
-                                });
-                                ui.add_space(8.0);
-                                ui.label("Workspace colors");
-                                ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
-                                form_grid("colors-workspaces").show(ui, |ui| {
-                                    for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
-                                        color_row(ui, &format!("Workspace {}", index + 1), color, &mut ev);
-                                    }
-                                });
-                            });
-                        }
-                        SettingsPage::Window => {
-                            section(ui, "Window", &colors, |ui| {
-                                form_grid("window").show(ui, |ui| {
-                                    row(ui, "Transparency", |ui| {
-                                        ev.apply |= ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0)).changed();
-                                    });
-                                    row(ui, "Default width", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.default_width).suffix(" px")).changed();
-                                    });
-                                    row(ui, "Default height", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.default_height).suffix(" px")).changed();
-                                    });
-                                    checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, &mut ev);
-                                });
-                            });
-                        }
-                        SettingsPage::Tabs => {
-                            section(ui, "Tab strip", &colors, |ui| {
-                                form_grid("tabs").show(ui, |ui| {
-                                    checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, &mut ev);
-                                    checkbox_row(ui, "Workspaces (Alt+Q…P)", &mut cfg.workspaces_enabled, &mut ev);
-                                    row(ui, "Title length", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed();
-                                    });
-                                    row(ui, "Active title length", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_short_current)).changed();
-                                    });
-                                    checkbox_row(ui, "Strip on top", &mut cfg.tablist_top, &mut ev);
-                                    checkbox_row(ui, "Hide strip", &mut cfg.tablist_hide, &mut ev);
-                                    checkbox_row(ui, "Multiline tabs", &mut cfg.multiline_tabs, &mut ev);
-                                    checkbox_row(ui, "Hide single tab", &mut cfg.hide_single_tab, &mut ev);
-                                    checkbox_row(ui, "Focus new tabs", &mut cfg.focus_new_tabs, &mut ev);
-                                    row(ui, "New tab position", |ui| {
-                                        let mut chosen = cfg.new_tab_position.clone();
-                                        egui::ComboBox::from_id_salt("new_tab_position")
-                                            .popup_style((**ui.style()).clone().into())
-                                            .width(140.0)
-                                            .selected_text(&cfg.new_tab_position)
-                                            .show_ui(ui, |ui| {
-                                                for name in ["next", "end", "first"] {
-                                                    ui.selectable_value(&mut chosen, name.to_string(), name);
-                                                }
-                                            });
-                                        if chosen != cfg.new_tab_position {
-                                            cfg.new_tab_position = chosen;
-                                            ev.apply = true;
-                                        }
-                                    });
-                                    row(ui, "Graveyard keeps", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.graveyard_limit).range(1..=32)).changed();
-                                    });
-                                    checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, &mut ev);
-                                });
-                            });
-                            section(ui, "Tab group colors", &colors, |ui| {
-                                ui.horizontal(|ui| {
-                                    for (i, color) in cfg.col.iter_mut().enumerate() {
-                                        ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new(format!("{}", i + 1)).small().color(colors.muted));
-                                            ev.apply |= color_cell(ui, color);
-                                        });
-                                    }
-                                });
-                            });
-                            section(ui, "Tab switcher", &colors, |ui| {
-                                form_grid("tab_switcher").show(ui, |ui| {
-                                    checkbox_row(ui, "Tab switcher enabled", &mut cfg.tab_overview_on_alt, &mut ev);
-                                    row(ui, "Backdrop dim", |ui| {
-                                        ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_opacity, 0.0..=1.0)).changed();
-                                    });
-                                    row(ui, "Delay (ms)", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_overview_delay_ms)).changed();
-                                    });
-                                    row(ui, "Preview scale", |ui| {
-                                        ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_scale, 0.05..=1.0)).changed();
-                                    });
-                                });
-                            });
-                        }
-                        SettingsPage::Terminal => {
-                            section(ui, "Scrollback", &colors, |ui| {
-                                form_grid("terminal").show(ui, |ui| {
-                                    row(ui, "Scrollback lines", |ui| {
-                                        ev.apply |= ui.add(egui::DragValue::new(&mut cfg.scrollback_lines).range(0..=1_000_000)).changed();
-                                    });
-                                });
-                            });
-                        }
-                        SettingsPage::Keys => {
-                            if let Some(action) = st.key_capture.clone() {
-                                section(ui, "Waiting for a shortcut", &colors, |ui| {
-                                    ui.label(egui::RichText::new(format!(
-                                        "Press the keys for “{}”. Esc cancels.", action_label(&action)))
-                                        .strong().color(colors.accent));
-                                });
-                            }
-                            for (group, rows) in key_groups(cfg) {
-                                section(ui, group, &colors, |ui| {
-                                    for (action, label) in rows {
-                                        binding_row(ui, &action, &label, cfg, st, &colors);
-                                    }
-                                });
-                            }
-                        }
+                        SettingsPage::Appearance => appearance_page(ui, cfg, st, choices, &mut ev, &colors),
+                        SettingsPage::Window => window_page(ui, cfg, &mut ev, &colors),
+                        SettingsPage::Tabs => tabs_page(ui, cfg, &mut ev, &colors),
+                        SettingsPage::Navigation => navigation_page(ui, cfg, &mut ev, &colors),
+                        SettingsPage::Terminal => terminal_page(ui, cfg, &mut ev, &colors),
+                        SettingsPage::Keys => keys_page(ui, cfg, st, &colors),
                     }
                 });
             ui.add_space(12.0);
@@ -2179,6 +2063,231 @@ pub fn config_window(
         });
     if !*open { st.font_popup = None; }
     ev
+}
+
+/// Every page renders through its own function, so a page's shape is readable
+/// in one screen and the match above is only a dispatch. Grouping is by what the
+/// user came here to change: a tab-strip background is an appearance setting even
+/// though its field is named for tabs, and the switcher is navigation even though
+/// it draws tabs.
+///
+/// Appearance: theme and colors, fonts, and every tab color.
+fn appearance_page(
+    ui: &mut egui::Ui,
+    cfg: &mut crate::config::Config,
+    st: &mut UiState,
+    choices: &[crate::fonts::FontChoice],
+    ev: &mut ConfigEvents,
+    colors: &TermStyle,
+) {
+    section(ui, "Theme & colors", colors, |ui| {
+        if !st.theme_fetched {
+            st.theme_choice = crate::theme::available();
+            st.theme_fetched = true;
+        }
+        form_grid("colors-terminal").show(ui, |ui| {
+            row(ui, "Theme", |ui| {
+                let written = if cfg.theme.is_empty() { "default".to_string() } else { cfg.theme.clone() };
+                let mut names = st.theme_choice.clone();
+                if !names.contains(&written) { names.push(written.clone()); }
+                let mut chosen = written.clone();
+                egui::ComboBox::from_id_salt("theme_preset").popup_style((**ui.style()).clone().into())
+                    .width(170.0).selected_text(&written)
+                    .show_ui(ui, |ui| {
+                        for name in &names { ui.selectable_value(&mut chosen, name.clone(), name); }
+                    });
+                if chosen != written {
+                    cfg.theme = chosen.clone();
+                    // A preset rewrites the color fields, so the rows below
+                    // change under the user. That is the point: the preset stays
+                    // above them, and a manual override is applied after it.
+                    if let Err(e) = crate::theme::apply_name(cfg, &chosen) { log::warn!("theme {chosen}: {e}"); }
+                    ev.apply = true;
+                }
+            });
+            color_row(ui, "Background", &mut cfg.background_color, ev);
+            color_row(ui, "Foreground", &mut cfg.foreground_color, ev);
+            color_row(ui, "Selection", &mut cfg.selection_color, ev);
+            color_row(ui, "Cursor", &mut cfg.cursor_color, ev);
+            color_row(ui, "Accent", &mut cfg.accent_color, ev);
+            color_row(ui, "Background tint", &mut cfg.bg_tint_color, ev);
+        });
+    });
+    section(ui, "Fonts", colors, |ui| {
+        form_grid("fonts").show(ui, |ui| {
+            font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, ev);
+            row(ui, "Line spacing", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.line_spacing)
+                    .speed(0.05).range(-0.9..=3.0).fixed_decimals(2))
+                    .on_hover_text("0 = current spacing; +0.1 adds 10% row height; -0.1 removes 10%.")
+                    .changed();
+            });
+            font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, ev);
+        });
+    });
+    section(ui, "Tab colors", colors, |ui| {
+        form_grid("colors-tabs").show(ui, |ui| {
+            color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
+            color_row(ui, "Add button", &mut cfg.add_button_color, ev);
+        });
+        // Two palettes color tabs, and they are not the same choice: one tags a
+        // tab by hand, the other is the workspace the tab sits in. Both live here
+        // because both are "what color is my tab", and each says which it is.
+        ui.add_space(8.0);
+        ui.label("Group colors");
+        ui.label(egui::RichText::new("The palette a tab is tagged with.").small().color(colors.muted));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (i, color) in cfg.col.iter_mut().enumerate() {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(format!("{}", i + 1)).small().color(colors.muted));
+                    ev.apply |= color_cell(ui, color);
+                });
+            }
+        });
+        ui.add_space(8.0);
+        ui.label("Workspace colors");
+        ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
+        ui.add_space(4.0);
+        form_grid("colors-workspaces").show(ui, |ui| {
+            for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
+                color_row(ui, &format!("Workspace {}", index + 1), color, ev);
+            }
+        });
+    });
+}
+
+/// Window: how big it starts and how it behaves, split because a size and a
+/// behavior are different decisions taken at different times.
+fn window_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Window dimensions", colors, |ui| {
+        form_grid("window-size").show(ui, |ui| {
+            row(ui, "Default width", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.default_width).suffix(" px")).changed();
+            });
+            row(ui, "Default height", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.default_height).suffix(" px")).changed();
+            });
+        });
+    });
+    section(ui, "Window behavior", colors, |ui| {
+        form_grid("window-behavior").show(ui, |ui| {
+            checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, ev);
+            row(ui, "Transparency", |ui| {
+                ev.apply |= ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0)).changed();
+            });
+        });
+    });
+}
+
+/// Tabs: the strip that lists them, then what happens when one opens or closes.
+fn tabs_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Tab bar", colors, |ui| {
+        form_grid("tabs").show(ui, |ui| {
+            checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, ev);
+            checkbox_row(ui, "Strip on top", &mut cfg.tablist_top, ev);
+            checkbox_row(ui, "Hide strip", &mut cfg.tablist_hide, ev);
+            checkbox_row(ui, "Hide single tab", &mut cfg.hide_single_tab, ev);
+            checkbox_row(ui, "Multiline tabs", &mut cfg.multiline_tabs, ev);
+            row(ui, "Title length", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_max_length)).changed();
+            });
+            row(ui, "Active title length", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_title_short_current)).changed();
+            });
+            checkbox_row(ui, "Shorten from start", &mut cfg.tab_title_shorten_start, ev);
+        });
+    });
+    section(ui, "Tab behavior", colors, |ui| {
+        form_grid("tab-behavior").show(ui, |ui| {
+            checkbox_row(ui, "Focus new tabs", &mut cfg.focus_new_tabs, ev);
+            row(ui, "New tab position", |ui| {
+                let mut chosen = cfg.new_tab_position.clone();
+                egui::ComboBox::from_id_salt("new_tab_position")
+                    .popup_style((**ui.style()).clone().into())
+                    .width(140.0)
+                    .selected_text(&cfg.new_tab_position)
+                    .show_ui(ui, |ui| {
+                        for name in ["next", "end", "first"] {
+                            ui.selectable_value(&mut chosen, name.to_string(), name);
+                        }
+                    });
+                if chosen != cfg.new_tab_position {
+                    cfg.new_tab_position = chosen;
+                    ev.apply = true;
+                }
+            });
+            row(ui, "Graveyard keeps", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.graveyard_limit).range(1..=32))
+                    .on_hover_text("Closed tabs stay running and raisable until this many are kept.")
+                    .changed();
+            });
+        });
+    });
+}
+
+/// Navigation: the ways to move between terminals. The switcher and workspaces
+/// both draw tabs, which is exactly why they sat under Tabs before, and neither
+/// is a tab-strip setting.
+fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Tab switcher", colors, |ui| {
+        form_grid("tab_switcher").show(ui, |ui| {
+            checkbox_row(ui, "Tab switcher enabled", &mut cfg.tab_overview_on_alt, ev);
+            row(ui, "Delay (ms)", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.tab_overview_delay_ms)).changed();
+            });
+            row(ui, "Preview scale", |ui| {
+                ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_scale, 0.05..=1.0)).changed();
+            });
+            row(ui, "Backdrop dim", |ui| {
+                ev.apply |= ui.add(egui::Slider::new(&mut cfg.tab_overview_opacity, 0.0..=1.0)).changed();
+            });
+        });
+    });
+    section(ui, "Workspaces", colors, |ui| {
+        form_grid("workspaces").show(ui, |ui| {
+            checkbox_row(ui, "Enable workspaces", &mut cfg.workspaces_enabled, ev);
+        });
+        ui.add_space(6.0);
+        // The shortcuts are not repeated here. A label baked into this page
+        // would keep advertising a chord the user has since rebound or unbound;
+        // Keys reads the real bindings.
+        ui.label(egui::RichText::new(
+            "Ten slots, each holding its own tabs. Their shortcuts are on the Keys page.",
+        )
+        .small()
+        .color(colors.muted));
+    });
+}
+
+/// Terminal: deliberately sparse. Unrelated controls do not belong here just
+/// because this page has room.
+fn terminal_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Scrollback", colors, |ui| {
+        form_grid("terminal").show(ui, |ui| {
+            row(ui, "Scrollback lines", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.scrollback_lines).range(0..=1_000_000)).changed();
+            });
+        });
+    });
+}
+
+/// Keys: every action, its current chord, and a reset or clear per row.
+fn keys_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, st: &mut UiState, colors: &TermStyle) {
+    if let Some(action) = st.key_capture.clone() {
+        section(ui, "Waiting for a shortcut", colors, |ui| {
+            ui.label(egui::RichText::new(format!(
+                "Press the keys for \u{201c}{}\u{201d}. Esc cancels.", action_label(&action)))
+                .strong().color(colors.accent));
+        });
+    }
+    for (group, rows) in key_groups(cfg) {
+        section(ui, group, colors, |ui| {
+            for (action, label) in rows {
+                binding_row(ui, &action, &label, cfg, st, colors);
+            }
+        });
+    }
 }
 
 fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) {
@@ -2957,6 +3066,92 @@ mod regression {
         }
     }
 
+    /// A control belongs to exactly one category. These labels are unique across
+    /// the whole settings UI (unlike section titles - the Keys page has a
+    /// "Workspaces" group of chords and Navigation has a "Workspaces" section of
+    /// settings), so a control that drifts to another page fails this test
+    /// instead of quietly rendering somewhere.
+    const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
+        (SettingsPage::Appearance, &["Theme", "Terminal font", "Tab strip", "Group colors", "Workspace 1"]),
+        (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized"]),
+        (SettingsPage::Tabs, &["Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
+        (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
+        (SettingsPage::Terminal, &["Scrollback lines"]),
+        (SettingsPage::Keys, &["Copy", "Search this tab", "Text bigger"]),
+    ];
+
+    fn page_labels(ctx: &Context, page: SettingsPage, size: (f32, f32)) -> Vec<String> {
+        let mut st = UiState { settings_page: page, ..Default::default() };
+        let mut cfg = crate::config::Config::default();
+        let mut labels = Vec::new();
+        // Two passes: a Window's first pass only measures.
+        for _ in 0..2 {
+            let mut full = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size.0, size.1))),
+                ..Default::default()
+            }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
+            labels = full.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            }).collect();
+            full.textures_delta.clear();
+        }
+        labels
+    }
+
+    #[test]
+    fn every_category_is_selectable_and_owns_its_controls() {
+        let ctx = Context::default();
+        for (page, marks) in PAGE_MARKS {
+            let labels = page_labels(&ctx, page, (1100.0, 1500.0));
+            for mark in marks {
+                assert!(labels.iter().any(|l| l == *mark), "{page:?} lost its {mark:?} control");
+            }
+            for (other, other_marks) in PAGE_MARKS {
+                if other == page { continue; }
+                for mark in other_marks {
+                    assert!(!labels.iter().any(|l| l == *mark),
+                        "{mark:?} belongs to {other:?} but appeared on {page:?}");
+                }
+            }
+            // The selector is the same on every page, or a category becomes
+            // unreachable once the user is on another one.
+            for (_, name) in SETTINGS_PAGES {
+                assert!(labels.iter().any(|l| l == *name), "selector lost {name} on {page:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn category_labels_survive_the_minimum_panel_width() {
+        // 448 is the default panel width and 412 the minimum; a long name must
+        // not be truncated at either, and nothing may reach outside the window.
+        for width in [448.0, 412.0, 640.0] {
+            let ctx = Context::default();
+            let mut st = UiState { panel_top: 24.0, ..Default::default() };
+            let mut cfg = crate::config::Config::default();
+            for _ in 0..3 {
+                let mut full = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 850.0))),
+                    ..Default::default()
+                }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
+                for (_, name) in SETTINGS_PAGES {
+                    let text = full.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == *name => Some((s.clip_rect, t)),
+                        _ => None,
+                    });
+                    // The first sizing pass of a new window doesn't paint.
+                    if let Some((clip, t)) = text {
+                        let rect = egui::Rect::from_min_size(t.pos, t.galley.size());
+                        assert!(clip.contains_rect(rect), "{name} is clipped at {width}px: {rect:?} by {clip:?}");
+                        assert!(rect.max.x <= width, "{name} runs past the window at {width}px: {rect:?}");
+                    }
+                }
+                full.textures_delta.clear();
+            }
+        }
+    }
+
     #[test]
     fn settings_pages_keep_save_and_cancel_visible_after_resize() {
         let ctx = Context::default();
@@ -2964,7 +3159,7 @@ mod regression {
         let mut cfg = crate::config::Config::default();
         let mut open = true;
         for (w, h) in [(1280.0, 850.0), (900.0, 540.0), (640.0, 420.0)] {
-            for page in [SettingsPage::Appearance, SettingsPage::Window, SettingsPage::Tabs, SettingsPage::Terminal, SettingsPage::Keys] {
+            for page in SETTINGS_PAGES.iter().map(|(page, _)| *page) {
                 st.settings_page = page;
                 for _ in 0..3 {
                     let mut full = ctx.run_ui(egui::RawInput {

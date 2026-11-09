@@ -67,12 +67,30 @@ def click(x, y):
     time.sleep(.15)
 
 
-def page(offset):
-    click(left + offset, strip + 105)
+def nav():
+    """Centers of the category cells, as the app reported them. Clicking by name
+    survives any change to the selector's layout; an offset guessed from a
+    screenshot moves the moment the grid does."""
+    line = [l for l in log_path.read_text().splitlines() if 'settings nav: ' in l][-1]
+    return {name: (float(x), float(y))
+            for name, x, y in re.findall(r'(\w+)=(-?[0-9.]+),(-?[0-9.]+)', line)}
+
+
+def page(name):
+    x, y = nav()[name]
+    click(x, y)
+
+
+def row_y(offset):
+    """A row inside the body, measured down from the selector's first row. The
+    body always starts under the selector, so a change to the selector's height
+    moves the rows with it - which a `strip + N` constant would not."""
+    return nav()['Appearance'][1] + offset
 
 
 def edit_width(value):
-    run('xdotool', 'mousemove', '--window', wid, str(round(left + 235)), str(round(strip + 244)),
+    # The default-width field, first row of Window dimensions.
+    run('xdotool', 'mousemove', '--window', wid, str(round(left + 243)), str(round(row_y(188))),
         'click', '--repeat', '2', '--delay', '70', '1')
     run('xdotool', 'key', 'ctrl+a')
     run('xdotool', 'type', str(value))
@@ -97,7 +115,7 @@ try:
         image = shot('appearance')
         return image if image.getpixel(probe) != terminal.getpixel(probe) else None
     wait(appeared, 'settings did not appear')
-    page(156)
+    page('Window')
     shot('window')
     edit_width(1234)
     shot('edited')
@@ -112,18 +130,24 @@ try:
     wait(lambda: 'configuration and colors reloaded' in log_path.read_text(), 'Cancel did not reload saved settings')
     assert config.read_text() == saved, 'Cancel modified the saved configuration'
     run('xdotool', 'key', 'alt+shift+c')
-    page(224)
+    page('Tabs')
     shot('tabs')
     run('xdotool', 'mousemove', '--window', wid, str(width - 80), '620', 'click', '--repeat', '7', '--delay', '70', '5')
     shot('tabs-scrolled')
-    page(296)
+    page('Terminal')
     shot('terminal-settings')
-    page(67)
-    click(left + 270, strip + 208)
+    page('Navigation')
+    shot('navigation')
+    page('Keys')
+    shot('keys')
+    page('Appearance')
+    # Theme & colors now leads the page, so the fonts sit below the fold of the
+    # color grid.
+    click(left + 291, row_y(512))
     shot('font-picker')
     # Clicking outside the picker leaves settings open.
     click(left + 75, strip + 34)
-    click(left + 215, strip + 389)
+    click(left + 220, row_y(223))
     color_popup = shot('color-picker')
     assert color_popup.getpixel((left - 30, height - 100)) != terminal.getpixel((left - 30, height - 100)), 'color picker missing'
     click(left + 75, strip + 34)

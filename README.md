@@ -57,14 +57,14 @@ Features
 * Tab switcher with cached GPU previews - hold Alt: each tab is a scaled,
   live view of its own terminal; arrows move the selection. Hover a tab for
   its preview. Selection and reordering animate in both the strip and switcher.
-  Settings → Tabs → Tab switcher enabled turns the switcher on or off without
+  Settings → Navigation → Tab switcher enabled turns the switcher on or off without
   changing numbered shortcuts (`tab_overview_on_alt` in the config).
   Show tab titles controls whether tabs show captions or only their numbers
   (`show_tab_titles`); both options are enabled by default. Number-only tabs
   retain title tooltips and can be closed by middle-click or the close shortcut.
 * Partial terminal redraws from Alacritty damage, into persistent per-tab GPU
   textures shared by the live window, previews, and image export.
-* Workspaces - opt-in (`workspaces_enabled: true`; Settings → Tabs →
+* Workspaces - opt-in (`workspaces_enabled: true`; Settings → Navigation →
   Workspaces). Off by default, in which case the workspace bindings and the
   tab-bar button are inert and tabs keep their normal color. When on,
   Alt+Shift+1…0 select ten independent tab sets in each window; the letter
