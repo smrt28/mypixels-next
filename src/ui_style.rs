@@ -595,6 +595,17 @@ pub(crate) fn tab_height(text_height: f32, scale: f32, compact: bool) -> f32 {
     (text_height + padding * scale).max(minimum * scale).round()
 }
 
+/// Choose the greater contrast ratio against an opaque background.
+pub(crate) fn black_or_white_text(background: egui::Color32) -> egui::Color32 {
+    let linear = egui::Rgba::from(background);
+    let luminance = 0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b();
+    if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 /// Keep theme text when readable; otherwise choose black or white for the fill.
 fn contrasting_text(foreground: egui::Color32, background: egui::Color32) -> egui::Color32 {
     let luminance = |color: egui::Color32| {
