@@ -95,10 +95,16 @@ pub struct UiState {
     /// A font row toggled its popup closed on button-press; the matching
     /// release must not count as a fresh open click (see `font_row`).
     font_suppress: bool,
-    /// The send-tab-to-window picker (Alt+Shift+w). Items and targets are
-    /// filled by the app when it opens the box; a click reports the target
-    /// window index, usize::MAX = "detach into a new window".
+    /// The send-tab-to-window picker (Alt+Shift+w) and the move-tab-to-
+    /// workspace picker (Alt+Shift+m). Items and targets are filled by the
+    /// app when it opens the box; a click reports the target window index,
+    /// usize::MAX = "detach into a new window". `move_title` is the box's
+    /// heading; empty means the original "Send tab to:". `move_workspace`
+    /// flips the pick's meaning: the target is a workspace index, not a
+    /// window index.
     pub move_open: bool,
+    pub move_title: String,
+    pub move_workspace: bool,
     pub move_items: Vec<String>,
     pub move_targets: Vec<usize>,
     pub move_pos: [f32; 2],
@@ -481,7 +487,8 @@ pub fn move_pick_box(ui: &egui::Ui, st: &mut UiState) {
         .fixed_pos(pos)
         .constrain(false)
         .show(&ctx, |ui| {
-            ui.label("Send tab to:");
+            let title = if st.move_title.is_empty() { "Send tab to:" } else { st.move_title.as_str() };
+            ui.label(title);
             for (i, label) in st.move_items.iter().enumerate() {
                 if ui.button(label).clicked() {
                     out = Some(Some(st.move_targets[i]));
@@ -2576,6 +2583,7 @@ const KEY_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("move_prev_tab", "Move tab left"), ("move_next_tab", "Move tab right"),
         ("move_first_tab", "Move tab to the start"), ("move_last_tab", "Move tab to the end"),
         ("send_tab_to_window", "Move tab to another window"),
+        ("move_tab_to_workspace", "Move tab to a workspace"),
     ]),
     ("Copy and paste", &[
         ("copy", "Copy"), ("paste", "Paste"), ("paste_primary", "Paste the selection"),

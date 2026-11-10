@@ -365,6 +365,22 @@ impl Win {
         self.workspaces.iter().position(|w| !w.tabs.is_empty())
     }
 
+    /// Move the active tab into a workspace's tab list; the terminal stays
+    /// alive there (pty and scrollback intact, like a window move).
+    fn move_tab_to_workspace(&mut self, target: usize) {
+        if target >= self.workspaces.len() || target == self.workspace || self.tabs.is_empty() {
+            return;
+        }
+        let from = self.active;
+        let tab = self.tabs.remove(from);
+        if !self.tabs.is_empty() {
+            self.active = from.min(self.tabs.len() - 1);
+        }
+        self.workspaces[target].tabs.push(tab);
+        self.workspaces[target].active = self.workspaces[target].tabs.len() - 1;
+        self.frame_gen = self.frame_gen.wrapping_add(1);
+    }
+
     fn select_workspace(&mut self, target: usize) {
         let previous = Workspace {
             tabs: std::mem::take(&mut self.tabs),
@@ -2470,11 +2486,16 @@ impl App {
                     window.request_redraw();
                 }
                 if let Some(pick) = egui.ui_state.move_out.take() {
+                    let to_workspace = egui.ui_state.move_workspace;
                     egui.ui_state.move_open = false;
                     if let Some(t) = pick {
-                        // Deferred: making a window needs the event loop,
-                        // which the draw path does not have.
-                        self.pending_move = Some((window.id(), t));
+                        if to_workspace {
+                            self.pending_action = Some((window.id(), format!("move_to_workspace_{t}")));
+                        } else {
+                            // Deferred: making a window needs the event loop,
+                            // which the draw path does not have.
+                            self.pending_move = Some((window.id(), t));
+                        }
                     }
                     window.request_redraw();
                 }
@@ -4545,6 +4566,12 @@ impl App {
                     self.switch_workspace(target);
                 }
             }
+            // The picker's pick, drained after the frame that showed it.
+            a if a.starts_with("move_to_workspace_") => {
+                if let Ok(target) = a["move_to_workspace_".len()..].parse::<usize>() {
+                    self.wins[self.cur].move_tab_to_workspace(target);
+                }
+            }
             "new_tab" => self.add_tab(),
             "new_window" => self.make_window(event_loop, None, None, true),
             "send_tab_to_window" => {
@@ -4582,9 +4609,42 @@ impl App {
                         st.move_items = items;
                         st.move_targets = targets;
                         st.move_pos = [12.0, self.tab_h / egui.ctx.pixels_per_point() + 6.0];
+                        st.move_title = String::new();
+                        st.move_workspace = false;
                         st.move_open = true;
                         st.move_out = None;
                     }
+                }
+            }
+            // The same picker, pointed at this window's other workspaces.
+            "move_tab_to_workspace" => {
+                if !self.config.workspaces_enabled {
+                    return;
+                }
+                let current = self.wins[self.cur].workspace;
+                let mut items = Vec::new();
+                let mut targets = Vec::new();
+                for (i, w) in self.wins[self.cur].workspaces.iter().enumerate() {
+                    if i == current {
+                        continue;
+                    }
+                    let title = w
+                        .tabs
+                        .get(w.active)
+                        .map(|t| t.display_title())
+                        .unwrap_or_else(|| "empty".to_string());
+                    items.push(format!("Workspace {} -- {} ({} tabs)", i + 1, title, w.tabs.len()));
+                    targets.push(i);
+                }
+                if let Some(egui) = self.wins[self.cur].egui.as_mut() {
+                    let st = &mut egui.ui_state;
+                    st.move_items = items;
+                    st.move_targets = targets;
+                    st.move_pos = [12.0, self.tab_h / egui.ctx.pixels_per_point() + 6.0];
+                    st.move_title = "Move tab to workspace:".to_string();
+                    st.move_workspace = true;
+                    st.move_open = true;
+                    st.move_out = None;
                 }
             }
             "copy" => {

@@ -200,6 +200,7 @@ impl Default for Config {
         bind("new_tab", &["CONTROL+ALT+z", "CONTROL+SHIFT+t"]);
         bind("new_window", &["CONTROL+SHIFT+n"]);
         bind("send_tab_to_window", &["MOD1+SHIFT+w"]);
+        bind("move_tab_to_workspace", &["MOD1+SHIFT+m"]);
         // Copy/paste follow the VTE and GNOME Terminal bindings the original gets
         // from GTK, so the fingers that already know them keep working. Selecting
         // text feeds the *primary* buffer separately and needs no key.
