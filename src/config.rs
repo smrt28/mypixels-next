@@ -1247,6 +1247,21 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
     None
 }
 
+/// The first OTHER action that already uses this chord, if any. `find_action`
+/// resolves a shared chord to the earlier action in list order, so a new
+/// binding that collides would never fire; the capture rejects it instead.
+pub fn binding_conflict(bindings: &[(String, Vec<Binding>)], action: &str, b: &Binding) -> Option<String> {
+    for (a, list) in bindings {
+        if a == action {
+            continue;
+        }
+        if list.iter().any(|o| o.mods == b.mods && o.key == b.key) {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1314,6 +1329,21 @@ mod tests {
             Some("goto_tab_1".into()), "unshifted Alt+2 still selects the tab");
         assert_eq!(find_action(&cfg.bindings, &by_position, ModifiersState::ALT | ModifiersState::SHIFT, false),
             Some("goto_workspace_1".into()), "and the same position with Shift selects the workspace");
+    }
+
+    #[test]
+    fn a_conflicting_chord_names_the_action_that_already_owns_it() {
+        // Alt+Shift+W belongs to send_tab_to_window; the workspace move must
+        // not be able to steal it, because list order would win the lookup.
+        let cfg = Config::default();
+        let taken = Binding::parse("MOD1+SHIFT+w").unwrap();
+        assert_eq!(binding_conflict(&cfg.bindings, "move_tab_to_workspace", &taken),
+            Some("send_tab_to_window".into()));
+        // Re-binding an action to its own chord is not a conflict, and a free
+        // chord is one too.
+        assert_eq!(binding_conflict(&cfg.bindings, "send_tab_to_window", &taken), None);
+        let free = Binding::parse("MOD1+SHIFT+m").unwrap();
+        assert_eq!(binding_conflict(&cfg.bindings, "move_tab_to_workspace", &free), None);
     }
 
     #[test]

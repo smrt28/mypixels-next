@@ -1071,6 +1071,12 @@ impl App {
             }
         };
         let binding = config::Binding { mods, key: bound };
+        // A shared chord resolves to the earlier action in list order, so the
+        // new one would never fire. Keep recording: a different chord is fine.
+        if let Some(other) = config::binding_conflict(&self.config.bindings, &action, &binding) {
+            self.show_error(format!("{} is already used by {}.", binding.label(), egui_ui::action_label(&other)));
+            return true;
+        }
         log::info!("bind {action} = {}", binding.spec());
         self.config.set_binding(&action, vec![binding]);
         if let Some(e) = self.wins[self.cur].egui.as_mut() {
