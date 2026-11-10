@@ -22,8 +22,8 @@ from PIL import Image
 root = Path(__file__).resolve().parents[1]
 OLD = os.environ.get('OLD_BIN', str(root / 'target/debug/mypixels'))
 NEW = os.environ.get('NEW_BIN', str(root / 'target/release/mypixels'))
-# Cursor blink is a free-running phase between runs (and the strip's clock
-# sits just outside the crop); a cell plus antialiasing is ~0.06%. Half a
+# Cursor blink is a free-running phase between runs; a cell plus
+# antialiasing is ~0.06%. Half a
 # percent still catches any real regression: the pre-cache-vs-cache bugs
 # this test was written for measured 3-11%.
 TOLERANCE = 0.005

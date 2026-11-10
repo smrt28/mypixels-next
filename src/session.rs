@@ -48,20 +48,7 @@ pub fn display_key() -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("DISPLAY").ok().filter(|s| !s.is_empty()))?;
-    let safe: String = disp
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let safe = if safe
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        safe
-    } else {
-        format!("d_{safe}")
-    };
-    Some(safe)
+    Some(display_key_for(&disp))
 }
 
 /// The well-known name for this display's session, or None when there is no
@@ -88,7 +75,7 @@ pub fn launch_window() -> Option<u32> {
     std::env::var("MYPIXELS_WINDOW").ok()?.trim().parse::<u32>().ok()
 }
 
-fn bus_name_for(disp: &str) -> Option<String> {
+fn display_key_for(disp: &str) -> String {
     let mut safe: String = disp
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -96,7 +83,7 @@ fn bus_name_for(disp: &str) -> Option<String> {
     if !safe.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
         safe.insert_str(0, "d_");
     }
-    Some(format!("com.github.volca.mypixels.{safe}"))
+    safe
 }
 
 /// Register as the session for this display. Returns None (and logs why) when
@@ -336,15 +323,15 @@ mod tests {
     #[test]
     fn display_scopes_the_bus_name() {
         assert_eq!(
-            bus_name_for("wayland-1").unwrap(),
-            "com.github.volca.mypixels.wayland_1"
+            display_key_for("wayland-1"),
+            "wayland_1"
         );
         assert_eq!(
-            bus_name_for(":0").unwrap(),
-            "com.github.volca.mypixels.d__0", // ':' becomes '_', start forced alphabetic
+            display_key_for(":0"),
+            "d__0", // ':' becomes '_', start forced alphabetic
             "X11 display names must still form valid bus names"
         );
         // A degenerate display name still yields a syntactically valid name.
-        assert_eq!(bus_name_for("").unwrap(), "com.github.volca.mypixels.d_");
+        assert_eq!(display_key_for(""), "d_");
     }
 }

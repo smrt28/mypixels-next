@@ -143,7 +143,7 @@ try:
     page('Appearance')
     # Theme & colors now leads the page, so the fonts sit below the fold of the
     # color grid.
-    click(left + 291, row_y(512))
+    click(left + 291, row_y(552))
     shot('font-picker')
     # Clicking outside the picker leaves settings open.
     click(left + 75, strip + 34)

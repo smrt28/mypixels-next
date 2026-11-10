@@ -59,3 +59,11 @@ The GPU box-filter downsamples at native display density, and egui samples those
 textures directly. Closing the switcher keeps the cache; closing/moving tabs
 releases their renderer registrations. CPU readback is reserved for explicit
 copy-as-image exports.
+
+Animation speed is a user preference under Appearance → Motion. Shared
+transitions use 160 ms at 1×, scaled by `animation_speed`; 0 disables motion.
+Workspace preview strips use the same duration when a newly focused tab needs
+to be revealed. Compact tabs are an optional density setting under Tabs → Tab
+bar: they change padding and height while retaining this palette and typography.
+Terminal brightness affects resolved terminal colors, including cached previews,
+and does not recolor the interface or overwrite theme colors.

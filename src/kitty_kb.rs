@@ -58,7 +58,6 @@ pub struct Input<'a> {
     pub repeat: bool,
     pub mods: ModifiersState,
     pub flags: u8,
-    pub app_cursor: bool,
 }
 
 /// The US-layout identity of a physical key: (unshifted, shifted). The
@@ -516,7 +515,6 @@ mod tests {
             repeat: false,
             mods: ModifiersState::empty(),
             flags,
-            app_cursor: false,
         }
     }
 

@@ -165,10 +165,18 @@ pub(crate) fn menu_separator(ui: &mut egui::Ui, colors: &TermStyle) {
 
 /// Shared motion policy. egui owns interpolation, interruption and repainting;
 /// components supply only stable identities and target states/geometry.
-pub(crate) const MOTION_SECONDS: f32 = 0.16;
+const MOTION_SECONDS: f32 = 0.16;
+
+pub(crate) fn apply_motion(ctx: &egui::Context, speed: f32) {
+    let speed = if speed.is_finite() { speed.clamp(0.0, 4.0) } else { 1.0 };
+    let seconds = if speed > 0.0 { MOTION_SECONDS / speed.max(0.25) } else { 0.0 };
+    if ctx.global_style().animation_time != seconds {
+        ctx.global_style_mut(|style| style.animation_time = seconds);
+    }
+}
 
 pub(crate) fn transition(ctx: &egui::Context, id: egui::Id, target: bool) -> f32 {
-    ctx.animate_bool_with_time_and_easing(id, target, MOTION_SECONDS, egui::emath::easing::cubic_out)
+    ctx.animate_bool_with_time_and_easing(id, target, ctx.global_style().animation_time, egui::emath::easing::cubic_out)
 }
 
 pub(crate) fn animated_rect(ctx: &egui::Context, id: egui::Id, target: egui::Rect) -> egui::Rect {
@@ -178,7 +186,7 @@ pub(crate) fn animated_rect(ctx: &egui::Context, id: egui::Id, target: egui::Rec
         data.insert_temp(id, now);
         old.is_none_or(|seen| now - seen > 0.3)
     });
-    let duration = if reset { 0.0 } else { MOTION_SECONDS };
+    let duration = if reset { 0.0 } else { ctx.global_style().animation_time };
     let x = ctx.animate_value_with_time(id.with("x"), target.left(), duration);
     let y = ctx.animate_value_with_time(id.with("y"), target.top(), duration);
     let width = ctx.animate_value_with_time(id.with("width"), target.width(), duration);
@@ -281,6 +289,9 @@ pub(crate) enum Icon {
     Dismiss,
     Layers,
     Search,
+    Filter,
+    ChevronLeft,
+    ChevronRight,
     More,
     Clock,
     Check,
@@ -379,6 +390,11 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
                 line(&[(-8.0, y), (0.0, y + 4.0), (8.0, y)]);
             }
             line(&[(-8.0, -5.0), (0.0, -9.0), (8.0, -5.0)]);
+        }
+        Icon::ChevronLeft => { line(&[(2.0, -4.0), (-2.0, 0.0), (2.0, 4.0)]); }
+        Icon::ChevronRight => { line(&[(-2.0, -4.0), (2.0, 0.0), (-2.0, 4.0)]); }
+        Icon::Filter => {
+            line(&[(-7.0, -6.0), (7.0, -6.0), (2.0, 0.0), (2.0, 6.0), (-2.0, 8.0), (-2.0, 0.0), (-7.0, -6.0)]);
         }
         Icon::Search => {
             p.circle_stroke(pt(-2.0, -2.0), 6.0, stroke);
@@ -574,8 +590,9 @@ pub(crate) fn form_grid(id: &str) -> egui::Grid {
 }
 
 /// Compact chrome stays readable while reserving terminal rows.
-pub(crate) fn tab_height(text_height: f32, scale: f32) -> f32 {
-    (text_height + 8.0 * scale).max(28.0 * scale).round()
+pub(crate) fn tab_height(text_height: f32, scale: f32, compact: bool) -> f32 {
+    let (padding, minimum) = if compact { (2.0, 18.0) } else { (8.0, 28.0) };
+    (text_height + padding * scale).max(minimum * scale).round()
 }
 
 /// Keep theme text when readable; otherwise choose black or white for the fill.
@@ -848,8 +865,32 @@ mod motion_tests {
     }
 
     #[test]
+    fn configured_speed_changes_actual_motion_and_off_finishes_in_flight_transitions() {
+        let slow = egui::Context::default();
+        let fast = egui::Context::default();
+        apply_motion(&slow, 0.5);
+        apply_motion(&fast, 2.0);
+        assert_eq!(slow.global_style().animation_time, 0.32);
+        assert_eq!(fast.global_style().animation_time, 0.08);
+        for ctx in [&slow, &fast] {
+            positions(ctx, 0.0, false);
+            positions(ctx, 0.016, true);
+        }
+        assert!(positions(&fast, 0.07, true).0 > positions(&slow, 0.07, true).0);
+        apply_motion(&slow, 0.0);
+        assert_eq!(positions(&slow, 0.08, true), (100.0, 0.0));
+        let mut full = slow.run_ui(egui::RawInput { time: Some(0.09), ..Default::default() }, |ui| {
+            let id = egui::Id::unique("disabled_hover");
+            assert_eq!(transition(ui.ctx(), id, false), 0.0);
+            assert_eq!(transition(ui.ctx(), id, true), 1.0);
+        });
+        full.textures_delta.clear();
+    }
+
+    #[test]
     fn stable_id_motion_interpolates_and_retargets_without_jumping() {
         let ctx = egui::Context::default();
+        apply_motion(&ctx, 1.0);
         assert_eq!(positions(&ctx, 0.0, false), (0.0, 100.0));
         positions(&ctx, 0.016, true);
         let middle = positions(&ctx, 0.08, true);

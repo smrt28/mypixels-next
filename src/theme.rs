@@ -29,15 +29,6 @@ pub fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     Rgb(channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
 }
 
-/// Text color for small accent-filled index chips, on light and dark themes.
-pub fn on_color(color: Rgb) -> Rgb {
-    let luminance = (299 * color.0 as u32 + 587 * color.1 as u32 + 114 * color.2 as u32) / 1000;
-    if luminance >= 145 {
-        Rgb(20, 20, 24)
-    } else {
-        Rgb(250, 250, 250)
-    }
-}
 
 fn color(value: &Value, name: &str) -> Result<Rgb, String> {
     value
@@ -622,7 +613,6 @@ mod tests {
         assert!(cfg.background_color.0 > 200);
         assert!(cfg.tab_color_fg.0 < 150);
         assert_ne!(cfg.tab_color_bg, Rgb(255, 255, 255));
-        assert_eq!(on_color(Rgb(240, 240, 240)), Rgb(20, 20, 24));
     }
 
     #[test]

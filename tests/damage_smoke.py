@@ -99,7 +99,7 @@ tab_overview_scale: 0.35
         path = work / f'{name}.png'
         run('import', '-window', wid, str(path))
         image = Image.open(path).convert('RGB')
-        # Exclude the tab strip's wall clock, retaining the full terminal grid.
+        # Compare the terminal grid independently of the tab strip.
         shots[name] = image.crop((0, strip, image.width, image.height))
 
     try:

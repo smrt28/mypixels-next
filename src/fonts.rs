@@ -178,7 +178,8 @@ pub fn line_metrics(
         hhea,
     };
     log::debug!(
-        "line_metrics({family}): typo upem={upem} asc={ascent} desc={descent} lead={leading} hhea={:?} -> {}px at 12px",
+        "line_metrics({family}): typo upem={upem} asc={ascent} desc={descent} lead={} hhea={:?} -> {}px at 12px",
+        lm.leading,
         lm.hhea,
         lm.height_at(12.0)
     );
@@ -191,18 +192,6 @@ pub struct FacePick {
     pub postscript: String,
     pub weight: u16,
     pub slant: DbStyle,
-}
-
-/// Resolve a family name to the one face we want from it.
-///
-/// Asking for a family alone is not enough. A family can ship Bold, Italic and
-/// Medium faces and no Regular at all -- Terminus (TTF) here is exactly that --
-/// and "whichever face comes first in the database" is then a coin flip that can
-/// land on Bold, which is what made the tab strip look emboldened. Rank upright
-/// faces by distance from 400 and break ties by database order, so the answer is
-/// stable and never an accident of file scan order.
-pub fn pick_face(db: &Database, family: &str) -> Option<FacePick> {
-    pick_face_near(db, family, 400, DbStyle::Normal)
 }
 
 /// The face of `family` nearest the requested weight and slant.
@@ -738,11 +727,6 @@ impl Coverage {
             Box::leak(Box::new(self.base.clone().family(Family::Name(name))));
         self.by_family.insert(fam.to_string(), attrs);
         attrs
-    }
-
-    /// Fallback families resolved so far (diagnostics, tests).
-    pub fn families(&self) -> Vec<&str> {
-        self.by_family.keys().map(|s| s.as_str()).collect()
     }
 }
 

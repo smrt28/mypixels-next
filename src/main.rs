@@ -327,6 +327,8 @@ struct Win {
     /// only while the panel is open.
     grave_thumbs: Vec<SwThumb>,
     thumb_rr: usize,
+    ws_preview_rr: usize,
+    ws_preview_next: Instant,
     preview_next: Instant,
     repaint_at: Option<Instant>,
     /// last BEL seen anywhere (visual bell; see bell_flash)
@@ -505,13 +507,13 @@ struct App {
     /// resolved colour. Key events need it without going through the frame
     /// builder: the ripple rings AT the cursor when a modifier is pressed.
     cursor_pt: Option<([f32; 2], [f32; 3])>,
-    pending_move: Option<usize>,
+    pending_move: Option<(WindowId, usize)>,
     /// A context-menu choice, run by the drain (which has the event loop).
-    pending_action: Option<String>,
+    pending_action: Option<(WindowId, String)>,
     /// A graveyard choice (raise/kill), deferred to the drain: applying it
     /// inside the draw path would shrink the graveyard mid-frame, and the
     /// preview index space built at the frame's top would go stale under it.
-    pending_grave: Option<(usize, String)>,
+    pending_grave: Option<(WindowId, usize, String)>,
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
     /// as long as the app runs.
     /// Keeps the session-bus thread -- and with it the bus name -- alive for
@@ -609,7 +611,7 @@ impl App {
             }
         }
         let tab_char_w = (ttotal / 4.0).max(1.0);
-        let tab_h = ui_style::tab_height(tab_lh, 1.0);
+        let tab_h = ui_style::tab_height(tab_lh, 1.0, config.compact_tabs);
 
         log::info!(
             "font: term {term_family} {term_pt}pt, tablist {tab_family} {tab_pt}pt; cell = {cell_w:.2} x {cell_h:.2}, tab char = {tab_char_w:.2}, strip = {tab_h:.1}px"
@@ -845,6 +847,7 @@ impl App {
             font_choices,
         ));
         self.wins[self.cur].gpu = Some(gpu);
+        self.apply_transparency();
     }
 
     fn add_tab(&mut self) {
@@ -940,6 +943,11 @@ impl App {
             tab.term.lock().is_focused = false;
         }
         win.select_workspace(target);
+        if let Some(e) = win.egui.as_mut()
+            && e.ui_state.panel_is(egui_ui::RightPanel::Workspaces) {
+            e.ui_state.ws_sel = Some(target);
+            e.ui_state.ws_collapsed = None;
+        }
         if in_gesture {
             // Land on this workspace's own front tab. Escape from here restores
             // it, rather than a tab index that belonged to the workspace the
@@ -1356,7 +1364,8 @@ impl App {
     /// Apply a deferred graveyard choice. The panel's index is newest-first;
     /// the graveyard is oldest-first.
     fn apply_pending_grave(&mut self) {
-        let Some((index, action)) = self.pending_grave.take() else { return };
+        let Some((window, index, action)) = self.pending_grave.take() else { return };
+        if !self.select_window(window) { return; }
         let Some(pos) = grave_pos_for(self.graveyard.len(), index) else { return };
         if action == "raise" {
             self.revive_tab(pos);
@@ -1368,16 +1377,6 @@ impl App {
     /// The workspace panel's rows: all ten slots of this window. The current
     /// workspace's tabs live in `Win::tabs`; the others are parked in their own
     /// list, so the current one is read from where it actually is.
-    ///
-    /// TODO: preview each workspace with its front tab, the way the Alt-held
-    /// switcher previews a tab. `title` already resolves to exactly that tab
-    /// (`tabs.get(active)`), so a thumbnail would show the same thing the caption
-    /// names. The work is in the thumbnail cache, which is scoped to the current
-    /// workspace: `sw_thumbs` is both kept alive by and captured from `Win::tabs`
-    /// alone (the `ids` retain and the capture order in the frame's preview pass),
-    /// so a tab parked in `Win::workspaces[i]` has no texture to show. It also
-    /// wants a budget - up to nine more live textures, for slots that are usually
-    /// empty, is why the panel lists rather than previews.
     fn ws_rows(&self) -> Vec<egui_ui::WsRow> {
         let win = &self.wins[self.cur];
         (0..WORKSPACES).map(|i| {
@@ -1390,6 +1389,14 @@ impl App {
                 index: i,
                 count: tabs.len(),
                 title: tabs.get(active).map(|t| t.display_title()).unwrap_or_default(),
+                genre: self.config.workspace_genres[i].clone(),
+                tabs: tabs.iter().enumerate().map(|(index, tab)| egui_ui::WsTab {
+                    id: tab.id,
+                    title: tab.display_title(),
+                    selected: index == active,
+                    preview: win.sw_thumbs.iter().find(|thumb| thumb.tab_id == tab.id)
+                        .map(|thumb| (thumb.handle, thumb.size)),
+                }).collect(),
                 current: i == win.workspace,
                 shortcut: config::workspace_shortcut(&self.config, i),
             }
@@ -1488,12 +1495,35 @@ impl App {
         }
     }
 
+    fn sync_all_term_sizes(&mut self, force: bool) {
+        let current = self.cur;
+        for index in 0..self.wins.len() {
+            self.cur = index;
+            self.sync_term_size_with(force);
+            if let Some(window) = &self.wins[index].window { window.request_redraw(); }
+        }
+        self.cur = current;
+    }
+
     /// Re-apply everything a config reload can change. Colors, palette, tab
     /// colors, bindings and tablist visibility are read from `self.config` at
     /// draw time, so swapping the struct (done by the caller) covers them. We
     /// only need to recompute the values copied into App at startup: fg/bg and,
     /// when the font changed, the cell metrics + glyph pools.
+    fn apply_transparency(&self) {
+        let transparent = effective_transparency(self.config.term_transparency) > 0.0;
+        for win in &self.wins {
+            if let Some(window) = &win.window {
+                // Wayland's opaque-region hint must follow the actual alpha.
+                // On X11 the ARGB visual is reserved at window creation instead.
+                window.set_transparent(transparent);
+                window.request_redraw();
+            }
+        }
+    }
+
     fn apply_config(&mut self, font_changed: bool, spacing_changed: bool) {
+        self.apply_transparency();
         if !self.config.tab_overview_on_alt {
             *self.switcher_alt_at.lock().unwrap() = None;
             self.switcher_show_req.store(false, Ordering::SeqCst);
@@ -1521,6 +1551,11 @@ impl App {
         } else if spacing_changed {
             // Changing row spacing preserves the live font zoom.
             self.rebuild_term_font();
+        }
+        let tab_h = ui_style::tab_height(self.tab_text_h, self.scale, self.config.compact_tabs);
+        if tab_h != self.tab_h {
+            self.tab_h = tab_h;
+            self.sync_all_term_sizes(false);
         }
     }
 
@@ -1595,13 +1630,7 @@ impl App {
         }
         // Metrics are global: resize every window and all its workspaces.
         // Force PTY pixel-size updates even when the row count stays the same.
-        let current = self.cur;
-        for index in 0..self.wins.len() {
-            self.cur = index;
-            self.sync_term_size_with(true);
-            if let Some(window) = &self.wins[index].window { window.request_redraw(); }
-        }
-        self.cur = current;
+        self.sync_all_term_sizes(true);
         // Font routing depends on the terminal font, so rebuild it with it.
         *self.coverage.borrow_mut() = Some(fonts::Coverage::new(
             &self.font_system,
@@ -1664,9 +1693,9 @@ impl App {
         self.tab_char_w = tab_char_w;
         self.tab_text_h = tab_lh;
         // Whole pixels again, for the same reason as the cell grid.
-        self.tab_h = ui_style::tab_height(tab_lh, self.scale);
+        self.tab_h = ui_style::tab_height(tab_lh, self.scale, self.config.compact_tabs);
 
-        self.sync_term_size();
+        self.sync_all_term_sizes(false);
         log::info!(
             "tab font: {} {:.0}pt; text {:.0}, strip {:.0}",
             tab_family, tab_pt, self.tab_text_h, self.tab_h
@@ -1782,18 +1811,14 @@ impl App {
         let vy1 = strip_h + self.wins[self.cur].rows as f32 * self.cell_h;
         for pl in k.placements_sorted() {
             let Some(img) = k.image(pl.image_id) else { continue };
-            let iw = pl
-                .cols
-                .map_or(img.width, |c| (c as f32 * self.cell_w).max(1.0) as u32);
-            let ih = pl
-                .rows
-                .map_or(img.height, |r| (r as f32 * self.cell_h).max(1.0) as u32);
+            let Some(geometry) = pl.geometry(img, [self.cell_w, self.cell_h]) else { continue };
+            let [iw, ih] = geometry.size;
             let x0 = pl.col as f32 * self.cell_w + pl.x_off as f32;
             let y0 = vy0
                 + (pl.anchor_line as f32 - top_abs as f32) * self.cell_h
                 + pl.y_off as f32;
             let (cx0, cy0) = (x0.max(0.0), y0.max(vy0));
-            let (cx1, cy1) = ((x0 + iw as f32).min(w as f32), (y0 + ih as f32).min(vy1));
+            let (cx1, cy1) = ((x0 + iw).min(w as f32), (y0 + ih).min(vy1));
             if cx1 <= cx0 || cy1 <= cy0 {
                 continue;
             }
@@ -1805,10 +1830,10 @@ impl App {
                 key,
                 dst: [cx0, cy0, cx1 - cx0, cy1 - cy0],
                 uv: [
-                    (cx0 - x0) / iw as f32,
-                    (cy0 - y0) / ih as f32,
-                    (cx1 - x0) / iw as f32,
-                    (cy1 - y0) / ih as f32,
+                    geometry.uv[0] + (cx0 - x0) / iw * geometry.uv[2],
+                    geometry.uv[1] + (cy0 - y0) / ih * geometry.uv[3],
+                    geometry.uv[0] + (cx1 - x0) / iw * geometry.uv[2],
+                    geometry.uv[1] + (cy1 - y0) / ih * geometry.uv[3],
                 ],
             });
         }
@@ -1829,15 +1854,16 @@ impl App {
         let palette = Palette::from_colors(content.colors, &self.config.palette);
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
         let resolve = |color: &Color| palette.resolve_with(color, self.fg, self.bg, self.config.cursor_color.to_f32());
-        let def_fg = resolve(&Color::Named(NamedColor::Foreground));
-        let def_bg = resolve(&Color::Named(NamedColor::Background));
+        let adjust = |color| self.config.adjust_terminal_color(color);
+        let def_fg = adjust(resolve(&Color::Named(NamedColor::Foreground)));
+        let def_bg = adjust(resolve(&Color::Named(NamedColor::Background)));
         // The cursor is the one element the user must never have to hunt
         // for, whatever palette the theme carries: boost it halfway to
         // white. A theme that already chose a bright cursor loses nothing
         // (the mix flattens as it approaches 1.0), a dark one gains a lot.
         let cursor_color = {
             let c = resolve(&Color::Named(NamedColor::Cursor));
-            c.map(|v| v + (1.0 - v) * 0.5)
+            adjust(c.map(|v| v + (1.0 - v) * 0.5))
         };
         let rows = self.wins[self.cur].rows;
         let cols = self.wins[self.cur].cols;
@@ -1868,6 +1894,8 @@ impl App {
             let mut bg = resolve(&cell.bg);
             if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
             if cell.flags.contains(Flags::DIM) { fg = fg.map(|v| v * 0.66); }
+            let fg = adjust(fg);
+            let bg = adjust(bg);
             let attrs = self.cell_attrs(c, cell.flags);
             let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
@@ -1960,6 +1988,8 @@ impl App {
     /// Builds a frame per tab (before the mutable gpu borrow), then hands
     /// off to the gpu pass.
     fn draw(&mut self, window: &Window) {
+        debug_assert_eq!(self.wins[self.cur].window.as_ref().map(|w| w.id()), Some(window.id()),
+            "a redraw must use its own window's terminal and renderer");
         if self.wins[self.cur].notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() >= 4) { self.wins[self.cur].notice = None; }
         // Selection-drag autoscroll: dragging the selection edge into the
         // band at either grid edge scrolls that way, and dragging PAST the
@@ -2085,11 +2115,48 @@ impl App {
                         cell_height: self.cell_h as u16,
                     }));
                 }
-                let damage = Damage::collect(term.damage_content());
-                term.reset_damage();
             }
             self.build_frame(&entry.tab, false,
                 |d| damage_events.push((n + gi, d)))
+        }).collect();
+        // Parked workspaces share the thumbnail cache, but only two temporary
+        // full-size GPU targets are needed. Rotate through visible cards at 5 Hz;
+        // keep the small thumbnails when the panel closes or workspaces switch.
+        let mut ws_preview_tabs = Vec::new();
+        let ws_panel = self.wins[self.cur].egui.as_ref()
+            .filter(|e| e.ui_state.panel_is(egui_ui::RightPanel::Workspaces));
+        if let Some(e) = ws_panel {
+            let visible_tabs = &e.ui_state.ws_visible_tabs;
+            let query = e.ui_state.ws_query.trim().to_lowercase();
+            let populated_only = e.ui_state.ws_populated_only;
+            let win = &self.wins[self.cur];
+            let mut candidates = Vec::new();
+            for (workspace, slot) in win.workspaces.iter().enumerate() {
+                if workspace == win.workspace || (populated_only && slot.tabs.is_empty()) { continue; }
+                let matches = query.is_empty()
+                    || format!("Workspace {} {}", workspace + 1, self.config.workspace_genres[workspace]).to_lowercase().contains(&query)
+                    || slot.tabs.iter().any(|tab| tab.display_title().to_lowercase().contains(&query));
+                if !matches { continue; }
+                for (tab, terminal) in slot.tabs.iter().enumerate() {
+                    if visible_tabs.contains(&terminal.id)
+                        || (visible_tabs.is_empty() && tab == slot.active) {
+                        candidates.push((workspace, tab));
+                    }
+                }
+            }
+            if now >= win.ws_preview_next && !candidates.is_empty() {
+                let start = win.ws_preview_rr % candidates.len();
+                for offset in 0..candidates.len().min(2) {
+                    ws_preview_tabs.push(candidates[(start + offset) % candidates.len()]);
+                }
+                let win = &mut self.wins[self.cur];
+                win.ws_preview_rr = (start + ws_preview_tabs.len()) % candidates.len();
+                win.ws_preview_next = now + std::time::Duration::from_millis(200);
+            }
+        }
+        let ws_preview_frames: Vec<FrameData> = ws_preview_tabs.iter().enumerate().map(|(pi, &(workspace, tab))| {
+            self.build_frame(&self.wins[self.cur].workspaces[workspace].tabs[tab], false,
+                |damage| damage_events.push((n + g + pi, damage)))
         }).collect();
         self.bg = saved_bg;
         let t_built = t_start.elapsed();
@@ -2112,6 +2179,9 @@ impl App {
             crate::config::terminal_bg(&self.config),
             self.config.col,
             self.config.line_spacing,
+            self.config.compact_tabs,
+            self.config.terminal_brightness,
+            self.config.term_transparency,
         );
         // The UI wears the terminal's EFFECTIVE colours (theme, palette and
         // overrides resolved upstream - not the raw config fields, which a
@@ -2120,6 +2190,7 @@ impl App {
         // reads visuals at layout time, not paint time.
         if let Some(e) = self.wins[self.cur].egui.as_ref() {
             e.ctx.set_visuals(ui_style::theme(&self.config, self.bg, self.fg));
+            ui_style::apply_motion(&e.ctx, self.config.animation_speed);
         }
         let tab_faces: Vec<tab_bar::TabFace> = if show_strip {
             self.wins[self.cur].tabs.iter().enumerate().map(|(i, tab)| tab_bar::TabFace {
@@ -2137,9 +2208,6 @@ impl App {
         } else { Vec::new() };
         let tab_font = egui::FontId::new(config::parse_font(&self.config.tablist_font).1 * 96.0 / 72.0,
             egui::FontFamily::Name(self.tab_face_key.clone().into()));
-        let clock = (self.config.tab_prepend.as_deref() == Some("clock")).then(|| {
-            let (hour, minute) = local_hhmm(); format!("{hour:02}:{minute:02}")
-        });
         let mut strip_geometry = tab_bar::Geometry::default();
         let mut full_output: Option<egui::FullOutput> = None;
         // The switcher draws through egui; its state machine stays in the
@@ -2199,7 +2267,6 @@ impl App {
         let sw_workspace = self.config.workspaces_enabled
             .then_some(self.wins[self.cur].workspace);
         let sw_dim = egui_ui::dim_fill(
-            &self.config,
             self.bg,
             (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8,
         );
@@ -2255,7 +2322,7 @@ impl App {
                 let full = ctx.run_ui(raw, |ui| {
                     if show_strip {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
-                            &tab_faces, self.wins[self.cur].active, clock.as_deref(),
+                            &tab_faces, self.wins[self.cur].active,
                             egui.ui_state.menu_open && egui.ui_state.menu_app, self.wins[self.cur].workspace,
                             egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces), &self.config);
                         if strip_geometry.menu_clicked {
@@ -2407,7 +2474,7 @@ impl App {
                     if let Some(t) = pick {
                         // Deferred: making a window needs the event loop,
                         // which the draw path does not have.
-                        self.pending_move = Some(t);
+                        self.pending_move = Some((window.id(), t));
                     }
                     window.request_redraw();
                 }
@@ -2415,7 +2482,7 @@ impl App {
                     // The panel's list is newest-first; the graveyard is
                     // oldest-first. Translate, then defer to the drain: the
                     // frame already counted the burials it is rendering.
-                    self.pending_grave = Some((index, action));
+                    self.pending_grave = Some((window.id(), index, action));
                     egui.ui_state.grave_sel = None;
                     window.request_redraw();
                 }
@@ -2424,8 +2491,13 @@ impl App {
                     // it goes through the same action the chord uses. The panel
                     // stays open: hopping between workspaces and watching the
                     // check mark move is what a panel is for.
-                    self.pending_action = Some(format!("goto_workspace_{index}"));
+                    self.pending_action = Some((window.id(), format!("goto_workspace_{index}")));
                     egui.ui_state.ws_sel = Some(index);
+                    window.request_redraw();
+                }
+                if let Some((workspace, id)) = egui.ui_state.ws_tab_out.take() {
+                    self.pending_action = Some((window.id(), format!("workspace_tab_{workspace}_{id}")));
+                    egui.ui_state.ws_sel = Some(workspace);
                     window.request_redraw();
                 }
                 if let Some(pick) = egui.ui_state.menu_out.take() {
@@ -2434,7 +2506,7 @@ impl App {
                     // flag has no falling edge to release the menu's focus.
                     egui_ui::release_focus(&ctx);
                     if let Some(action) = pick {
-                        self.pending_action = Some(action);
+                        self.pending_action = Some((window.id(), action));
                     }
                     window.request_redraw();
                 }
@@ -2465,16 +2537,21 @@ impl App {
         if revert {
             self.reload_config();
         } else if changed {
-            // Re-apply only when a cached value moved. Opacity, switcher and
+            if old_text_state.8 != self.config.term_transparency {
+                self.apply_transparency();
+            }
+            // Re-apply only when a cached value moved. Switcher and
             // geometry fields are read live per frame, and forcing a full
             // re-shape on every slider tick would stutter the drag.
             let font_changed = old_text_state.0 != self.config.term_font
                 || old_text_state.1 != self.config.tablist_font;
             let colors_changed = old_text_state.2 != self.config.foreground_color
                 || old_text_state.3 != crate::config::terminal_bg(&self.config)
-                || old_text_state.4 != self.config.col;
+                || old_text_state.4 != self.config.col
+                || old_text_state.7 != self.config.terminal_brightness;
             let spacing_changed = old_text_state.5 != self.config.line_spacing;
-            if font_changed || colors_changed || spacing_changed {
+            let compact_changed = old_text_state.6 != self.config.compact_tabs;
+            if font_changed || colors_changed || spacing_changed || compact_changed {
                 self.apply_config(font_changed, spacing_changed);
             }
         }
@@ -2547,6 +2624,7 @@ impl App {
         let images = self.image_quads(active, &mut gpu, strip_h, w);
         let mut tab_ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
         tab_ids.extend(self.graveyard.iter().map(|entry| entry.tab.id));
+        tab_ids.extend(ws_preview_tabs.iter().map(|&(workspace, tab)| self.wins[self.cur].workspaces[workspace].tabs[tab].id));
         gpu.ensure_previews(&tab_ids, (w, h));
         for (i, damage) in damage_events {
             gpu.damage_terminal(i, &damage);
@@ -2633,7 +2711,7 @@ impl App {
                 self.cell_h,
                 // Adwaita's selection blue, at the alpha terminals like VTE use
                 // for an overlay rather than a colour swap.
-                { let c = self.config.selection_color.to_f32(); [c[0], c[1], c[2], 0.35] },
+                { let c = self.config.adjust_terminal_color(self.config.selection_color.to_f32()); [c[0], c[1], c[2], 0.35] },
             );
         }
         if let Some((cx, cy)) = frame.cursor {
@@ -2712,7 +2790,7 @@ impl App {
                 prompt_y,
                 w as f32,
                 self.cell_h,
-                [self.bg[0], self.bg[1], self.bg[2], 1.0],
+                [frame.bg[0], frame.bg[1], frame.bg[2], 1.0],
             );
             let prompt = format!("  {}", self.wins[self.cur].notice.as_ref().unwrap().0);
             {
@@ -2731,9 +2809,9 @@ impl App {
                     scale: 1.0,
                     bounds,
                     default_color: glyphon::Color::rgb(
-                        (self.fg[0] * 255.0) as u8,
-                        (self.fg[1] * 255.0) as u8,
-                        (self.fg[2] * 255.0) as u8,
+                        (frame.fg[0] * 255.0) as u8,
+                        (frame.fg[1] * 255.0) as u8,
+                        (frame.fg[2] * 255.0) as u8,
                     ),
                     custom_glyphs: &[],
                 });
@@ -2802,7 +2880,7 @@ impl App {
                         &fd.bg,
                         &self.config.tablist_background.to_f32(),
                         &selection,
-                        self.config.selection_color.to_f32(),
+                        self.config.adjust_terminal_color(self.config.selection_color.to_f32()),
                         bg_a,
                         self.cell_w,
                         self.cell_h,
@@ -2817,12 +2895,20 @@ impl App {
             // The graveyard panel keeps its previews live through the same
             // batched pipeline; the list is short by construction (limit),
             // and nothing is built while the panel is closed.
-            if self.wins[self.cur].egui.as_ref()
-                .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Graveyard))
             {
-                for gi in 0..g {
-                    let i = n + gi;
-                    let fd = &grave_frames[gi];
+                let grave_open = self.wins[self.cur].egui.as_ref()
+                    .is_some_and(|e| e.ui_state.panel_is(egui_ui::RightPanel::Graveyard));
+                let mut workspace_built = 0;
+                for pi in 0..g + ws_preview_tabs.len() {
+                    let parked = pi >= g;
+                    if !parked && !grave_open { continue; }
+                    let i = n + pi;
+                    let (tab, fd) = if parked {
+                        let (workspace, ti) = ws_preview_tabs[pi - g];
+                        (&self.wins[self.cur].workspaces[workspace].tabs[ti], &ws_preview_frames[pi - g])
+                    } else {
+                        (&self.graveyard[pi].tab, &grave_frames[pi])
+                    };
                     let style = TerminalStyle {
                         tab_id: tab_ids[i], size: (w, h), cell: (self.cell_w, self.cell_h), strip_h,
                         fg: fd.fg, bg: fd.bg, cursor_color: fd.cursor_color,
@@ -2831,14 +2917,16 @@ impl App {
                     if gpu.prev_styles[i].as_ref() != Some(&style) {
                         gpu.prev_damage[i] = Damage::full();
                     }
-                    let images = self.image_quads_for(&self.graveyard[gi].tab, &mut gpu, strip_h, w);
+                    let images = self.image_quads_for(tab, &mut gpu, strip_h, w);
                     gpu.update_overlays(i, gpu::TerminalOverlays {
                         images: images.clone(), ..Default::default()
                     }, self.wins[self.cur].rows, self.cell_h, strip_h);
                     if gpu.prev_damage[i].is_empty() { continue; }
                     let throttled = gpu.prev_revision[i] != 0
                         && now.duration_since(gpu.prev_last[i]) < std::time::Duration::from_millis(200);
-                    if throttled || built >= 2 { continue; }
+                    if parked {
+                        if workspace_built >= 2 { continue; }
+                    } else if throttled || built >= 2 { continue; }
                     let damage = std::mem::take(&mut gpu.prev_damage[i]);
                     gpu.prev_styles[i] = Some(style);
                     let metrics = gpu.pool[0].metrics();
@@ -2867,7 +2955,7 @@ impl App {
                             &fd.bg,
                             &self.config.tablist_background.to_f32(),
                             &[],
-                            self.config.selection_color.to_f32(),
+                            self.config.adjust_terminal_color(self.config.selection_color.to_f32()),
                             bg_a,
                             self.cell_w,
                             self.cell_h,
@@ -2877,7 +2965,7 @@ impl App {
                             h,
                         ),
                     });
-                    built += 1;
+                    if parked { workspace_built += 1; } else { built += 1; }
                 }
             }
         }
@@ -2948,7 +3036,7 @@ impl App {
         // Downsample rendered previews on the GPU; egui samples the same
         // persistent textures. No map_async, CPU wait, or re-upload is needed.
         if self.wins[self.cur].egui.is_some() {
-            let ids: Vec<_> = self.wins[self.cur].tabs.iter().map(|tab| tab.id).collect();
+            let ids: Vec<_> = self.wins[self.cur].all_tabs().map(|tab| tab.id).collect();
             // Renderer registrations must be freed along with closed/moved tabs.
             let mut thumbs = std::mem::take(&mut self.wins[self.cur].sw_thumbs);
             let renderer = &mut self.wins[self.cur].egui.as_mut().unwrap().renderer;
@@ -2957,6 +3045,9 @@ impl App {
                 if !keep { renderer.free_texture(&thumb.handle); }
                 keep
             });
+            for thumb in &mut thumbs {
+                if !tab_ids[..n].contains(&thumb.tab_id) { thumb.revision = 0; }
+            }
             let term_h = ((h as f32) - strip_h).max(1.0);
             let (ptw, pth) = egui_ui::thumbnail_size(w as f32 / self.scale.max(1.0), w as f32 / term_h,
                 self.config.tab_overview_scale);
@@ -2964,13 +3055,16 @@ impl App {
             let mut updated = 0;
             let mut thumbnail_order = preview_order.clone();
             if !thumbnail_order.contains(&active) { thumbnail_order.insert(0, active); }
+            thumbnail_order.extend((0..ws_preview_tabs.len()).map(|pi| n + g + pi));
             for &i in &thumbnail_order {
-                if updated >= 2 { break; }
+                if i < n && updated >= 2 { continue; }
                 let revision = gpu.prev_revision.get(i).copied().unwrap_or(0);
                 if revision == 0 { continue; }
-                let id = ids[i];
+                let id = tab_ids[i];
                 let old = thumbs.iter().position(|t| t.tab_id == id);
-                if old.is_some_and(|at| thumbs[at].pixels == (tw, th) && thumbs[at].revision == revision) { continue; }
+                // A temporary parked target can start again at revision one.
+                // Its content is fresh even when the old small texture had that revision.
+                if i < n && old.is_some_and(|at| thumbs[at].pixels == (tw, th) && thumbs[at].revision == revision) { continue; }
                 let old_texture = old.map(|at| &thumbs[at].texture);
                 let Some(texture) = gpu.thumbnail(i, strip_h as u32, (tw, th), old_texture) else { continue; };
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2982,7 +3076,7 @@ impl App {
                     renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear)
                 };
                 let thumb = SwThumb { tab_id: id, handle, texture, size: (ptw.round() as u32, pth.round() as u32),
-                    pixels: (tw, th), revision };
+                    pixels: (tw, th), revision: if i < n { revision } else { 0 } };
                 if let Some(at) = old { thumbs[at] = thumb; } else { thumbs.push(thumb); }
                 updated += 1;
             }
@@ -3089,6 +3183,22 @@ impl App {
                 self.cur = index;
                 line
             } else { spec.as_str() };
+            if let Some(coords) = line.strip_prefix("click:") {
+                if let Some((x, y)) = coords.split_once(',').and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?))) {
+                    let pos = egui::pos2(x, y);
+                    let win = &mut self.wins[self.cur];
+                    let scale = win.egui.as_ref().map_or(1.0, |e| e.ctx.pixels_per_point());
+                    win.pointer = (x * scale, y * scale);
+                    win.fifo_egui_events.push(egui::Event::PointerMoved(pos));
+                    for pressed in [true, false] {
+                        win.fifo_egui_events.push(egui::Event::PointerButton {
+                            pos, button: egui::PointerButton::Primary, pressed,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+                continue;
+            }
             if line == "spy" {
                 // Test hook: dump tab state
                 let state: Vec<String> = self.wins[self.cur].
@@ -3135,7 +3245,7 @@ impl App {
                     .and_then(|e| e.ui_state.ws_sel)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "-".into());
-                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {} workspace={} switcher={} panel={} sel={}", self.wins[self.cur].active, surf, cursor, state.join(","), ren, self.wins[self.cur].workspace, self.wins[self.cur].overview.is_some(), panel, sel);
+                log::info!("SPY active={} surf={} cursor=[{}] tabs=[{}] {} workspace={} switcher={} panel={} sel={} window={} windows={} menu={}", self.wins[self.cur].active, surf, cursor, state.join(","), ren, self.wins[self.cur].workspace, self.wins[self.cur].overview.is_some(), panel, sel, self.cur + 1, self.wins.len(), self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open));
                 continue;
             }
             if line == "switcher" {
@@ -3935,14 +4045,7 @@ impl App {
         let Some(tab) = self.wins[self.cur].tabs.get(self.wins[self.cur].active) else {
             return;
         };
-        let (flags, app_cursor) = {
-            let term = tab.term.lock();
-            let m = *term.mode();
-            (
-                kitty_kb::active_flags(&m),
-                m.contains(alacritty_terminal::term::TermMode::APP_CURSOR),
-            )
-        };
+        let flags = kitty_kb::active_flags(tab.term.lock().mode());
         if flags == 0 {
             return;
         }
@@ -3955,7 +4058,6 @@ impl App {
             repeat: false,
             mods: self.modifiers,
             flags,
-            app_cursor,
         }) {
             if !bytes.is_empty() {
                 tab.write(&bytes);
@@ -4121,7 +4223,6 @@ impl App {
                     repeat: ke.repeat,
                     mods: self.modifiers,
                     flags: kb_flags,
-                    app_cursor,
                 })
                 .or_else(|| key_bytes(key, self.modifiers, app_cursor)),
                 None => key_bytes(key, self.modifiers, app_cursor),
@@ -4230,7 +4331,16 @@ impl App {
     /// business: with the panel open they mean "move the check mark" and
     /// "go there", and a workspace switch is reversible with the same key.
     fn ws_wants_key(&self, key: &Key) -> bool {
+        // Explicit search focus owns typing; workspace shortcuts stay global.
+        let editing = self.wins[self.cur].egui.as_ref().is_some_and(|e| {
+            e.ui_state.ws_search_open && e.ctx.memory(|m| m.focused())
+                .is_some_and(|id| egui::text_edit::TextEditState::load(&e.ctx, id).is_some())
+        });
+        if editing {
+            return !Self::is_panel_action(self.action_for(key, None, false).as_deref().unwrap_or_default());
+        }
         Self::is_grave_nav_key(key) || matches!(key, Key::Named(NamedKey::Enter))
+            || (self.modifiers.control_key() && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("f")))
     }
 
     /// The panel's own keys. Navigation is always its; the commit keys
@@ -4388,9 +4498,48 @@ impl App {
         handled
     }
 
+    fn select_window(&mut self, id: WindowId) -> bool {
+        if let Some(index) = self.wins.iter().position(|w| w.window.as_ref().is_some_and(|w| w.id() == id)) {
+            self.cur = index;
+            true
+        } else { false }
+    }
+
+    /// Menu results belong to the window that queued them, even when another
+    /// window's redraw is the first opportunity to execute the deferred work.
+    fn drain_window_actions(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some((window, action)) = self.pending_action.take() {
+            if self.select_window(window) { self.do_action(&action, event_loop); }
+        }
+        if let Some((window, target)) = self.pending_move.take() {
+            if !self.select_window(window) { return; }
+            let from = self.cur;
+            let idx = self.wins[from].active;
+            if target == usize::MAX {
+                self.make_window(event_loop, None, None, false);
+                let to = self.wins.len() - 1;
+                self.move_tab(from, idx, to, 0, event_loop);
+            } else if target < self.wins.len() && target != from {
+                let insert = self.wins[target].tabs.len();
+                self.move_tab(from, idx, target, insert, event_loop);
+            }
+        }
+    }
+
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let n = self.wins[self.cur].tabs.len();
         match action {
+            a if a.starts_with("workspace_tab_") => {
+                if let Some((workspace, id)) = a["workspace_tab_".len()..].split_once('_')
+                    && let (Ok(workspace), Ok(id)) = (workspace.parse::<usize>(), id.parse::<usize>())
+                    && self.config.workspaces_enabled && workspace < WORKSPACES {
+                    self.switch_workspace(workspace);
+                    let win = &mut self.wins[self.cur];
+                    if let Some(index) = win.tabs.iter().position(|tab| tab.id == id) {
+                        win.active = index;
+                    }
+                }
+            }
             a if a.starts_with("goto_workspace_") => {
                 if let Ok(target) = a["goto_workspace_".len()..].parse::<usize>() {
                     self.switch_workspace(target);
@@ -4612,7 +4761,7 @@ impl App {
                 }
             }
             "send_tab_new_window" => {
-                self.pending_move = Some(usize::MAX);
+                self.pending_move = self.wins[self.cur].window.as_ref().map(|w| (w.id(), usize::MAX));
                 for w in self.window_slot.lock().unwrap().iter() {
                     w.request_redraw();
                 }
@@ -4735,25 +4884,9 @@ impl App {
     }
 }
 
-/// Local HH:MM. `std::time` has no calendar/local conversion, and pulling in a
-/// date-time crate for a two-number clock label is not worth it.
-fn local_hhmm() -> (u32, u32) {
-    // SAFETY: `time` accepts null; `localtime_r` writes the caller's own tm and
-    // is the thread-safe variant (unlike `localtime`).
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        (
-            tm.tm_hour.max(0) as u32,
-            tm.tm_min.max(0) as u32,
-        )
-    }
-}
-
 /// Local HH:MM:SS for a unix timestamp (the history panel's clocks).
 fn local_hms(secs: i64) -> String {
-    // SAFETY: as in `local_hhmm` - `localtime_r` writes the caller's tm.
+    // SAFETY: `localtime_r` writes the caller's own tm and is thread-safe.
     unsafe {
         let t = secs as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
@@ -4974,9 +5107,9 @@ impl App {
                         Window::default_attributes()
                             .with_inner_size(size)
                             .with_maximized(self.config.default_maximize)
-                            // Only worth requesting when we will use it: an
-                            // ARGB visual costs the compositor a second blend.
-                            .with_transparent(self.config.term_transparency > 0.0)
+                            // Reserve an alpha-capable visual even when starting
+                            // opaque: X11 cannot change the visual after creation.
+                            .with_transparent(true)
                             .with_title("mypixels")
                             // Compositor identity: this is the wayland app_id
                             // (and the X11 WM_CLASS), which the original set
@@ -5023,6 +5156,8 @@ impl App {
                 sw_thumbs: Vec::new(),
                 grave_thumbs: Vec::new(),
                 thumb_rr: 0,
+                ws_preview_rr: 0,
+                ws_preview_next: Instant::now(),
                 preview_next: Instant::now(),
                 repaint_at: None,
                 autoscroll_next: None,
@@ -5743,14 +5878,6 @@ fn key_bytes(k: &Key, mods: ModifiersState, app_cursor: bool) -> Option<Vec<u8>>
             esc(format!("[{n}~").as_bytes())
         }
     };
-    // `ESC [ 1;<m> <fin>` for the lettered ones (arrows, Home/End, F1-F4).
-    let csi1 = |fin: u8| -> Vec<u8> {
-        if mcode > 1 {
-            esc(format!("[1;{mcode}{fin}").as_bytes())
-        } else {
-            vec![0x1b, b'[', fin]
-        }
-    };
     match k {
         Key::Character(c) => {
             if ctrl {
@@ -5941,10 +6068,7 @@ impl ApplicationHandler for App {
         // for" via `cur`. Events for windows we do not know (one just
         // closed, or a stray) are dropped -- there is nothing correct left
         // to do with them.
-        match self.wins.iter().position(|w| w.window.as_ref().is_some_and(|win| win.id() == id)) {
-            Some(i) => self.cur = i,
-            None => return,
-        }
+        if !self.select_window(id) { return; }
         let Some(window) = self.wins[self.cur].window.clone() else {
             return;
         };
@@ -6043,14 +6167,8 @@ impl ApplicationHandler for App {
             },
             WindowEvent::RedrawRequested => {
                 // This frame belongs to the window that asked for it. The
-                // drains below may open a window and switch `cur` to it
-                // (session requests, pending actions and moves); drawing
-                // with the switched `cur` would render the newcomer's state
-                // into THIS window's surface and desync this window's
-                // frame-callback bookkeeping in winit -- the exact recipe
-                // for a window that stops drawing forever. Draw for the
-                // original window, then hand `cur` to the newcomer.
-                let frame_win = self.cur;
+                // Deferred work can change the selected window. Restore this
+                // event's WindowId before touching any per-window state.
                 self.check_theme_files();
                 self.drain_clipboard();
                 self.drain_bell_pings();
@@ -6063,21 +6181,8 @@ impl ApplicationHandler for App {
                 self.drain_test_keys(event_loop);
                 self.drain_session_requests(event_loop);
                 self.apply_pending_grave();
-                if let Some(action) = self.pending_action.take() {
-                    self.do_action(&action, event_loop);
-                }
-                if let Some(target) = self.pending_move.take() {
-                    let from = self.cur;
-                    let idx = self.wins[from].active;
-                    if target == usize::MAX {
-                        self.make_window(event_loop, None, None, false);
-                        let to = self.wins.len() - 1;
-                        self.move_tab(from, idx, to, 0, event_loop);
-                    } else if target < self.wins.len() && target != from {
-                        let insert = self.wins[target].tabs.len();
-                        self.move_tab(from, idx, target, insert, event_loop);
-                    }
-                }
+                self.drain_window_actions(event_loop);
+                if !self.select_window(id) { return; }
                 // Open the Alt-held switcher if the clock asked and Alt is
                 // still held (guards against the press/release race).
                 if self.switcher_show_req.swap(false, Ordering::SeqCst)
@@ -6162,25 +6267,13 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                // The drains may have moved `cur` (new window from a session
-                // request, a pending action); the frame itself still belongs
-                // to the window that requested it. If a drain closed that
-                // window, the frame request is moot.
-                let wanted_cur = self.cur;
-                if frame_win >= self.wins.len() {
-                    self.cur = wanted_cur.min(self.wins.len().saturating_sub(1));
-                    return;
-                }
-                self.cur = frame_win;
+                if !self.select_window(id) { return; }
                 // Draw unconditionally: winit only sends RedrawRequested when a
                 // frame is actually wanted (our own request_redraw, resize, or
                 // compositor damage). A hand-rolled damage flag here would have
                 // to be remembered by every caller -- and silently swallow
                 // frames for the ones that didn't (e.g. the cursor blink).
                 self.draw(&window);
-                if wanted_cur < self.wins.len() && wanted_cur != frame_win {
-                    self.cur = wanted_cur;
-                }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 let px = position.x as f32;
@@ -6435,9 +6528,12 @@ impl ApplicationHandler for App {
                                         return;
                                     }
                                     None => {
+                                        // Creating the destination changes `cur`.
+                                        // The dragged terminal still belongs to the source.
+                                        let from = self.cur;
                                         self.make_window(event_loop, None, None, false);
                                         let to = self.wins.len() - 1;
-                                        self.move_tab(self.cur, idx, to, 0, event_loop);
+                                        self.move_tab(from, idx, to, 0, event_loop);
                                         return;
                                     }
                                     _ => {}
@@ -6661,22 +6757,8 @@ impl ApplicationHandler for App {
     }
 }
 
-/// TEMPORARY compensation for the difference between our one alpha stage and the
-/// original's, applied by default; `MYPIXELS_TRANSPARENCY` (or the deprecated
-/// `MYPIXELS_OPACITY`) replaces it outright.
-///
-/// Two readings from the user, at the values actually used:
-///   transparency 0.1 -> ours too dark (needs to be more see-through)
-///   transparency 0.6 -> ours too transparent (needs to be less see-through)
-/// The first wants eff > x, the second eff < x, so the correction must cross and
-/// no constant or scale factor can do it. Modelled as a bump that ramps in over
-/// the first tenth and a flatter slope above it:
-///   eff = 0.75*x + 0.105*min(1, x/0.1)
-/// which gives 0.18 at 0.1 and 0.555 at 0.6, is continuous, monotone, and 0 at 0
-/// so an opaque config stays opaque. That is curve-fitting, not a derivation --
-/// the likely real cause is that VTE composites its *text* inside the translucent
-/// layer as well, which lifts the whole appearance rather than the background.
-/// Re-check after the window/tint layer is modelled; then keep or delete this.
+/// Transparency is the fraction of the background that shows through.
+/// The environment override retains the old diagnostic escape hatch.
 fn effective_transparency(cfg: f32) -> f32 {
     static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     let over = *OVERRIDE.get_or_init(|| {
@@ -6684,13 +6766,13 @@ fn effective_transparency(cfg: f32) -> f32 {
             .or_else(|_| std::env::var("MYPIXELS_OPACITY"))
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0))
     });
     if let Some(v) = over {
         return v;
     }
-    let x = cfg.clamp(0.0, 1.0);
-    (0.75 * x + 0.105 * (x / 0.1).min(1.0)).clamp(0.0, 1.0)
+    cfg.clamp(0.0, 1.0)
 }
 
 /// Report what this compositor + driver pair will actually do with our alpha,
@@ -6698,7 +6780,18 @@ fn effective_transparency(cfg: f32) -> f32 {
 /// mapped and the desktop is undisturbed -- which matters because the answer
 /// differs per backend, per driver and per compositor, and cannot be settled by
 /// reading their sources.
-fn alpha_probe(event_loop: &EventLoop<()>) {
+struct AlphaProbe;
+
+impl ApplicationHandler for AlphaProbe {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        alpha_probe(event_loop);
+        event_loop.exit();
+    }
+
+    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+}
+
+fn alpha_probe(event_loop: &ActiveEventLoop) {
     let window = std::sync::Arc::new(
         event_loop
             .create_window(
@@ -6774,8 +6867,7 @@ pub fn build_stamp() -> String {
         Some((git, secs)) => {
             let secs: u64 = secs.parse().unwrap_or_default();
             let (h, m) = {
-                let mut t = secs % 86400;
-                if t < 0 { t += 86400; }
+                let t = secs % 86400;
                 (t / 3600 % 24, t / 60 % 60)
             };
             let d = secs / 86400;
@@ -6886,7 +6978,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
     }
     let event_loop = EventLoop::new().expect("event loop");
     if std::env::args().any(|a| a == "--alpha-probe") {
-        alpha_probe(&event_loop);
+        event_loop.run_app(&mut AlphaProbe).expect("alpha probe");
         return;
     }
     let mut app = App::new();
@@ -6962,6 +7054,24 @@ mod preview_tests {
 mod palette_tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+
+    #[test]
+    fn brightness_adjusts_resolved_ansi_truecolor_and_runtime_overrides_once() {
+        let mut colors = alacritty_terminal::term::color::Colors::default();
+        colors[1] = Some(Rgb { r: 64, g: 96, b: 128 });
+        let palette = Palette::from_colors(&colors, &Some([config::Rgb(20, 30, 40); 16]));
+        let equivalent = [Color::Spec(Rgb { r: 64, g: 96, b: 128 }), Color::Indexed(1), Color::Named(NamedColor::Red)];
+        let mut cfg = Config::default();
+        for brightness in [-40.0, 0.0, 40.0] {
+            cfg.terminal_brightness = brightness;
+            let adjust = |color| cfg.adjust_terminal_color(palette.resolve_with(&color, [0.5; 3], [0.2; 3], [0.6; 3]));
+            for color in equivalent {
+                assert_eq!(adjust(color), cfg.adjust_terminal_color([64.0 / 255.0, 96.0 / 255.0, 128.0 / 255.0]));
+            }
+            assert_eq!(adjust(Color::Named(NamedColor::Background)), cfg.adjust_terminal_color([0.2; 3]));
+            assert_eq!(adjust(Color::Named(NamedColor::Foreground)), cfg.adjust_terminal_color([0.5; 3]));
+        }
+    }
 
     #[test]
     fn osc_overrides_use_the_same_slots_for_named_and_indexed_colors() {
@@ -7097,7 +7207,7 @@ mod tests {
         // band = 2.2 cells deep: grazing its far edge drifts one line...
         assert_eq!(App::autoscroll_tick(58.0, 24.0, 400.0, 16.0), Some((1, 1)));
         // ...mid-band travels two...
-        assert_eq!(App::autoscroll_tick(32.0, 24.0, 400.0, 16.0), Some((2, 2)).map(|(a, b)| (1, b)));
+        assert_eq!(App::autoscroll_tick(32.0, 24.0, 400.0, 16.0), Some((2, 2)).map(|(_, b)| (1, b)));
         // ...and the grid edge itself (a full band of depth) three.
         assert_eq!(App::autoscroll_tick(24.0, 24.0, 400.0, 16.0), Some((1, 3)));
         // Past it (the strip zone, or the window's own border) keeps ramping.

@@ -67,6 +67,16 @@ Features
   retain title tooltips and can be closed by middle-click or the close shortcut.
 * Partial terminal redraws from Alacritty damage, into persistent per-tab GPU
   textures shared by the live window, previews, and image export.
+* Optional compact tabs in Settings → Tabs → Tab bar (`compact_tabs: true`).
+  Reduced padding and strip height keep the same typography, workspace colors,
+  and close controls. The default spacing is unchanged.
+* Terminal brightness in Settings → Appearance → Theme & colors
+  (`terminal_brightness: -100` through `100`). `0` preserves the palette;
+  negative percentages darken terminal colors and positive percentages brighten
+  them. The theme and interface colors stay intact.
+* Animation speed in Settings → Appearance → Motion. `1×` keeps the default
+  timing, `0.25×`–`4×` changes UI transition speed, and `0` turns animations off.
+  Changes preview live; Save persists `animation_speed` in the configuration.
 * Workspaces - opt-in (`workspaces_enabled: true`; Settings → Navigation →
   Workspaces). Off by default, in which case the workspace bindings and the
   tab-bar button are inert and tabs keep their normal color. When on,
@@ -79,9 +89,17 @@ Features
   and keep their terminals running. Visiting an empty workspace opens its
   first terminal. The workspace number beside the terminal icon, ruled off from
   the icon and the tabs and drawn in its own colour, opens the workspace panel:
-  all ten slots in their own colours, each with its tab count, the caption of
-  its front tab, and the chord that jumps to it. Click a row or press Enter to go; the panel stays open so you
-  can hop, and Esc closes it. `show_workspaces` is its action, shipped unbound
+  cards in their own colours, with tab counts and live terminal previews.
+  The selected card expands; click a preview to open that exact tab. Each view
+  scrolls to its focused tab, with left/right buttons when more cards are available.
+  Up/Down select a workspace and Enter switches to it. Left/Right focus the
+  previous/next tab, without wrapping; overflow buttons do the same. The preview
+  strip animates to reveal the focused tab when needed. Search (or Ctrl+F) finds workspaces by
+  number, genre or tab title; the filter hides empty slots, and + opens the next
+  empty workspace. The panel stays open as you switch. Esc closes search first,
+  then the panel. Optional genres live in Settings → Navigation → Workspaces
+  (`workspace_genre_1` through `workspace_genre_10`); they describe a purpose,
+  independent of terminal directories. `show_workspaces` is its action, shipped unbound
   so it collides with nothing, and bindable in Settings → Keys. Closing a workspace's last tab
   returns to another populated workspace; closing the window's final tab
   closes the window. Bindings are configurable as `goto_workspace_0` through

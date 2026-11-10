@@ -5,7 +5,7 @@
 //! retain their own keyboard behavior. The app routes terminal keys directly.
 
 use egui::{Context, FullOutput, ViewportId};
-use crate::ui_style::{TermStyle, Icon, text, text_right, text_width, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row, action_row_tinted};
+use crate::ui_style::{TermStyle, Icon, text, text_right, text_width, icon as draw_icon, icon_button, icon_button_faded, actions, section, form_grid, rgb_c32, preview_image, action_row};
 
 /// The egui side of the app: context, winit event state and the wgpu
 /// renderer that paints egui's tessellation.
@@ -143,6 +143,12 @@ pub struct UiState {
     pub ws_rows: Vec<WsRow>,
     pub ws_sel: Option<usize>,
     pub ws_out: Option<usize>,
+    pub ws_tab_out: Option<(usize, usize)>,
+    pub ws_query: String,
+    pub ws_search_open: bool,
+    pub ws_populated_only: bool,
+    pub ws_collapsed: Option<usize>,
+    pub ws_visible_tabs: Vec<usize>,
     pub grave_rows: Vec<GraveRow>,
     pub grave_sel: Option<usize>,
     pub grave_out: Option<(usize, String)>,
@@ -173,9 +179,6 @@ pub enum RightPanel {
     Settings,
 }
 
-/// One buried tab, as the graveyard panel displays it. Every field is
-/// precomputed by the app (rebuilt every frame while the panel is open),
-/// so the panel never touches a terminal, a pty, or a codec.
 /// One workspace, as the panel displays it. The app precomputes every field
 /// each frame the panel is open, so the panel never walks a window's tab
 /// lists and never touches a terminal.
@@ -186,6 +189,8 @@ pub struct WsRow {
     pub count: usize,
     /// Caption of the workspace's selected tab, empty when it holds none.
     pub title: String,
+    pub genre: String,
+    pub tabs: Vec<WsTab>,
     /// The workspace this window is looking at right now.
     pub current: bool,
     /// The chord that jumps here, read from the live config so the panel can
@@ -193,6 +198,15 @@ pub struct WsRow {
     pub shortcut: String,
 }
 
+#[derive(Clone)]
+pub struct WsTab {
+    pub id: usize,
+    pub title: String,
+    pub selected: bool,
+    pub preview: Option<(egui::TextureId, (u32, u32))>,
+}
+
+/// One buried tab, precomputed by the app while the graveyard panel is open.
 #[derive(Clone)]
 pub struct GraveRow {
     pub id: usize,
@@ -212,9 +226,8 @@ impl UiState {
     /// Sidebars are passive until an editor is explicitly focused. Merely
     /// opening a panel or clicking one of its buttons never claims typing.
     pub fn owns_keyboard(&self, ctx: &egui::Context) -> bool {
-        // The graveyard and workspace panels drive their lists with arrows and
-        // Enter and have no editor of their own, so they own the keys outright
-        // (like the menus).
+        // The list panels own navigation like menus; the app also routes
+        // typing to the workspace search while its editor has focus.
         self.rename_open || self.menu_open || self.move_open || self.info_page.is_some()
             || self.key_capture.is_some()
             || matches!(self.right_panel, RightPanel::Graveyard | RightPanel::Workspaces)
@@ -461,7 +474,7 @@ pub fn move_pick_box(ui: &egui::Ui, st: &mut UiState) {
     let mut out: Option<Option<usize>> = None;
     let mut area = egui::Rect::NOTHING;
     egui::Window::new("move_tab_pick")
-        .id(egui::Id::new("move_tab_pick_box"))
+        .id(egui::Id::unique("move_tab_pick_box"))
         .title_bar(false)
         .movable(false)
         .resizable(false)
@@ -1181,11 +1194,19 @@ pub fn graveyard_panel(
         });
 }
 
-/// The workspace picker, as a side panel: the ten slots in their own colours,
-/// each showing how many tabs it holds and what the front one is, with the
-/// chord that jumps to it on the right. Same anatomy as the graveyard panel:
-/// header, one line of keys, a list of rows, and a detail card for the row the
-/// keyboard is on.
+/// Filter once for both keyboard navigation and the visible cards.
+fn visible_workspaces(st: &UiState) -> Vec<usize> {
+    let query = st.ws_query.trim().to_lowercase();
+    st.ws_rows.iter().filter(|row| {
+        (!st.ws_populated_only || row.count > 0)
+            && (query.is_empty()
+                || format!("Workspace {} {} {}", row.index + 1, row.genre, row.title).to_lowercase().contains(&query)
+                || row.tabs.iter().any(|tab| tab.title.to_lowercase().contains(&query)))
+    }).map(|row| row.index).collect()
+}
+
+/// Workspace cards share the terminal UI's surfaces and identity colors. The
+/// keyboard selection expands in place; terminal wells are real GPU previews.
 pub fn workspaces_panel(
     ui: &mut egui::Ui,
     st: &mut UiState,
@@ -1194,145 +1215,323 @@ pub fn workspaces_panel(
     top: f32,
     colors_ws: &[egui::Color32],
 ) {
-    if !st.panel_is(RightPanel::Workspaces) {
-        st.ws_out = None;
-        return;
-    }
     st.ws_out = None;
+    st.ws_tab_out = None;
+    st.ws_visible_tabs.clear();
+    if !st.panel_is(RightPanel::Workspaces) { return; }
+    let ctx = ui.ctx().clone();
     if !st.menu_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        release_focus(ui.ctx());
-        st.close_panel(RightPanel::Workspaces);
+        release_focus(&ctx);
+        if st.ws_search_open {
+            st.ws_search_open = false;
+            st.ws_query.clear();
+        } else {
+            st.close_panel(RightPanel::Workspaces);
+        }
         return;
     }
     let colors = TermStyle::new(ui, ok, err);
-    let TermStyle { bg, fg, muted, border, accent, card, .. } = colors;
-    // Navigation belongs to the app's keyboard, which forwards to egui while
-    // this panel is the only surface.
-    let (nav, commit) = ui.input(|i| (
-        i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowDown),
-        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowRight),
-    ));
-    let count = st.ws_rows.len();
-    if nav && count > 0 {
-        let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-        let cur = st.ws_sel.unwrap_or(0).min(count - 1);
-        st.ws_sel = Some(if up { (cur + count - 1) % count } else { (cur + 1) % count });
-    }
-    if commit {
-        st.ws_out = st.ws_sel.filter(|s| *s < count);
-    }
+    let TermStyle { bg, fg, muted, border, accent, .. } = colors;
     let mut host = ui.max_rect();
     host.min.y = host.min.y.max(top);
-    host.min.x = (host.max.x - 380.0).max(host.min.x);
+    let width = (host.width() * 0.44).clamp(360.0, 600.0).min(host.width());
+    host.min.x = host.max.x - width;
     egui::Area::new(egui::Id::unique("mypixels_workspaces_area"))
-        .fixed_pos(host.min)
-        .order(egui::Order::Middle)
-        .fade_in(false)
-        .movable(false)
-        .constrain(false)
-        .show(ui.ctx(), |ui| {
+        .fixed_pos(host.min).order(egui::Order::Middle).fade_in(false)
+        .movable(false).constrain(false)
+        .show(&ctx, |ui| {
             ui.set_max_size(host.size());
-            egui::Frame::new().fill(bg).inner_margin(18.0).show(ui, |ui| {
-                ui.set_width((host.width() - 36.0).max(0.0));
-                ui.set_min_height((host.height() - 36.0).max(0.0));
+            egui::Frame::new().fill(bg).inner_margin(14.0).show(ui, |ui| {
+                ui.set_width((host.width() - 28.0).max(0.0));
+                ui.set_min_height((host.height() - 28.0).max(0.0));
+                colors.apply_controls(ui);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                let edge = ui.max_rect().left() - 18.0;
-                ui.painter().vline(edge, host.y_range(), egui::Stroke::new(1.0, border));
-                let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
-                draw_icon(ui.painter(), Icon::Layers, egui::pos2(header.left() + 14.0, header.center().y), fg);
-                text(
-                    ui,
-                    egui::Rect::from_min_max(
-                        egui::pos2(header.left() + 36.0, header.top()),
-                        egui::pos2(header.right() - 68.0, header.bottom()),
-                    ),
-                    &format!("Workspaces {}", st.ws_rows.iter().filter(|r| r.count > 0).count()),
-                    fg,
-                    16.0,
-                    true,
-                );
-                let close_rect = egui::Rect::from_center_size(
-                    egui::pos2(header.right() - 10.0, header.center().y),
-                    egui::vec2(30.0, 30.0),
-                );
-                if icon_button(ui, close_rect, Icon::Dismiss, "Close workspaces", &colors).clicked() {
+                ui.painter().vline(host.left(), host.y_range(), egui::Stroke::new(1.0, border));
+                let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
+                draw_icon(ui.painter(), Icon::Layers, egui::pos2(header.left() + 12.0, header.center().y), fg);
+                text(ui, header.with_min_x(header.left() + 32.0).with_max_x(header.left() + 140.0), "Workspaces", fg, 16.0, true);
+                let badge = egui::Rect::from_center_size(egui::pos2(header.left() + 150.0, header.center().y), egui::vec2(24.0, 23.0));
+                ui.painter().rect_filled(badge, 7.0, colors.card.lerp_to_gamma(fg, 0.07));
+                crate::ui_style::text_centered(ui, badge, &st.ws_rows.iter().filter(|row| row.count > 0).count().to_string(), fg, 12.0, true);
+                let control = |slot: f32| egui::Rect::from_center_size(
+                    egui::pos2(header.right() - 15.0 - slot * 31.0, header.center().y), egui::vec2(28.0, 28.0));
+                let search_key = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
+                let search_clicked = icon_button(ui, control(3.0), Icon::Search, "Search workspaces", &colors).clicked();
+                let focus_search = search_key || (search_clicked && !st.ws_search_open);
+                if search_clicked || search_key {
+                    st.ws_search_open = search_key || !st.ws_search_open;
+                    if !st.ws_search_open { st.ws_query.clear(); release_focus(&ctx); }
+                }
+                let mut filter_colors = colors;
+                if st.ws_populated_only { filter_colors.fg = accent; }
+                if icon_button(ui, control(2.0), Icon::Filter, "Show only populated workspaces", &filter_colors).clicked() {
+                    st.ws_populated_only = !st.ws_populated_only;
+                }
+                let empty = st.ws_rows.iter().find(|row| row.count == 0).map(|row| row.index);
+                let mut add_colors = colors;
+                if empty.is_none() { add_colors.fg = muted; }
+                if icon_button(ui, control(1.0), Icon::Plus,
+                    if empty.is_some() { "Open an empty workspace" } else { "All ten workspaces are in use" }, &add_colors).clicked()
+                    && let Some(index) = empty {
+                    st.ws_populated_only = false;
+                    st.ws_query.clear();
+                    st.ws_sel = Some(index);
+                    st.ws_collapsed = None;
+                    st.ws_out = Some(index);
+                }
+                if icon_button(ui, control(0.0), Icon::Dismiss, "Close workspaces", &colors).clicked() {
                     st.close_panel(RightPanel::Workspaces);
                 }
-                let hint = egui::Rect::from_min_size(
-                    egui::pos2(ui.cursor().left(), ui.cursor().top()),
-                    egui::vec2(ui.available_width(), 16.0),
-                );
-                text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter go \u{b7} Esc close", muted, 11.0, false);
-                ui.add_space(14.0);
-                // A workspace with no tabs is still a slot: the keyboard can
-                // walk onto it, and visiting it opens its first terminal.
-                // The detail card is part of the panel, not something below
-                // the fold: the list gets what is left after it, the same
-                // split the history panel makes between its list and preview.
-                // 72 card + 14 gap + 18 frame padding, or the last line lands
-                // off the bottom of the window.
-                let reserve = if st.ws_sel.is_some() { 104.0 } else { 0.0 };
-                egui::ScrollArea::vertical()
-                    .id_salt("workspaces_list")
-                    .auto_shrink([false, false])
-                    .max_height((ui.available_height() - reserve).max(120.0))
+                if st.ws_search_open {
+                    ui.add_space(8.0);
+                    let response = ui.add(egui::TextEdit::singleline(&mut st.ws_query)
+                        .id_salt("workspace_search").hint_text("Find a workspace, genre or tab…")
+                        .desired_width(ui.available_width()));
+                    if focus_search { response.request_focus(); }
+                    ui.add_space(6.0);
+                }
+                ui.add_space(8.0);
+                let visible = visible_workspaces(st);
+                let nav = ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowDown));
+                if !visible.contains(&st.ws_sel.unwrap_or(usize::MAX)) { st.ws_sel = visible.first().copied(); }
+                if nav && !visible.is_empty() {
+                    let cur = visible.iter().position(|index| Some(*index) == st.ws_sel).unwrap_or(0);
+                    let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                    st.ws_sel = Some(visible[if up { (cur + visible.len() - 1) % visible.len() } else { (cur + 1) % visible.len() }]);
+                    st.ws_collapsed = None;
+                }
+                let editing = ui.memory(|m| m.focused()).is_some_and(|id| egui::text_edit::TextEditState::load(&ctx, id).is_some());
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    st.ws_out = st.ws_sel;
+                }
+                if !editing {
+                    let left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+                    let right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
+                    if left != right
+                        && let Some(row) = st.ws_sel.and_then(|index| st.ws_rows.get(index))
+                        && let Some(id) = neighboring_workspace_tab(row, left) {
+                        st.ws_tab_out = Some((row.index, id));
+                        st.ws_collapsed = None;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Home)) { st.ws_sel = visible.first().copied(); }
+                    if ui.input(|i| i.key_pressed(egui::Key::End)) { st.ws_sel = visible.last().copied(); }
+                }
+                let scroll_selected = ctx.data_mut(|data| {
+                    let id = egui::Id::unique("workspace_selection_viewport");
+                    let value = (st.ws_sel, host.size());
+                    let changed = data.get_temp::<(Option<usize>, egui::Vec2)>(id) != Some(value);
+                    data.insert_temp(id, value);
+                    nav || changed
+                });
+                let footer_h = 25.0;
+                egui::ScrollArea::vertical().id_salt("workspaces_list")
+                    .auto_shrink([false, false]).max_height((ui.available_height() - footer_h).max(0.0))
                     .show(ui, |ui| {
-                        for row in &st.ws_rows {
-                            let index = row.index;
-                            let is_current = row.current;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+                        if visible.is_empty() {
+                            ui.add_space(32.0);
+                            ui.label(egui::RichText::new("No matching workspaces").color(muted));
+                        }
+                        for index in visible {
+                            let row = &st.ws_rows[index];
                             let selected = st.ws_sel == Some(index);
-                            if selected || is_current {
-                                colors.card_surface(ui.painter(), rect.shrink2(egui::vec2(0.0, 2.0)), selected, false);
-                            }
                             let color = colors_ws.get(index).copied().unwrap_or(accent);
-                            // The number is the workspace's identity, so it leads
-                            // the row: ten rows of colour alone are a memory test.
-                            let what = match row.count {
-                                0 => "empty".to_string(),
-                                1 => "1 tab".to_string(),
-                                n => format!("{n} tabs"),
-                            };
-                            let label = format!("Workspace {} \u{b7} {}", index + 1, what);
-                            let response = action_row_tinted(
-                                ui, rect, ui.scope_id().with(("ws_row", index)), &label, &row.shortcut,
-                                Some(if is_current { Icon::Check } else { Icon::Layers }), true, &colors, Some(color));
+                            let expanded = selected && row.count > 0 && st.ws_collapsed != Some(index);
+                            let tile_w = ((ui.available_width() - 40.0) / 3.0).clamp(100.0, 174.0);
+                            let tile_h = (tile_w * 0.60).clamp(64.0, 104.0);
+                            let height = if expanded { 68.0 + tile_h + 31.0 } else { 68.0 };
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+                            let heading = rect.with_max_y(rect.top() + 66.0);
+                            let response = ui.interact(heading.with_max_x(rect.right() - 29.0), ui.scope_id().with(("ws_row", index)), egui::Sense::click());
+                            let disclosure = ui.interact(heading.with_min_x(rect.right() - 29.0),
+                                ui.scope_id().with(("ws_disclosure", index)), egui::Sense::click());
+                            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Workspace {}, {} tabs, {}", index + 1, row.count, row.genre)));
+                            let hover = response.hovered() || disclosure.hovered();
+                            let fill = bg.lerp_to_gamma(color, if selected { 0.085 } else if hover { 0.055 } else { 0.015 });
+                            ui.painter().rect(rect, 11.0, fill, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
+                                if selected { color } else if hover { border.lerp_to_gamma(color, 0.45) } else { border }), egui::StrokeKind::Inside);
+                            let mark = egui::Rect::from_center_size(egui::pos2(rect.left() + 27.0, heading.center().y), egui::vec2(30.0, 32.0));
+                            crate::ui_style::text_centered(ui, mark, &(index + 1).to_string(), color, 20.0, true);
+                            let name_x = rect.left() + 53.0;
+                            let badge = egui::Rect::from_center_size(egui::pos2(rect.right() - 60.0, heading.center().y), egui::vec2(62.0, 24.0));
+                            ui.painter().rect_filled(badge, 12.0, fill.lerp_to_gamma(fg, 0.07));
+                            let count = if row.count == 0 { "Empty".into() } else { format!("{} tab{}", row.count, if row.count == 1 { "" } else { "s" }) };
+                            crate::ui_style::text_centered(ui, badge, &count, if row.count == 0 { muted } else { fg }, 11.0, false);
+                            let compact_start = (name_x + 142.0).min(badge.left() - 8.0);
+                            let name_right = if expanded { badge.left() - 8.0 } else { compact_start };
+                            text(ui, egui::Rect::from_min_max(egui::pos2(name_x, heading.top() + 10.0), egui::pos2(name_right, heading.top() + 31.0)),
+                                &format!("Workspace {}", index + 1), fg, 14.0, true);
+                            text(ui, egui::Rect::from_min_max(egui::pos2(name_x, heading.top() + 33.0), egui::pos2(name_right, heading.top() + 52.0)),
+                                if row.genre.is_empty() { &row.shortcut } else { &row.genre }, muted, 11.0, false);
+                            let chevron = egui::pos2(rect.right() - 14.0, heading.center().y);
+                            let points = if expanded { vec![chevron + egui::vec2(-4.0, -2.0), chevron + egui::vec2(0.0, 2.0), chevron + egui::vec2(4.0, -2.0)] }
+                                else { vec![chevron + egui::vec2(-2.0, -4.0), chevron + egui::vec2(2.0, 0.0), chevron + egui::vec2(-2.0, 4.0)] };
+                            ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.5, if selected { color } else { muted })));
+                            if row.current {
+                                ui.painter().circle_filled(egui::pos2(mark.right() - 1.0, mark.bottom() - 1.0), 2.5, color);
+                            }
+                            if !expanded {
+                                let space = badge.left() - compact_start - 10.0;
+                                if space >= 54.0 {
+                                    let w = ((space - 34.0) / 2.0).clamp(32.0, 86.0);
+                                    let strip = egui::Rect::from_min_size(egui::pos2(compact_start, heading.center().y - 20.0), egui::vec2(space, 40.0));
+                                    if let Some(id) = workspace_tab_strip(ui, strip, row, egui::vec2(w, 40.0), false, color, &colors, &mut st.ws_visible_tabs) {
+                                        st.ws_tab_out = Some((index, id));
+                                        release_focus(&ctx);
+                                    }
+                                }
+                            }
                             if response.clicked() {
                                 st.ws_sel = Some(index);
+                                st.ws_collapsed = None;
                                 st.ws_out = Some(index);
+                                release_focus(&ctx);
                             }
-                            response.on_hover_text(format!(
-                                "Workspace {} \u{b7} {} \u{b7} {}", index + 1,
-                                if row.count == 0 { "empty" } else { row.title.as_str() }, row.shortcut))
+                            if disclosure.clicked() {
+                                st.ws_sel = Some(index);
+                                st.ws_collapsed = if expanded { Some(index) } else { None };
+                                if row.count == 0 { st.ws_out = Some(index); }
+                                release_focus(&ctx);
+                            }
+                            disclosure.on_hover_text(if row.count == 0 { "Open workspace" } else if expanded { "Collapse workspace" } else { "Expand workspace" })
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            response.on_hover_text(format!("Workspace {} · {}\n{}\n{}", index + 1,
+                                if row.genre.is_empty() { "No genre" } else { &row.genre }, row.title, row.shortcut))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if expanded {
+                                let preview_rect = egui::Rect::from_min_max(rect.min + egui::vec2(12.0, 64.0), rect.max - egui::vec2(12.0, 8.0));
+                                if let Some(id) = workspace_tab_strip(ui, preview_rect, row, egui::vec2(tile_w, tile_h), true, color, &colors, &mut st.ws_visible_tabs) {
+                                    st.ws_tab_out = Some((index, id));
+                                    release_focus(&ctx);
+                                }
+                            }
+                            if scroll_selected && selected { ui.scroll_to_rect(rect, Some(egui::Align::Center)); }
+                            ui.add_space(8.0);
                         }
                     });
-                if let Some(index) = st.ws_sel.filter(|i| *i < count) {
-                    let row = &st.ws_rows[index];
-                    ui.add_space(14.0);
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), egui::Sense::hover());
-                    ui.painter().rect(rect, 9.0, card, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
-                    let left = rect.left() + 13.0;
-                    text(ui, egui::Rect::from_min_max(
-                        egui::pos2(left, rect.top() + 8.0),
-                        egui::pos2(rect.right() - 12.0, rect.top() + 30.0),
-                    ), &format!("Workspace {}", index + 1), fg, 15.0, true);
-                    // The chord is not repeated here: every row already shows its
-                    // own on the right, and a third line pushed this card off the
-                    // bottom of the window.
-                    for (i, (label, value)) in [
-                        ("Holds", if row.count == 0 { "nothing".into() } else { format!("{} tab{}", row.count, if row.count == 1 { "" } else { "s" }) }),
-                        ("Front", if row.title.is_empty() { "\u{2014}".into() } else { row.title.clone() }),
-                    ].into_iter().enumerate() {
-                        let y = rect.top() + 32.0 + i as f32 * 20.0;
-                        let line = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(rect.width() - 26.0, 20.0));
-                        text(ui, line.with_max_x(left + 64.0), label, muted, 13.0, false);
-                        text(ui, line.with_min_x(left + 68.0), &value, fg, 13.0, false);
-                    }
-                }
+                ui.add_space(7.0);
+                let (hint, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+                text(ui, hint, "↑↓ workspace · ←→ tab · Enter go · Esc close", muted, 10.0, false);
             });
         });
+    // The panel is a live view, including terminals parked in other workspaces.
+    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+}
+
+#[derive(Clone, Default)]
+struct WorkspaceStripState {
+    focus: Option<(usize, usize)>,
+    count: usize,
+    width: f32,
+    last_frame: Option<u64>,
+}
+
+/// A workspace keeps its own scroll position in each presentation. Follow its
+/// focused terminal when focus/layout changes or the view opens; otherwise let
+/// the user browse freely with the wheel or trackpad. Focus changes only move
+/// the viewport when the newly focused card would otherwise be clipped.
+fn workspace_tab_strip(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    row: &WsRow,
+    tile: egui::Vec2,
+    expanded: bool,
+    color: egui::Color32,
+    colors: &TermStyle,
+    visible_tabs: &mut Vec<usize>,
+) -> Option<usize> {
+    let gap = if expanded { 8.0 } else { 6.0 };
+    let pitch = tile.x + gap;
+    let content_width = row.tabs.len() as f32 * pitch - gap;
+    let overflow = content_width > rect.width() + 0.5;
+    let gutter = if !overflow { 0.0 } else if expanded { 24.0 } else if rect.width() < 70.0 { 10.0 } else { 14.0 };
+    let viewport = rect.shrink2(egui::vec2(gutter, 0.0));
+    let id = egui::Id::unique("workspace_tab_strip").with((row.index, expanded));
+    let focus = row.tabs.iter().enumerate().find(|(_, tab)| tab.selected).map(|(index, tab)| (tab.id, index));
+    let frame = ui.ctx().cumulative_frame_nr();
+    let mut state = ui.ctx().data_mut(|data| data.get_temp::<WorkspaceStripState>(id).unwrap_or_default());
+    let reset = state.count != row.tabs.len() || state.width != viewport.width()
+        || state.last_frame.is_none_or(|last| frame > last + 1);
+    let follow_focus = state.focus != focus && !reset;
+    let offset = if reset {
+        focus.map(|(_, index)| (index as f32 * pitch + tile.x * 0.5 - viewport.width() * 0.5)
+            .clamp(0.0, (content_width - viewport.width()).max(0.0)))
+    } else { None };
+    state.focus = focus;
+    state.count = row.tabs.len();
+    state.width = viewport.width();
+    state.last_frame = Some(frame);
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("workspace_tabs", row.index, expanded)).max_rect(viewport));
+    child.set_clip_rect(ui.clip_rect().intersect(viewport));
+    let mut scroll = egui::ScrollArea::horizontal().id_salt("previews")
+        .animated(ui.ctx().global_style().animation_time > 0.0)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, false]).max_width(viewport.width()).max_height(viewport.height());
+    if let Some(offset) = offset { scroll = scroll.horizontal_scroll_offset(offset); }
+    let output = scroll.show(&mut child, |ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.horizontal(|ui| {
+            let mut pick = None;
+            for (number, tab) in row.tabs.iter().enumerate() {
+                let (tile_rect, response) = ui.allocate_exact_size(
+                    egui::vec2(tile.x, tile.y + if expanded { 23.0 } else { 0.0 }), egui::Sense::click());
+                let well = tile_rect.with_max_y(tile_rect.top() + tile.y);
+                if follow_focus && tab.selected
+                    && (well.left() < ui.clip_rect().left() || well.right() > ui.clip_rect().right()) {
+                    ui.scroll_to_rect_animation(well, Some(egui::Align::Center),
+                        egui::style::ScrollAnimation::duration(ui.ctx().global_style().animation_time));
+                }
+                if ui.is_rect_visible(well) { visible_tabs.push(tab.id); }
+                workspace_preview(ui, well, tab, colors);
+                if tab.selected || response.hovered() {
+                    ui.painter().rect_stroke(well, 7.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+                }
+                if expanded {
+                    text(ui, tile_rect.with_min_y(well.bottom() + 2.0).shrink2(egui::vec2(4.0, 0.0)),
+                        &format!("{}  {}", number + 1, tab.title), if tab.selected { colors.fg } else { colors.muted }, 10.0, false);
+                }
+                if response.clicked() { pick = Some(tab.id); }
+                response.on_hover_text(&tab.title).on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            pick
+        }).inner
+    });
+    let offset = output.state.clamped_offset().x;
+    let max_offset = (output.content_size.x - output.inner_rect.width()).max(0.0);
+    let mut pick = output.inner;
+    if overflow {
+        for (left, available, x) in [(true, offset > 0.5, rect.left() + gutter * 0.5),
+            (false, offset < max_offset - 0.5, rect.right() - gutter * 0.5)] {
+            let Some(neighbor) = neighboring_workspace_tab(row, left).filter(|_| available) else { continue; };
+            let button = egui::Rect::from_center_size(egui::pos2(x, rect.top() + tile.y * 0.5), egui::vec2(gutter, tile.y.min(30.0)));
+            let response = ui.interact(button, id.with(left), egui::Sense::click());
+            let label = format!("Focus {} tab in workspace {}", if left { "Previous" } else { "Next" }, row.index + 1);
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+            if response.hovered() { ui.painter().rect_filled(button, 5.0, colors.card); }
+            draw_icon(ui.painter(), if left { Icon::ChevronLeft } else { Icon::ChevronRight }, button.center(),
+                if response.hovered() { color } else { colors.muted });
+            if response.clicked() {
+                pick = Some(neighbor);
+            }
+            response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+    pick
+}
+
+fn neighboring_workspace_tab(row: &WsRow, left: bool) -> Option<usize> {
+    let current = row.tabs.iter().position(|tab| tab.selected)?;
+    let next = if left { current.checked_sub(1)? } else { current.checked_add(1)? };
+    row.tabs.get(next).map(|tab| tab.id)
+}
+
+fn workspace_preview(ui: &egui::Ui, rect: egui::Rect, tab: &WsTab, colors: &TermStyle) {
+    if tab.preview.is_some() {
+        preview_image(ui, rect, tab.preview, colors);
+    } else {
+        ui.painter().rect(rect, 7.0, colors.bg, egui::Stroke::new(1.0, colors.border), egui::StrokeKind::Inside);
+        draw_icon(ui.painter(), Icon::Terminal, rect.center(), colors.muted);
+    }
 }
 
 /// The rename box: a small frameless window with one text field. Enter
@@ -1348,7 +1547,7 @@ pub fn rename_box(ui: &egui::Ui, st: &mut UiState) {
     let seed = st.rename_seed;
     let mut out: Option<Option<String>> = None;
     egui::Window::new("rename_tab")
-        .id(egui::Id::new("rename_tab_box"))
+        .id(egui::Id::unique("rename_tab_box"))
         .title_bar(false)
         .movable(false)
         .resizable(false)
@@ -1693,7 +1892,7 @@ pub fn release_focus_if_closed(
 /// not flat black. Over a light theme a black dim reads as smoke; over a
 /// dark one the difference is subtle - either way the overlay now belongs
 /// to the palette the user chose.
-pub fn dim_fill(cfg: &crate::config::Config, bg: [f32; 3], alpha: u8) -> egui::Color32 {
+pub fn dim_fill(bg: [f32; 3], alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
         (bg[0] * 0.30 * 255.0) as u8,
         (bg[1] * 0.30 * 255.0) as u8,
@@ -2143,6 +2342,12 @@ fn appearance_page(
             color_row(ui, "Cursor", &mut cfg.cursor_color, ev);
             color_row(ui, "Accent", &mut cfg.accent_color, ev);
             color_row(ui, "Background tint", &mut cfg.bg_tint_color, ev);
+            row(ui, "Terminal brightness", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.terminal_brightness)
+                    .speed(1.0).range(-100.0..=100.0).suffix("%").fixed_decimals(0))
+                    .on_hover_text("0% keeps the original terminal colors; negative values darken them, positive values brighten them.")
+                    .changed();
+            });
         });
     });
     section(ui, "Fonts", colors, |ui| {
@@ -2156,6 +2361,18 @@ fn appearance_page(
             });
             font_row(ui, "Tab font", &mut cfg.tablist_font, FontWhich::Tablist, st, choices, ev);
         });
+    });
+    section(ui, "Motion", colors, |ui| {
+        form_grid("appearance-motion").show(ui, |ui| {
+            row(ui, "Animation speed", |ui| {
+                ev.apply |= ui.add(egui::Slider::new(&mut cfg.animation_speed, 0.0..=4.0)
+                    .step_by(0.25).custom_formatter(|speed, _| {
+                        if speed == 0.0 { "Off".into() } else { format!("{speed:.2}×") }
+                    })).changed();
+            });
+        });
+        ui.label(egui::RichText::new("1× is normal. Lower is slower; 0 turns animations off.")
+            .small().color(colors.muted));
     });
     section(ui, "Tab colors", colors, |ui| {
         form_grid("colors-tabs").show(ui, |ui| {
@@ -2206,7 +2423,8 @@ fn window_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut Conf
         form_grid("window-behavior").show(ui, |ui| {
             checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, ev);
             row(ui, "Transparency", |ui| {
-                ev.apply |= ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0)).changed();
+                ev.apply |= ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0))
+                    .on_hover_text("0 is opaque; 1 is fully transparent. Brightness is separate under Appearance.").changed();
             });
         });
     });
@@ -2216,6 +2434,7 @@ fn window_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut Conf
 fn tabs_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
     section(ui, "Tab bar", colors, |ui| {
         form_grid("tabs").show(ui, |ui| {
+            checkbox_row(ui, "Compact tabs", &mut cfg.compact_tabs, ev);
             checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, ev);
             checkbox_row(ui, "Strip on top", &mut cfg.tablist_top, ev);
             checkbox_row(ui, "Hide strip", &mut cfg.tablist_hide, ev);
@@ -2289,6 +2508,15 @@ fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut 
         )
         .small()
         .color(colors.muted));
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Optional genres describe what each workspace is for.").small().color(colors.muted));
+        form_grid("workspace_genres").show(ui, |ui| {
+            for (index, genre) in cfg.workspace_genres.iter_mut().enumerate() {
+                row(ui, &format!("Workspace {} genre", index + 1), |ui| {
+                    ev.apply |= ui.add(egui::TextEdit::singleline(genre).hint_text("e.g. Development").desired_width(180.0)).changed();
+                });
+            }
+        });
     });
 }
 
@@ -3104,9 +3332,9 @@ mod regression {
     /// settings), so a control that drifts to another page fails this test
     /// instead of quietly rendering somewhere.
     const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
-        (SettingsPage::Appearance, &["Theme", "Terminal font", "Tab strip", "Group colors", "Workspace 1"]),
+        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Tab strip", "Group colors", "Workspace 1"]),
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized"]),
-        (SettingsPage::Tabs, &["Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
+        (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
         (SettingsPage::Terminal, &["Scrollback lines"]),
         (SettingsPage::Keys, &["Copy", "Search this tab", "Text bigger"]),
@@ -3503,7 +3731,6 @@ mod input_regression {
         }
     }
 
-    #[test]
     /// Clicking and typing in the popup's filter must not dismiss it: the
     /// popup's DEFAULT close behavior (CloseOnClick) closed it on its own
     /// filter click, and the app then tore the state down. Regression test
@@ -3633,7 +3860,6 @@ mod input_regression {
         assert!(g.iter().any(|t| t.trim() == "+"), "no plus stepper");
     }
 
-    #[test]
     /// The egui rename box: seeded draft arrives selected (first key
     /// replaces it), Enter commits, and any other focus loss -- Escape or a
     /// click away -- cancels. The hand-drawn prompt had this logic in the
@@ -3642,7 +3868,7 @@ mod input_regression {
     fn rename_box_selects_seeds_commits_and_cancels() {
         let ctx = Context::default();
         let mut st = UiState::default();
-        let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
+        let step = |st: &mut UiState, events: Vec<egui::Event>| {
             let mut full = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_max(
@@ -3714,6 +3940,7 @@ mod input_regression {
         );
     }
 
+    #[test]
     fn keyboard_focus_released_when_ui_steps_aside() {
         let mut db = glyphon::fontdb::Database::new();
         db.load_system_fonts();
@@ -3725,6 +3952,8 @@ mod input_regression {
         let focus_filter = |sim: &mut Sim| {
             let p = seed_popup(FontWhich::Term, &format!("{seed_spec} 13"), sim.choices);
             sim.st.font_popup = Some(p);
+            // egui's first pass sizes the popup; the second paints its controls.
+            sim.frame(vec![]);
             sim.frame(vec![]);
             let r = sim.last_popup_rect.expect("filter laid out");
             let pos = r.center();
@@ -3895,4 +4124,190 @@ mod input_regression {
         }
     }
 
+}
+
+#[cfg(test)]
+mod workspace_panel_tests {
+    use super::*;
+
+    fn state() -> UiState {
+        UiState {
+            right_panel: RightPanel::Workspaces,
+            ws_sel: Some(0),
+            ws_rows: (0..10).map(|index| WsRow {
+                index, count: if index < 3 { 2 } else { 0 },
+                title: format!("Terminal {index}"),
+                genre: if index == 1 { "Research".into() } else { String::new() },
+                tabs: if index < 3 { (0..2).map(|tab| WsTab {
+                    id: index * 10 + tab, title: format!("Terminal {index}-{tab}"),
+                    selected: tab == 0, preview: None,
+                }).collect() } else { Vec::new() },
+                current: index == 0, shortcut: format!("Alt+Shift+{}", (index + 1) % 10),
+            }).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn frame(ctx: &egui::Context, st: &mut UiState, size: egui::Vec2, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events, ..Default::default()
+        }, |ui| workspaces_panel(ui, st, egui::Color32::GREEN, egui::Color32::RED, 24.0, &[egui::Color32::CYAN; 10]));
+        output.textures_delta.clear();
+        output.shapes
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn filtering_and_keyboard_navigation_follow_visible_workspace_indices() {
+        let ctx = egui::Context::default();
+        let mut st = state();
+        let size = egui::vec2(900.0, 500.0);
+        for _ in 0..3 { frame(&ctx, &mut st, size, vec![]); }
+        st.ws_populated_only = true;
+        st.ws_sel = Some(2);
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowDown)]);
+        assert_eq!(st.ws_sel, Some(0));
+        st.ws_query = "research".into();
+        frame(&ctx, &mut st, size, vec![]);
+        assert_eq!(st.ws_sel, Some(1));
+        frame(&ctx, &mut st, size, vec![key(egui::Key::Enter)]);
+        assert_eq!(st.ws_out, Some(1));
+        st.ws_query = "Terminal 2-1".into();
+        assert_eq!(visible_workspaces(&st), vec![2]);
+        st.ws_query = "missing".into();
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowDown)]);
+        assert_eq!(st.ws_sel, None);
+        frame(&ctx, &mut st, size, vec![key(egui::Key::Enter)]);
+        assert_eq!(st.ws_out, None);
+    }
+
+    #[test]
+    fn left_and_right_focus_adjacent_tabs_in_the_selected_workspace_without_wrapping() {
+        let ctx = egui::Context::default();
+        let mut st = state();
+        st.ws_sel = Some(2);
+        let size = egui::vec2(1200.0, 800.0);
+        for _ in 0..3 { frame(&ctx, &mut st, size, vec![]); }
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowLeft)]);
+        assert_eq!(st.ws_tab_out, None, "Left wrapped past the first tab");
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowRight)]);
+        assert_eq!(st.ws_tab_out, Some((2, 21)));
+        assert_eq!(st.ws_out, None, "Right still committed the workspace instead of a tab");
+        st.ws_rows[2].tabs[0].selected = false;
+        st.ws_rows[2].tabs[1].selected = true;
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowRight)]);
+        assert_eq!(st.ws_tab_out, None, "Right wrapped past the last tab");
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowLeft)]);
+        assert_eq!(st.ws_tab_out, Some((2, 20)));
+        st.ws_sel = Some(9);
+        frame(&ctx, &mut st, size, vec![key(egui::Key::ArrowRight)]);
+        assert_eq!(st.ws_tab_out, None, "an empty workspace has no adjacent tab");
+    }
+
+    #[test]
+    fn expanded_preview_click_picks_the_exact_terminal() {
+        let ctx = egui::Context::default();
+        let mut st = state();
+        let size = egui::vec2(1200.0, 800.0);
+        let mut shapes = Vec::new();
+        for _ in 0..3 { shapes = frame(&ctx, &mut st, size, vec![]); }
+        let pos = shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(t) if t.galley.text() == "2  Terminal 0-1" => Some(t.pos + egui::vec2(8.0, 5.0)),
+            _ => None,
+        }).expect("expanded terminal caption missing");
+        for pressed in [true, false] {
+            frame(&ctx, &mut st, size, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert_eq!(st.ws_tab_out, Some((0, 1)));
+        assert_eq!(st.ws_out, None, "a preview click also selected its parent card");
+    }
+
+    #[test]
+    fn chevrons_expand_and_collapse_without_switching_workspaces() {
+        let ctx = egui::Context::default();
+        let mut st = state();
+        let size = egui::vec2(1200.0, 800.0);
+        let mut shapes = Vec::new();
+        for _ in 0..3 { shapes = frame(&ctx, &mut st, size, vec![]); }
+        let y = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text() == "Workspace 1" => Some(t.pos.y + 17.0), _ => None,
+        }).expect("workspace heading missing");
+        let pos = egui::pos2(size.x - 28.0, y);
+        for expected in [Some(0), None] {
+            for pressed in [true, false] {
+                frame(&ctx, &mut st, size, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            assert_eq!(st.ws_collapsed, expected);
+            assert_eq!(st.ws_out, None);
+        }
+    }
+
+    #[test]
+    fn every_workspace_follows_its_focus_and_buttons_focus_neighboring_tabs() {
+        let ctx = egui::Context::default();
+        let mut st = state();
+        let size = egui::vec2(1200.0, 800.0);
+        for workspace in 0..2 {
+            let row = &mut st.ws_rows[workspace];
+            row.tabs = (0..9).map(|index| WsTab {
+                id: 100 * (workspace + 1) + index, title: format!("Terminal {workspace}-{index}"),
+                selected: index == 8, preview: None,
+            }).collect();
+            row.count = row.tabs.len();
+        }
+        for _ in 0..3 { frame(&ctx, &mut st, size, vec![]); }
+        assert!(st.ws_visible_tabs.contains(&108), "expanded workspace did not reveal its focused last tab");
+        assert!(st.ws_visible_tabs.contains(&208), "compact workspace did not reveal its focused last tab");
+        for (workspace, expanded) in [(0, true), (1, false)] {
+            let id = egui::Id::unique("workspace_tab_strip").with((workspace, expanded));
+            assert!(ctx.read_response(id.with(true)).is_some(), "missing left overflow arrow");
+            assert!(ctx.read_response(id.with(false)).is_none(), "right arrow shown at the end");
+            let pos = ctx.read_response(id.with(true)).unwrap().rect.center();
+            for pressed in [true, false] {
+                frame(&ctx, &mut st, size, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                }]);
+                assert_eq!(st.ws_out, None, "a tab arrow also selected its parent workspace card");
+            }
+            assert_eq!(st.ws_tab_out, Some((workspace, 100 * (workspace + 1) + 7)));
+        }
+        // A focus change follows again, independently in each workspace.
+        for workspace in 0..2 {
+            for (index, tab) in st.ws_rows[workspace].tabs.iter_mut().enumerate() { tab.selected = index == 0; }
+        }
+        for _ in 0..30 { frame(&ctx, &mut st, size, vec![]); }
+        assert!(st.ws_visible_tabs.contains(&100));
+        assert!(st.ws_visible_tabs.contains(&200));
+        for (workspace, expanded) in [(0, true), (1, false)] {
+            let id = egui::Id::unique("workspace_tab_strip").with((workspace, expanded));
+            assert!(ctx.read_response(id.with(true)).is_none(), "left arrow shown at the beginning");
+            assert!(ctx.read_response(id.with(false)).is_some());
+        }
+    }
+
+    #[test]
+    fn workspace_header_and_footer_fit_small_and_large_windows() {
+        for size in [egui::vec2(480.0, 320.0), egui::vec2(900.0, 500.0), egui::vec2(1600.0, 1000.0)] {
+            let ctx = egui::Context::default();
+            let mut st = state();
+            let mut shapes = Vec::new();
+            for _ in 0..3 { shapes = frame(&ctx, &mut st, size, vec![]); }
+            for label in ["Workspaces", "↑↓ workspace · ←→ tab · Enter go · Esc close"] {
+                let (clip, t) = shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == label => Some((s.clip_rect, t)), _ => None,
+                }).unwrap_or_else(|| panic!("{label} missing at {size:?}"));
+                let rect = egui::Rect::from_min_size(t.pos, t.galley.size());
+                assert!(clip.contains_rect(rect), "{label} clipped at {size:?}: {rect:?} by {clip:?}");
+                assert!(rect.bottom() <= size.y, "{label} below the window at {size:?}");
+            }
+        }
+    }
 }

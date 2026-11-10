@@ -11,15 +11,13 @@
 //! second: images keep their original upload bytes, so a copy is lossless
 //! and never round-trips through pixels.
 //!
-//! Implemented subset of https://sw.kovidgoyal.net/kitty/graphicsprotocol :
+//! Implemented subset of https://sw.kovidgoyal.net/kitty/graphics-protocol/ :
 //! `a=t` transmit, `a=T` transmit+display, `a=p` display, `a=d` delete,
 //! `f=24`/`f=32` raw RGB/RGBA, `f=100` PNG, image ids, placement ids,
-//! chunked transfer (`m=1`),
-//! columns/rows sizing, x/y offsets, z-index. Raw RGB/RGBA (`f=24/32`),
-//! zlib (`o=z`), cursor-relative delete filters, file/shared-memory
-//! transfer, protocol responses and scroll-cursor semantics are NOT
-//! implemented; they are ignored or rejected per the caps below, and
-//! advertising them (`a=q`) is deferred rather than answered falsely.
+//! chunked transfer (`m=1`), source cropping (`x,y,w,h`), display offsets
+//! (`X,Y`), cell sizing, z-index, quiet responses, and
+//! file/temp-file/shared-memory transfers. Unicode placeholders and zlib
+//! compression are not implemented.
 //!
 //! Caps are blunt by design: one transfer, one image, one tab each has a
 //! ceiling, and crossing one drops the sequence instead of growing memory.
@@ -36,8 +34,10 @@ pub const MAX_TRANSFER: usize = 32 * 1024 * 1024;
 pub const MAX_SIDE: u32 = 8192;
 /// Images retained per tab; older unreferenced ones are evicted.
 pub const MAX_IMAGES: usize = 64;
-/// Placements retained per tab.
-pub const MAX_PLACEMENTS: usize = 1024;
+/// Placements retained per tab. Yazi uses one placement per terminal cell,
+/// so a single large preview can need thousands. Keep the budget bounded,
+/// with room for dense grids on high-resolution displays.
+pub const MAX_PLACEMENTS: usize = 64 * 1024;
 
 /// One decoded image. `gen` bumps when an id is overwritten, giving the
 /// GPU texture cache a cheap invalidation key.
@@ -48,6 +48,21 @@ pub struct KittyImage {
     /// The untouched upload payload (PNG today), for a lossless copy.
     pub source: Arc<Vec<u8>>,
     pub generation: u32,
+}
+
+/// The source pixel rectangle, before scaling or positioning the placement.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourceRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+pub struct PlacementGeometry {
+    pub size: [f32; 2],
+    /// Normalized source rectangle: u, v, width, height.
+    pub uv: [f32; 4],
 }
 
 /// Where an image sits: anchored at a cell (absolute logical line, as the
@@ -63,7 +78,41 @@ pub struct Placement {
     pub rows: Option<u32>,
     pub x_off: u32,
     pub y_off: u32,
+    pub source: SourceRect,
     pub z: i32,
+}
+
+impl Placement {
+    pub fn geometry(&self, image: &KittyImage, cell: [f32; 2]) -> Option<PlacementGeometry> {
+        let src = self.source;
+        if src.x >= image.width || src.y >= image.height { return None; }
+        let width = src.width.unwrap_or(image.width).min(image.width - src.x) as f32;
+        let height = src.height.unwrap_or(image.height).min(image.height - src.y) as f32;
+        if width <= 0.0 || height <= 0.0 { return None; }
+        let fit_width = self.cols.map(|cols| (cols as f32 * cell[0] - self.x_off as f32).max(0.0));
+        let fit_height = self.rows.map(|rows| (rows as f32 * cell[1] - self.y_off as f32).max(0.0));
+        // Cropped 1x1 placements form Yazi's pixel-aligned tile grid: fitting
+        // each rounded source tile separately would introduce seams. Ordinary
+        // images keep their aspect ratio within the requested cell rectangle.
+        let tile = self.cols == Some(1) && self.rows == Some(1)
+            && (src.width.is_some() || src.height.is_some() || src.x > 0 || src.y > 0);
+        let size = match (fit_width, fit_height) {
+            (Some(w), Some(h)) if tile => [w, h],
+            (Some(w), Some(h)) => {
+                let scale = (w / width).min(h / height);
+                [width * scale, height * scale]
+            },
+            (Some(w), None) => [w, w * height / width],
+            (None, Some(h)) => [h * width / height, h],
+            (None, None) => [width, height],
+        };
+        if size[0] <= 0.0 || size[1] <= 0.0 { return None; }
+        Some(PlacementGeometry {
+            size,
+            uv: [src.x as f32 / image.width as f32, src.y as f32 / image.height as f32,
+                width / image.width as f32, height / image.height as f32],
+        })
+    }
 }
 
 /// Where transmitted image bytes come from beyond the stream itself.
@@ -84,6 +133,8 @@ struct Pending {
     /// transient images can coexist.
     named: bool,
     display: bool,
+    quiet: u8,
+    source: SourceRect,
     format: u32,
     px_w: u32,
     px_h: u32,
@@ -111,6 +162,7 @@ pub struct TabKitty {
     placements: Vec<Placement>,
     next_id: u32,
     next_placement: u32,
+    next_generation: u32,
     pending: Option<Pending>,
 }
 
@@ -121,6 +173,7 @@ impl Default for TabKitty {
             placements: Vec::new(),
             next_id: 1,
             next_placement: 1,
+            next_generation: 0,
             pending: None,
         }
     }
@@ -130,8 +183,26 @@ impl TabKitty {
     /// One complete APC string (the bytes between `ESC _` and ST, so it
     /// starts with the `G` namespace letter for Kitty), anchored at
     /// `line`/`col` as captured at dispatch. Returns bytes to write back to
-    /// the pty - today only the `a=q` interrogation answer.
+    /// the pty, respecting the command's quiet-response policy.
     pub fn on_apc(&mut self, payload: &[u8], line: usize, col: usize) -> Vec<u8> {
+        let bare = payload.strip_prefix(b"G").unwrap_or_default();
+        let head = bare.strip_prefix(b";").unwrap_or(bare).split(|&b| b == b';').next().unwrap_or_default();
+        let get = |key: &[u8]| head.split(|&b| b == b',').find_map(|part| part.strip_prefix(key));
+        let number = |key: &[u8]| get(key).and_then(|v| std::str::from_utf8(v).ok()?.parse::<u32>().ok());
+        let inherited = self.pending.as_ref().filter(|p| {
+            (get(b"a=").is_none() && get(b"i=").is_none())
+                || (number(b"i=") == Some(p.id)
+                    && matches!(get(b"a="), None | Some(b"t") | Some(b"T"))
+                    && (get(b"a=") == Some(b"T")) == p.display)
+        }).map_or(0, |p| p.quiet);
+        let quiet = number(b"q=").map_or(inherited, |q| q.min(2) as u8);
+        let reply = self.handle_apc(payload, line, col);
+        if quiet == 2 || (quiet == 1 && reply.windows(3).any(|s| s == b";OK")) {
+            Vec::new()
+        } else { reply }
+    }
+
+    fn handle_apc(&mut self, payload: &[u8], line: usize, col: usize) -> Vec<u8> {
         if payload.first() != Some(&b'G') {
             // Some other APC dialect (tmux passes several through); not
             // ours to interpret, and nothing here may misread it.
@@ -205,6 +276,12 @@ impl TabKitty {
 
         let action = get(b'a').and_then(|v| v.first()).copied().unwrap_or(b't');
         let more = num(b'm') == 1;
+        let source = SourceRect {
+            x: num(b'x') as u32,
+            y: num(b'y') as u32,
+            width: (num(b'w') > 0).then(|| num(b'w') as u32),
+            height: (num(b'h') > 0).then(|| num(b'h') as u32),
+        };
 
         // Interrogation. The spec's answer is minimal and this is NOT
         // negotiable on shape: `ESC_G i=<id>;OK ESC\`. (A richer `:OK,f=`
@@ -279,18 +356,20 @@ impl TabKitty {
                     Some(b"s") => Some(PathMode::Shm),
                     _ => None,
                 };
-                let mut p = Pending {
+                let p = Pending {
                     id,
                     named: num(b'i') != 0,
                     display: action == b'T',
+                    quiet: num(b'q').min(2) as u8,
+                    source,
                     path_mode,
                     format,
                     px_w: num(b's') as u32,
                     px_h: num(b'v') as u32,
                     cols: (num(b'c') > 0).then(|| num(b'c') as u32),
                     rows: (num(b'r') > 0).then(|| num(b'r') as u32),
-                    x_off: num(b'x') as u32,
-                    y_off: num(b'y') as u32,
+                    x_off: num(b'X') as u32,
+                    y_off: num(b'Y') as u32,
                     z: num(b'z') as u32 as i32,
                     anchor_line: line,
                     anchor_col: col,
@@ -327,12 +406,13 @@ impl TabKitty {
                 self.push_placement(Placement {
                     image_id: id,
                     placement_id,
+                    source,
                     anchor_line: line,
                     col,
                     cols: (num(b'c') > 0).then(|| num(b'c') as u32),
                     rows: (num(b'r') > 0).then(|| num(b'r') as u32),
-                    x_off: num(b'x') as u32,
-                    y_off: num(b'y') as u32,
+                    x_off: num(b'X') as u32,
+                    y_off: num(b'Y') as u32,
                     z: num(b'z') as u32 as i32,
                 });
                 if id != 0 {
@@ -368,6 +448,7 @@ impl TabKitty {
         if pl.placement_id >= self.next_placement {
             self.next_placement = pl.placement_id + 1;
         }
+        self.placements.retain(|old| old.image_id != pl.image_id || old.placement_id != pl.placement_id);
         self.placements.push(pl);
         while self.placements.len() > MAX_PLACEMENTS {
             self.placements.remove(0);
@@ -433,7 +514,12 @@ impl TabKitty {
                 return Vec::new();
             },
         };
-        let generation = self.images.get(&p.id).map(|old| old.generation + 1).unwrap_or(0);
+        // Yazi deletes and reuses the same image id when changing files.
+        // Never recycle the GPU cache key just because the old image is gone.
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        // Re-transmitting an id replaces its data and placements together.
+        self.placements.retain(|placement| placement.image_id != p.id);
         self.images.insert(p.id, KittyImage { width: rgba.0, height: rgba.1, rgba: rgba.2, source: src, generation });
         if let Some(path) = temp_to_delete {
             // Only our own kind of temp path is ever removed (spec).
@@ -464,6 +550,7 @@ impl TabKitty {
             self.push_placement(Placement {
                 image_id: p.id,
                 placement_id: 0,
+                source: p.source,
                 anchor_line: p.anchor_line,
                 col: p.anchor_col,
                 cols: p.cols,
@@ -501,11 +588,6 @@ impl TabKitty {
         self.images.clear();
         self.placements.clear();
         self.pending = None;
-    }
-
-    /// Ids currently held, for GPU cache pruning on tab close.
-    pub fn image_ids(&self) -> Vec<u32> {
-        self.images.keys().copied().collect()
     }
 }
 
@@ -674,7 +756,6 @@ fn to_rgba8(raw: &[u8], ct: png::ColorType, w: u32, h: u32) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     /// A tiny valid PNG (solid 4x2 RGBA) built with the same decoder's
     /// partner, so the fixture cannot drift from the parser.
@@ -739,6 +820,103 @@ mod tests {
         let p = enc_png(2, 1, png::ColorType::Indexed, &[0, 1], Some(&[20, 21, 22, 40, 41, 42]));
         let (_, _, rgba) = decode_png(&p).unwrap();
         assert_eq!(rgba, vec![20, 21, 22, 255, 40, 41, 42, 255]);
+    }
+
+    #[test]
+    fn yazi_source_crops_are_distinct_from_display_offsets() {
+        let mut k = TabKitty::default();
+        let pixels = vec![128; 8 * 4 * 4];
+        assert!(k.on_apc(&apc("a=t,i=7,f=32,s=8,v=4,q=2", &b64(&pixels)), 0, 0).is_empty());
+        assert!(k.on_apc(&apc("a=p,i=7,p=1,x=4,y=2,w=4,h=2,X=1,Y=2,c=1,r=1,q=2", &[]), 12, 3).is_empty());
+        let pl = &k.placements()[0];
+        assert_eq!((pl.anchor_line, pl.col, pl.x_off, pl.y_off), (12, 3, 1, 2));
+        let geometry = pl.geometry(k.image(7).unwrap(), [10.0, 10.0]).unwrap();
+        assert_eq!(geometry.uv, [0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(geometry.size, [9.0, 8.0]);
+    }
+
+    #[test]
+    fn source_crops_clip_and_single_axis_sizing_preserves_aspect() {
+        let mut k = TabKitty::default();
+        k.on_apc(&apc("a=t,i=7,f=100", &b64(&tiny_png())), 0, 0);
+        for (params, expected) in [
+            ("a=p,i=7,p=1,x=3,y=1,w=200,h=200,c=1,r=1", Some(([10.0, 20.0], [0.75, 0.5, 0.25, 0.5]))),
+            ("a=p,i=7,p=1,x=4", None),
+            ("a=p,i=7,p=1,y=2", None),
+            ("a=p,i=7,p=1,c=4", Some(([40.0, 20.0], [0.0, 0.0, 1.0, 1.0]))),
+            ("a=p,i=7,p=1,r=4", Some(([160.0, 80.0], [0.0, 0.0, 1.0, 1.0]))),
+            ("a=p,i=7,p=1,c=4,r=4", Some(([40.0, 20.0], [0.0, 0.0, 1.0, 1.0]))),
+            ("a=p,i=7,p=1", Some(([4.0, 2.0], [0.0, 0.0, 1.0, 1.0]))),
+        ] {
+            k.on_apc(&apc(params, &[]), 0, 0);
+            let result = k.placements()[0].geometry(k.image(7).unwrap(), [10.0, 20.0]);
+            assert_eq!(result.map(|g| (g.size, g.uv)), expected, "{params}");
+        }
+    }
+
+    #[test]
+    fn quiet_uploads_and_placements_suppress_only_requested_responses() {
+        let mut k = TabKitty::default();
+        let bytes = b64(&tiny_png());
+        for quiet in [1, 2] {
+            assert!(k.on_apc(&apc(&format!("a=t,i=7,f=100,q={quiet}"), &bytes), 0, 0).is_empty());
+            assert!(k.on_apc(&apc(&format!("a=p,i=7,q={quiet}"), &[]), 0, 0).is_empty());
+        }
+        assert!(!k.on_apc(&apc("a=p,i=99,q=1", &[]), 0, 0).is_empty());
+        assert!(k.on_apc(&apc("a=p,i=99,q=2", &[]), 0, 0).is_empty());
+        k.on_apc(&apc("a=t,i=8,f=100,q=2,m=1", &bytes[..4]), 0, 0);
+        assert!(k.on_apc(&apc("m=0", &bytes[4..]), 0, 0).is_empty());
+        assert!(k.image(8).is_some());
+        assert!(!k.on_apc(&apc("a=p,i=8", &[]), 0, 0).is_empty());
+    }
+
+    #[test]
+    fn large_tiled_previews_keep_their_top_left_corner() {
+        let mut k = TabKitty::default();
+        k.on_apc(&apc("a=t,i=7,f=100,q=2", &b64(&tiny_png())), 0, 0);
+        // One placement per cell, as used by Yazi. The old 1024-placement
+        // budget discarded the top rows and part of the next row.
+        for row in 0..32 {
+            for col in 0..48 {
+                let id = row * 48 + col + 1;
+                k.on_apc(&apc(&format!("a=p,i=7,p={id},c=1,r=1,q=2"), &[]), row, col);
+            }
+        }
+        assert_eq!(k.placements().len(), 32 * 48);
+        let first = k.placements().first().unwrap();
+        assert_eq!((first.placement_id, first.anchor_line, first.col), (1, 0, 0));
+        let last = k.placements().last().unwrap();
+        assert_eq!((last.placement_id, last.anchor_line, last.col), (1536, 31, 47));
+    }
+
+    #[test]
+    fn deleted_image_ids_get_fresh_gpu_generations() {
+        let mut k = TabKitty::default();
+        let bytes = b64(&tiny_png());
+        let mut generations = Vec::new();
+        for delete in ["a=d,d=I,i=7", "a=d,d=A", "a=d,d=I,i=7"] {
+            k.on_apc(&apc("a=t,i=7,f=100,q=2", &bytes), 0, 0);
+            let generation = k.image(7).unwrap().generation;
+            assert!(!generations.contains(&generation));
+            generations.push(generation);
+            k.on_apc(&apc(delete, &[]), 0, 0);
+            assert!(k.image(7).is_none());
+        }
+    }
+
+    #[test]
+    fn redrawing_a_named_placement_replaces_its_old_geometry() {
+        let mut k = TabKitty::default();
+        for id in [7, 8] {
+            k.on_apc(&apc(&format!("a=t,i={id},f=100"), &b64(&tiny_png())), 0, 0);
+        }
+        k.on_apc(&apc("a=p,i=7,p=10,x=0,w=2", &[]), 1, 2);
+        k.on_apc(&apc("a=p,i=7,p=10,x=2,w=2", &[]), 3, 4);
+        assert_eq!(k.placements().len(), 1);
+        let placement = k.placements()[0];
+        assert_eq!((placement.anchor_line, placement.col, placement.source.x), (3, 4, 2));
+        k.on_apc(&apc("a=p,i=8,p=10", &[]), 0, 0);
+        assert_eq!(k.placements().len(), 2);
     }
 
     #[test]
@@ -906,10 +1084,12 @@ mod tests {
     #[test]
     fn replacement_bumps_generation() {
         let mut k = TabKitty::default();
-        k.on_apc(&apc("a=t,i=4,f=100", &b64(&tiny_png())), 1, 0);
+        k.on_apc(&apc("a=T,i=4,f=100", &b64(&tiny_png())), 1, 0);
         assert_eq!(k.image(4).unwrap().generation, 0);
+        assert_eq!(k.placements().len(), 1);
         k.on_apc(&apc("a=t,i=4,f=100", &b64(&tiny_png())), 1, 0);
         assert_eq!(k.image(4).unwrap().generation, 1);
+        assert!(k.placements().is_empty(), "new data kept the old image's placements");
     }
 
     /// The terminal-side rule for moving the cursor past a displayed image.

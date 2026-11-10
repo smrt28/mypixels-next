@@ -65,6 +65,8 @@ pub struct Config {
     pub tablist_background: Rgb,
     /// Workspace identity colors, W1 through W10. Tab chrome is derived from these.
     pub workspace_colors: [Rgb; 10],
+    /// Optional purpose labels, independent of any terminal working directory.
+    pub workspace_genres: [String; 10],
     pub tab_color_bg: Rgb,
     pub tab_color_bg_selected: Rgb,
     pub tab_color_fg: Rgb,
@@ -81,6 +83,10 @@ pub struct Config {
     pub selection_color: Rgb,
     pub cursor_color: Rgb,
     pub accent_color: Rgb,
+    /// UI transition speed multiplier: 1 is normal, 0 disables animation.
+    pub animation_speed: f32,
+    /// Terminal color brightness in percent; leaves the source palette intact.
+    pub terminal_brightness: f32,
     /// The selected theme (preset name, `wal`, or a YAML path); empty means
     /// none. Kept as written so the picker and the file agree after a save.
     pub theme: String,
@@ -109,6 +115,7 @@ pub struct Config {
     /// Enables the Alt-held visual tab switcher. Numbered shortcuts work independently.
     pub tab_overview_on_alt: bool,
     pub show_tab_titles: bool,
+    pub compact_tabs: bool,
     /// Ten independent tab sets per window. Off by default.
     pub workspaces_enabled: bool,
     /// Opt-in alternative workspace shortcut: Alt+Q..P. Off by default because
@@ -157,7 +164,6 @@ pub struct Config {
     transparency_explicit: bool,
     pub bg_tint_color: Rgb,
     pub tab_format: String,
-    pub tab_prepend: Option<String>,
     pub tab_append: Option<String>,
     pub autohide_delay: i32,
     // keybindings
@@ -238,6 +244,7 @@ impl Default for Config {
                 "#5e9eff", "#f07b72", "#71c58c", "#e7b85a", "#b792ed",
                 "#5fc7d0", "#e998be", "#ec9756", "#bbc96a", "#95a8c4",
             ].map(parse_hex),
+            workspace_genres: std::array::from_fn(|_| String::new()),
             tab_color_bg: parse_hex("#303030"),
             tab_color_bg_selected: parse_hex("#505020"),
             tab_color_fg: parse_hex("#888888"),
@@ -253,6 +260,8 @@ impl Default for Config {
             selection_color: parse_hex("#3584e4"),
             cursor_color: Rgb(140, 140, 153),
             accent_color: Rgb(92, 191, 191),
+            animation_speed: 1.0,
+            terminal_brightness: 0.0,
             theme: String::new(),
             theme_files: Vec::new(),
             palette: None,
@@ -274,6 +283,7 @@ impl Default for Config {
             ],
             tab_overview_on_alt: true,
             show_tab_titles: true,
+            compact_tabs: false,
             workspaces_enabled: false,
             workspace_letter_keys: false,
             tab_overview_opacity: 0.3,
@@ -298,7 +308,6 @@ impl Default for Config {
             transparency_explicit: false,
             bg_tint_color: parse_hex("#140008"),
             tab_format: "<span %(color)s>%(tcorner)s%(entangled)s%(tname)s]</span>".to_string(),
-            tab_prepend: Some("clock".to_string()),
             tab_append: None,
             autohide_delay: -1,
             bindings,
@@ -366,6 +375,12 @@ impl Config {
         };
         Self::from_text(&text, path.parent().unwrap_or(std::path::Path::new(".")))
             .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn adjust_terminal_color(&self, color: [f32; 3]) -> [f32; 3] {
+        if self.terminal_brightness == 0.0 { return color; }
+        let factor = 1.0 + self.terminal_brightness / 100.0;
+        color.map(|channel| (channel * factor).clamp(0.0, 1.0))
     }
 
     pub fn terminal_line_height(&self, normal_height: f32) -> f32 {
@@ -507,6 +522,8 @@ impl Config {
             ("selection_color".into(), rgb(&self.selection_color)),
             ("cursor_color".into(), rgb(&self.cursor_color)),
             ("accent_color".into(), rgb(&self.accent_color)),
+            ("animation_speed".into(), self.animation_speed.to_string()),
+            ("terminal_brightness".into(), self.terminal_brightness.to_string()),
             ("bg_tint_color".into(), rgb(&self.bg_tint_color)),
             ("tablist_background".into(), rgb(&self.tablist_background)),
             ("add_button_color".into(), rgb(&self.add_button_color)),
@@ -514,6 +531,7 @@ impl Config {
             ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
+            ("compact_tabs".into(), self.compact_tabs.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
             ("workspace_letter_keys".into(), self.workspace_letter_keys.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
@@ -535,6 +553,9 @@ impl Config {
         ];
         for (i, color) in self.workspace_colors.iter().enumerate() {
             keys.push((format!("workspace_color_{}", i + 1), rgb(color)));
+        }
+        for (i, genre) in self.workspace_genres.iter().enumerate() {
+            keys.push((format!("workspace_genre_{}", i + 1), str_(genre)));
         }
         for (i, c) in self.col.iter().enumerate() {
             keys.push((format!("col_{i}"), rgb(c)));
@@ -742,6 +763,11 @@ pub(crate) fn workspace_color_index(key: &str) -> Option<usize> {
     (index < WORKSPACES).then_some(index)
 }
 
+fn workspace_genre_index(key: &str) -> Option<usize> {
+    let index = key.strip_prefix("workspace_genre_")?.parse::<usize>().ok()?.checked_sub(1)?;
+    (index < WORKSPACES).then_some(index)
+}
+
 pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
         let Some(map) = v.as_mapping() else {
             return;
@@ -754,6 +780,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 key if workspace_color_index(key).is_some() => {
                     set_rgb(&mut cfg.workspace_colors[workspace_color_index(key).unwrap()], val);
                 }
+                key if workspace_genre_index(key).is_some() => {
+                    if let Some(genre) = val.as_str() {
+                        cfg.workspace_genres[workspace_genre_index(key).unwrap()] = genre.trim().to_string();
+                    }
+                }
                 "bindings" => merge_bindings(&mut cfg.bindings, val),
                 "tablist_background" => set_rgb(&mut cfg.tablist_background, val),
                 "tab_color_bg" => set_rgb(&mut cfg.tab_color_bg, val),
@@ -763,6 +794,13 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 "tab_color_entangle" => set_rgb(&mut cfg.tab_color_entangle, val),
                 "tab_color_idx" => set_rgb(&mut cfg.tab_color_idx, val),
                 "add_button_color" => set_rgb(&mut cfg.add_button_color, val),
+                "terminal_brightness" => {
+                    if let Some(value) = val.as_f64().filter(|v| v.is_finite() && (-100.0..=100.0).contains(v)) {
+                        cfg.terminal_brightness = value as f32;
+                    } else {
+                        log::warn!("terminal_brightness must be a finite percentage between -100 and 100");
+                    }
+                },
                 "foreground_color" => set_rgb(&mut cfg.foreground_color, val),
                 "background_color" => set_rgb(&mut cfg.background_color, val),
                 "selection_color" => set_rgb(&mut cfg.selection_color, val),
@@ -822,9 +860,6 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                         cfg.default_tab_title = s.to_string();
                     }
                 },
-                "tab_prepend" => {
-                    cfg.tab_prepend = val.as_str().map(String::from);
-                },
                 "tab_append" => {
                     cfg.tab_append = val.as_str().map(String::from);
                 },
@@ -879,6 +914,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                         cfg.transparency_explicit = true;
                     }
                 },
+                "animation_speed" => {
+                    if let Some(speed) = val.as_f64().filter(|speed| speed.is_finite()) {
+                        cfg.animation_speed = if speed <= 0.0 { 0.0 } else { speed.clamp(0.25, 4.0) as f32 };
+                    }
+                },
                 "tab_overview_opacity" => {
                     if let Some(f) = val.as_f64() {
                         cfg.tab_overview_opacity = f.clamp(0.0, 1.0) as f32;
@@ -898,6 +938,9 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                     if let Some(b) = val.as_bool() {
                         cfg.default_maximize = b;
                     }
+                },
+                "compact_tabs" => {
+                    if let Some(b) = val.as_bool() { cfg.compact_tabs = b; }
                 },
                 "show_tab_titles" => {
                     if let Some(b) = val.as_bool() {
@@ -1185,13 +1228,7 @@ impl Binding {
         }
     }
 
-    /// Match against raw character input (for keys that arrive as text).
-    pub fn matches_char(&self, c: &str, _mods: ModifiersState) -> bool {
-        if self.mods != ModifiersState::empty() {
-            return false;
-        }
-        matches!(&self.key, BoundKey::Char(k) if k == c)
-    }
+
 }
 
 /// Find the first action whose any binding matches.
@@ -1211,6 +1248,29 @@ pub fn find_action(bindings: &[(String, Vec<Binding>)], key: &Key, mods: Modifie
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_brightness_is_a_percentage_and_preserves_source_colors() {
+        let base = std::path::Path::new(".");
+        for brightness in [-100.0, -40.0, 0.0, 40.0, 100.0] {
+            let cfg = Config::from_text(&format!("theme: dracula\nterminal_brightness: {brightness}\n"), base).unwrap();
+            let source: [f32; 3] = [0.25, 0.5, 0.9];
+            let expected = source.map(|c| (c * (1.0 + brightness / 100.0)).clamp(0.0, 1.0));
+            assert_eq!(cfg.adjust_terminal_color(source), expected);
+            let saved = replace_top_level_values("", &cfg.ui_keys());
+            let restored = Config::from_text(&saved, base).unwrap();
+            assert_eq!(restored.terminal_brightness, brightness);
+            assert_eq!(restored.palette, cfg.palette);
+            let mut changed = cfg.clone();
+            crate::theme::apply_name(&mut changed, "catppuccin-latte").unwrap();
+            assert_eq!(changed.terminal_brightness, brightness);
+        }
+        for invalid in [".nan", ".inf", "-101", "101", "'bright'", "null"] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nterminal_brightness: {invalid}\n"), base).unwrap();
+            assert_eq!(cfg.terminal_brightness, 0.0);
+        }
+        assert_eq!(Config::default().adjust_terminal_color([0.25, 0.5, 1.0]), [0.25, 0.5, 1.0]);
+    }
+
     #[test]
     fn line_spacing_scales_the_normal_height_and_round_trips() {
         let base = std::path::Path::new(".");
@@ -1310,13 +1370,39 @@ mod tests {
         let defaults = Config::default();
         assert!(defaults.tab_overview_on_alt);
         assert!(defaults.show_tab_titles);
-        let cfg = Config::from_text("wal_palette: ''\ntab_overview_on_alt: false\nshow_tab_titles: false\n", std::path::Path::new(".")).unwrap();
+        assert!(!defaults.compact_tabs);
+        let cfg = Config::from_text("wal_palette: ''\ntab_overview_on_alt: false\nshow_tab_titles: false\ncompact_tabs: true\n", std::path::Path::new(".")).unwrap();
         assert!(!cfg.tab_overview_on_alt);
         assert!(!cfg.show_tab_titles);
+        assert!(cfg.compact_tabs);
         let saved = replace_top_level_values("", &cfg.ui_keys());
         let restored = Config::from_text(&saved, std::path::Path::new(".")).unwrap();
         assert!(!restored.tab_overview_on_alt);
         assert!(!restored.show_tab_titles);
+        assert!(restored.compact_tabs);
+    }
+
+    #[test]
+    fn animation_speed_defaults_bounds_and_save_round_trip() {
+        let base = std::path::Path::new(".");
+        assert_eq!(Config::default().animation_speed, 1.0);
+        for (written, expected) in [("0", 0.0), ("0.01", 0.25), ("0.5", 0.5), ("2", 2.0), ("-1", 0.0), ("999", 4.0),
+            (".nan", 1.0), (".inf", 1.0), ("nope", 1.0)] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nanimation_speed: {written}\n"), base).unwrap();
+            assert_eq!(cfg.animation_speed, expected, "{written}");
+            let saved = replace_top_level_values("", &cfg.ui_keys());
+            assert_eq!(Config::from_text(&saved, base).unwrap().animation_speed, expected);
+        }
+    }
+
+    #[test]
+    fn workspace_genres_are_optional_and_round_trip() {
+        let cfg = Config::from_text("wal_palette: ''\nworkspace_genre_1: 'Development'\nworkspace_genre_10: \"Research & notes\"\nworkspace_genre_0: ignored\nworkspace_genre_11: ignored\nworkspace_genre_2: 42\n", std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.workspace_genres[0], "Development");
+        assert_eq!(cfg.workspace_genres[9], "Research & notes");
+        assert!(cfg.workspace_genres[1..9].iter().all(String::is_empty));
+        let saved = Config::from_text(&replace_top_level_values("", &cfg.ui_keys()), std::path::Path::new(".")).unwrap();
+        assert_eq!(saved.workspace_genres, cfg.workspace_genres);
     }
 
     #[test]

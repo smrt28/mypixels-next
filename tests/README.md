@@ -128,3 +128,28 @@ in live PTYs across two windows and hidden workspaces. It checks terminal pixel
 size reports, row counts, restoring the default, and preserving live font zoom.
 It uses isolated children and a FIFO, without desktop keyboard or clipboard
 input. Set `MYPIXELS_SPACING_SCREENSHOT=1` to save desktop screenshots with grim.
+
+`xvfb-run -a -s "-screen 0 1600x1000x24" python3 tests/workspace_panel_smoke.py`
+checks workspace cards, previews of parked terminals, exact-tab preview clicks,
+genre search with real editor input, Escape focus release, empty-workspace
+creation, the small-window layout, focused tabs beyond the first page, and
+left/right overflow buttons. It leaves screenshots in
+`/tmp/mypixels-workspace-panel-*`. Requires xdotool, ImageMagick and Pillow.
+
+The reviewed fork adds these checks:
+
+- `xvfb-run -a -s "-screen 0 1600x1000x24" python3 tests/menu_window_smoke.py --x11`
+  creates windows from the application menu, exercises both old and new windows,
+  and checks that window removal does not misroute later actions. The isolated
+  X server needs xdotool to focus its own test windows.
+- `python3 tests/brightness_smoke.py` checks rendered ANSI, truecolor, runtime
+  overrides, and previews. Use a private Wayland compositor with grim.
+- `MYPIXELS_ISOLATED_GRAPHICS_TEST=1 python3 tests/transparency_smoke.py` checks
+  opaque startup, live alpha changes, independent brightness, and both windows'
+  Wayland opaque-region hints. Use a private compositor with a black background
+  and grim; Gamescope with gamescopectl also works. `--x11` checks a private
+  XWayland display under the same compositor.
+- `python3 tests/yazi_image_smoke.py` checks real Yazi image previews, reuse of
+  image ids, navigation, large tiled previews, and resizing. Use a private
+  Wayland compositor with grim and Yazi installed; `--x11` uses its XWayland
+  display. Checks select the most recent upload when Yazi reuses image ids.

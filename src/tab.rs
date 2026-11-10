@@ -168,7 +168,7 @@ pub struct Tab {
 
     pub sender: EventLoopSender,
     /// Keep the event loop thread alive.
-    pub handle: std::thread::JoinHandle<(
+    _handle: std::thread::JoinHandle<(
         alacritty_terminal::event_loop::EventLoop<alacritty_terminal::tty::Pty, SpikeListener>,
         alacritty_terminal::event_loop::State,
     )>,
@@ -282,7 +282,7 @@ impl Tab {
             id: tab_id,
             term,
             sender,
-            handle,
+            _handle: handle,
             title,
             child_pid,
             cwd: Arc::new(Mutex::new((String::new(), None))),
@@ -346,12 +346,6 @@ impl Tab {
 
     pub fn clear_selection(&mut self) {
         self.term.lock().selection = None;
-    }
-
-    /// Rows currently owned by scrollback: everything below this buffer
-    /// index is final and can never be rewritten by the application.
-    pub fn history_size(&self) -> usize {
-        self.term.lock().grid().history_size()
     }
 
     /// (history rows, rows ever scrolled out of the viewport): the pair

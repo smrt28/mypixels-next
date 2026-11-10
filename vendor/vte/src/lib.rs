@@ -430,7 +430,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// the string exactly as it does for OSC - an APC interrupted by ESC
     /// still dispatches what it held, malformed-by-construction payloads
     /// being the consumer's problem to reject.
-    #[inline]
     fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
             0x18 | 0x1A => {

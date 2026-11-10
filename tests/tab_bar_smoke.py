@@ -80,9 +80,9 @@ def click(x, y, button=1):
     time.sleep(.25)
 
 
-def spy():
+def spy(window=1):
     count = log_path.read_text().count('SPY active=')
-    with keys.open('w') as out: out.write('spy\n')
+    with keys.open('w') as out: out.write(f'window:{window}:spy\n')
     wait(lambda: log_path.read_text().count('SPY active=') > count, 'spy response missing')
     line = [line for line in log_path.read_text().splitlines() if 'SPY active=' in line][-1]
     ids = list(map(int, re.findall(r'\d+\[:(\d+)\]', line)))
@@ -172,11 +172,15 @@ try:
     for total in range(2, 5):
         key('ctrl+shift+t')
         wait(lambda: len(spy()[0]) == total, 'new-tab shortcut failed')
+    # Locate the third tab from its own selection outline. Its x position
+    # changes with workspace chrome, captions, density, and the selected font.
+    key('alt+3')
+    target_left, target_right, _, _ = selected()
     key('alt+1')
     before, _ = spy()
     left, right, top, bottom = selected()
     run('xdotool', 'mousemove', '--window', wid, str(round((left + right) / 2)), str(round(strip / 2)), 'mousedown', '1')
-    run('xdotool', 'mousemove', '--window', wid, '370', str(round(strip / 2)))
+    run('xdotool', 'mousemove', '--window', wid, str(round((target_left + target_right) / 2)), str(round(strip / 2)))
     time.sleep(.25)
     run('xdotool', 'mouseup', '1')
     wait(lambda: spy()[0][2] == before[0], 'drag did not reorder the tab')
@@ -194,14 +198,22 @@ try:
     count = len(spy()[0])
     click((left + right) / 2, strip / 2, 2)
     wait(lambda: len(spy()[0]) == count - 1, 'middle-click close failed')
-    # Native out-of-window drops still detach a tab into another window.
+    # Native out-of-window drops must move the actual terminal, not leave an
+    # empty destination window after make_window changes the selected window.
+    before_detach, before_active = spy()
+    detached_id = before_detach[before_active]
     left, right, top, bottom = selected()
     run('xdotool', 'mousemove', '--window', wid, str(round((left + right) / 2)), str(round(strip / 2)), 'mousedown', '1')
     run('xdotool', 'mousemove', '--window', wid, '1100', '650')
     time.sleep(.2)
     run('xdotool', 'mouseup', '1')
     wait(lambda: len(windows()) == 2, 'dragging off the window did not detach the tab')
+    wait(lambda: len(spy(1)[0]) == len(before_detach) - 1, 'detached terminal stayed in the source window')
+    wait(lambda: spy(2) == ([detached_id], 0), 'new window did not receive the detached terminal')
     run('xdotool', 'windowfocus', '--sync', wid)
+    # An unmanaged X server does not raise a focused window. The detached
+    # window can otherwise intercept clicks intended for the original one.
+    run('xdotool', 'windowraise', wid)
     click(20, strip / 2)
     click(80, strip + 22)
     wait(lambda: len(windows()) == 3, 'menu did not create a new window')

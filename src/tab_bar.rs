@@ -45,7 +45,6 @@ pub(crate) fn show(
     font: egui::FontId,
     tabs: &[TabFace],
     active: usize,
-    clock: Option<&str>,
     menu_open: bool,
     workspace: usize,
     workspace_open: bool,
@@ -106,31 +105,31 @@ pub(crate) fn show(
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 p.vline(brand_width - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             }
-            let clock_width = if clock.is_some() && width >= 500.0 { 52.0 } else { 0.0 };
-            if clock_width > 0.0 {
-                ui_style::text(
-                    ui,
-                    egui::Rect::from_min_max(egui::pos2(width - clock_width, 0.0), egui::pos2(width, height)),
-                    clock.unwrap(),
-                    colors.muted,
-                    11.0,
-                    false,
-                );
-            }
-            let gap = 4.0;
-            let body_height = (height - 6.0).max(16.0);
-            let widths: Vec<f32> = tabs
-                .iter()
-                .map(|tab| {
-                    if !cfg.show_tab_titles { return 36.0; }
-                    let title = ui.painter().layout_no_wrap(tab.title.clone(), font.clone(), colors.fg);
-                    (title.size().x + 58.0 + if tab.entangled { 10.0 } else { 0.0 }).clamp(96.0, (width - brand_width - clock_width - 54.0).clamp(96.0, 236.0))
-                })
-                .collect();
+            let gap = if cfg.compact_tabs { 1.0 } else { 4.0 };
+            let margin = if cfg.compact_tabs { 1.0 } else { 3.0 };
+            let body_height = (height - 2.0 * margin).max(16.0);
+            let badge_width = |index: usize| if cfg.compact_tabs {
+                // Keep a character of breathing room on either side.
+                ((index + 1).to_string().len() + 2) as f32 * 7.0 + 2.0
+            } else { 19.0 };
+            let close_width = if cfg.compact_tabs { 14.0 } else { 20.0 };
+            let close_inset = if cfg.compact_tabs { 8.0 } else { 13.0 };
+            let widths: Vec<f32> = tabs.iter().enumerate().map(|(index, tab)| {
+                if !cfg.show_tab_titles { return if cfg.compact_tabs { badge_width(index) + 2.0 } else { 36.0 }; }
+                let title = ui.painter().layout_no_wrap(tab.title.clone(), font.clone(), colors.fg);
+                let (padding, minimum) = if cfg.compact_tabs {
+                    let fitted = badge_width(index) + close_width + 5.0;
+                    (fitted, fitted)
+                } else { (58.0, 96.0) };
+                let markers = if tab.entangled { 10.0 } else { 0.0 }
+                    + if cfg.compact_tabs && tab.group.is_some() { 6.0 } else { 0.0 };
+                (title.size().x + padding + markers).clamp(minimum,
+                    (width - brand_width - 54.0).clamp(minimum, 236.0))
+            }).collect();
             let content_width = widths.iter().sum::<f32>() + gap * tabs.len().saturating_sub(1) as f32;
-            let viewport_width = content_width.min((width - brand_width - clock_width - 38.0).max(30.0));
+            let viewport_width = content_width.min((width - brand_width - 38.0).max(30.0));
             let viewport =
-                egui::Rect::from_min_size(egui::pos2(brand_width + 4.0, 3.0), egui::vec2(viewport_width, body_height));
+                egui::Rect::from_min_size(egui::pos2(brand_width + gap, margin), egui::vec2(viewport_width, body_height));
             let selection = (tabs.get(active).map(|t| t.id), width.to_bits(), content_width.to_bits());
             let follow = ui.ctx().data_mut(|d| {
                 let id = egui::Id::unique("tab_bar_selection");
@@ -172,18 +171,19 @@ pub(crate) fn show(
                                 );
                             }
                             let badge = egui::Rect::from_center_size(
-                                egui::pos2(if cfg.show_tab_titles { rect.left() + 15.0 } else { rect.center().x }, rect.center().y),
-                                egui::vec2(19.0, (body_height - 6.0).max(14.0)),
+                                egui::pos2(if cfg.show_tab_titles { rect.left() + if cfg.compact_tabs { 1.0 + badge_width(index) * 0.5 } else { 15.0 } } else { rect.center().x }, rect.center().y),
+                                egui::vec2(badge_width(index), (body_height - if cfg.compact_tabs { 2.0 } else { 6.0 }).max(14.0)),
                             );
                             let mut badge_style = colors;
                             badge_style.fg = chrome.index;
                             badge_style.number_badge(ui.painter(), badge, index + 1, selected, 11.0);
                             let close = egui::Rect::from_center_size(
-                                egui::pos2(rect.right() - 13.0, rect.center().y),
-                                egui::vec2(20.0, body_height),
+                                egui::pos2(rect.right() - close_inset, rect.center().y),
+                                egui::vec2(close_width, body_height),
                             );
                             if cfg.show_tab_titles {
-                                let title = rect.with_min_x(badge.right() + 8.0).with_max_x(close.left() - 3.0);
+                                let title = rect.with_min_x(badge.right() + if cfg.compact_tabs { 1.0 } else { 8.0 })
+                                    .with_max_x(close.left() - if cfg.compact_tabs { 1.0 } else { 3.0 });
                                 if tab.entangled {
                                     ui_style::text(
                                         ui,
@@ -195,8 +195,8 @@ pub(crate) fn show(
                                     );
                                 }
                                 let group_width = if let Some(color) = tab.group {
-                                    ui.painter().circle_filled(egui::pos2(close.left() - 7.0, rect.center().y), 2.5, color);
-                                    10.0
+                                    ui.painter().circle_filled(egui::pos2(close.left() - if cfg.compact_tabs { 3.0 } else { 7.0 }, rect.center().y), 2.5, color);
+                                    if cfg.compact_tabs { 6.0 } else { 10.0 }
                                 } else { 0.0 };
                                 ui_style::text_with_font(
                                     ui,
@@ -221,7 +221,7 @@ pub(crate) fn show(
                                 // Native drag hit targets follow layout, so moving
                                 // neighbors do not retrigger a swap mid-animation.
                                 geometry.close[index] = egui::Rect::from_center_size(
-                                    egui::pos2(target.right() - 13.0, target.center().y), egui::vec2(20.0, body_height))
+                                    egui::pos2(target.right() - close_inset, target.center().y), egui::vec2(close_width, body_height))
                                     .intersect(viewport);
                             }
                             geometry.tabs[index] = target.intersect(viewport);
@@ -250,7 +250,7 @@ pub(crate) fn show(
                         }
                     });
                 });
-            let add = egui::Rect::from_min_size(egui::pos2(viewport.right() + 4.0, 3.0), egui::vec2(28.0, body_height));
+            let add = egui::Rect::from_min_size(egui::pos2(viewport.right() + gap, margin), egui::vec2(28.0, body_height));
             let response = ui.interact(add, egui::Id::unique("tab_bar_add"), egui::Sense::hover());
             if response.hovered() {
                 colors.surface(ui.painter(), add, 5.0, false, true);
@@ -272,6 +272,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_tabs_reduce_padding_without_clipping_controls() {
+        for width in [360.0, 1280.0] {
+            for show_titles in [false, true] {
+                let ctx = egui::Context::default();
+                let mut cfg = crate::config::Config::default();
+                cfg.show_tab_titles = show_titles;
+                let tabs: Vec<_> = (0..40).map(|id| TabFace {
+                    id, preview: None, title: "caption".into(), tooltip: "caption".into(),
+                    group: None, entangled: false, attention: 0.0,
+                }).collect();
+                let mut normal_width = 0.0;
+                let mut normal_height = 0.0;
+                for compact in [false, true] {
+                    cfg.compact_tabs = compact;
+                    let height = ui_style::tab_height(16.0, 1.0, compact);
+                    let mut geometry = Geometry::default();
+                    for _ in 0..5 {
+                        let mut full = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                            ..Default::default()
+                        }, |ui| {
+                            geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 0, false, &cfg);
+                        });
+                        full.textures_delta.clear();
+                    }
+                    let selected = geometry.tabs[39];
+                    assert!(selected.left() >= 0.0 && selected.right() < width);
+                    assert!(selected.top() >= 0.0 && selected.bottom() <= height);
+                    assert!(geometry.add.right() <= width && geometry.add.left() >= selected.right());
+                    if show_titles {
+                        let close = geometry.close[39];
+                        assert!(close.width() >= if compact { 13.0 } else { 18.0 });
+                        assert!(selected.contains_rect(close));
+                    } else {
+                        assert!(!geometry.close[39].is_positive());
+                    }
+                    if compact {
+                        assert!(selected.width() < normal_width);
+                        assert!(height < normal_height);
+                        if !show_titles { assert!((selected.width() - 32.0).abs() < 1.0); }
+                    } else {
+                        normal_width = selected.width();
+                        normal_height = height;
+                    }
+                }
+            }
+        }
+        // Compact spacing follows scale and leaves tall fonts unclipped.
+        assert_eq!(ui_style::tab_height(32.0, 2.0, true), 36.0);
+        assert_eq!(ui_style::tab_height(40.0, 1.0, true), 42.0);
+    }
+
+    #[test]
     fn number_only_tabs_are_compact_and_keep_selection_reachable() {
         for width in [360.0, 1280.0] {
             let ctx = egui::Context::default();
@@ -289,7 +342,7 @@ mod tests {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                         ..Default::default()
                     }, |ui| {
-                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, None, false, 0, false, &cfg);
+                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, false, 0, false, &cfg);
                     });
                     if !show_titles {
                         assert!(!full.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
@@ -331,7 +384,7 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                 ..Default::default()
             }, |ui| {
-                geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, Some("12:34"), false, 2, false, &cfg);
+                geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg);
             });
             full.textures_delta.clear();
             let mark = geometry.workspace;
@@ -352,7 +405,7 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                 ..Default::default()
             }, |ui| {
-                off = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, Some("12:34"), false, 2, false, &cfg);
+                off = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg);
             });
             out.textures_delta.clear();
             assert!(!off.workspace.is_positive(), "a hidden indicator still claims a rect");
@@ -386,7 +439,7 @@ mod tests {
                         },
                         |ui| {
                             geometry =
-                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, Some("12:34"), false, 0, false, &cfg);
+                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, false, 0, false, &cfg);
                         },
                     );
                     output.textures_delta.clear();

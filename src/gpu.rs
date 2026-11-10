@@ -295,7 +295,7 @@ fn fs(i: VSIn) -> @location(0) vec4<f32> {
 /// An uploaded image texture and its bind group, keyed by (tab, id, gen).
 struct ImgSlot {
     _tex: wgpu::Texture,
-    view: wgpu::TextureView,
+    _view: wgpu::TextureView,
     bind: wgpu::BindGroup,
 }
 
@@ -864,7 +864,7 @@ impl Gpu {
                 },
             ],
         });
-        self.img_cache.insert(key, ImgSlot { _tex: tex, view, bind });
+        self.img_cache.insert(key, ImgSlot { _tex: tex, _view: view, bind });
     }
 
     /// Drop every texture belonging to a tab (tab close).
