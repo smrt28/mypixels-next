@@ -134,6 +134,17 @@ impl Selection {
         self.region.end = Anchor::new(point, side);
     }
 
+    /// The point where the selection was started.
+    pub fn start_point(&self) -> Point {
+        self.region.start.point
+    }
+
+    /// Set the side of the start anchor, e.g. to keep the pressed cell in
+    /// the selection as the drag direction changes.
+    pub fn set_start_side(&mut self, side: Side) {
+        self.region.start.side = side;
+    }
+
     pub fn rotate<D: Dimensions>(
         mut self,
         dimensions: &D,

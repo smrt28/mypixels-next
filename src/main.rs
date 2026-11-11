@@ -2035,8 +2035,12 @@ impl App {
                     // Same buffer-line transform as `cell_at`, applied to
                     // the edge row of the post-scroll view.
                     let col = ((px / self.cell_w).floor() as usize).min(self.wins[self.cur].cols.saturating_sub(1));
-                    let within = px / self.cell_w - (px / self.cell_w).floor();
-                    let side = if within < 0.5 { Side::Left } else { Side::Right };
+                    // The edge row is the moving end of the selection. The
+                    // pointer's half-cell side would clip it at the cell
+                    // midline (and col 0, Left, wraps to the previous line
+                    // and drops the whole row), so face the side toward the
+                    // drag and select through the cell under the pointer.
+                    let side = if d > 0 { Side::Left } else { Side::Right };
                     let vis_row = if d > 0 { 0 } else { self.wins[self.cur].rows as i32 - 1 };
                     let off = tab.term.lock().grid().display_offset() as i32;
                     tab.update_selection(

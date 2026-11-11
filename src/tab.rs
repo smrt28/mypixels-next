@@ -319,7 +319,24 @@ impl Tab {
 
     /// Grow the selection to a cell while dragging.
     pub fn update_selection(&self, at: Point, side: Side) {
-        if let Some(sel) = self.term.lock().selection.as_mut() {
+        let mut term = self.term.lock();
+        if let Some(sel) = term.selection.as_mut() {
+            // The cell under the press always stays in the selection, VTE's
+            // rule. The range drops the start cell when the start anchor's
+            // side faces INTO it, so as the drag moves the start anchor's
+            // side must face away from the drag: Left when the selection
+            // grows right/down from the press, Right when it grows left/up.
+            match sel.ty {
+                SelectionType::Simple => {
+                    let start = sel.start_point();
+                    sel.set_start_side(if at >= start { Side::Left } else { Side::Right });
+                },
+                SelectionType::Block => {
+                    let start = sel.start_point();
+                    sel.set_start_side(if at.column >= start.column { Side::Left } else { Side::Right });
+                },
+                _ => {},
+            }
             sel.update(at, side);
         }
     }
