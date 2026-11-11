@@ -327,13 +327,23 @@ impl Tab {
             // side must face away from the drag: Left when the selection
             // grows right/down from the press, Right when it grows left/up.
             match sel.ty {
+                SelectionType::Block => {
+                    // A block is a rectangle of whole cells, edges inclusive:
+                    // both anchor sides face outward. (With the pointer's
+                    // half-cell sides, a vertical drag in one column reads
+                    // as zero width and selects nothing.)
+                    if at.column >= sel.start_point().column {
+                        sel.set_start_side(Side::Left);
+                        sel.update(at, Side::Right);
+                    } else {
+                        sel.set_start_side(Side::Right);
+                        sel.update(at, Side::Left);
+                    }
+                    return;
+                },
                 SelectionType::Simple => {
                     let start = sel.start_point();
                     sel.set_start_side(if at >= start { Side::Left } else { Side::Right });
-                },
-                SelectionType::Block => {
-                    let start = sel.start_point();
-                    sel.set_start_side(if at.column >= start.column { Side::Left } else { Side::Right });
                 },
                 _ => {},
             }

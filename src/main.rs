@@ -6535,8 +6535,12 @@ impl ApplicationHandler for App {
                         // whole rows: what VTE does, and why the clicks have to be
                         // counted by hand.
                         let count = self.count_click(0, at);
+                        // Shift+drag is the rectangular (column) selection.
+                        // Shift already bypasses the terminal's mouse
+                        // reporting, so the gesture is the app's; Alt would
+                        // race the Alt-held tab switcher for the same drag.
                         let ty = match count {
-                            _ if self.modifiers.alt_key() => SelectionType::Block,
+                            _ if self.modifiers.alt_key() || self.modifiers.shift_key() => SelectionType::Block,
                             3 => SelectionType::Lines,
                             2 => SelectionType::Semantic,
                             _ => SelectionType::Simple,
