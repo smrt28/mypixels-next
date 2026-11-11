@@ -113,8 +113,10 @@ pub(crate) fn show(
                 p.vline(tabs_right, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             }
             let gap = if cfg.compact_tabs { 1.0 } else { 4.0 };
-            let margin = if cfg.compact_tabs { 1.0 } else { 3.0 };
-            let body_height = (height - 2.0 * margin).max(16.0);
+            let margin = if cfg.compact_tabs { 1.0 / ui.ctx().pixels_per_point() } else { 3.0 };
+            let body_height = if cfg.compact_tabs {
+                (height - 2.0 * margin).max(1.0)
+            } else { (height - 2.0 * margin).max(16.0) };
             let badge_width = |index: usize| if cfg.compact_tabs {
                 // Keep a character of breathing room on either side.
                 ((index + 1).to_string().len() + 2) as f32 * 7.0 + 2.0
@@ -179,7 +181,7 @@ pub(crate) fn show(
                             }
                             let badge = egui::Rect::from_center_size(
                                 egui::pos2(if cfg.show_tab_titles { rect.left() + if cfg.compact_tabs { 1.0 + badge_width(index) * 0.5 } else { 15.0 } } else { rect.center().x }, rect.center().y),
-                                egui::vec2(badge_width(index), (body_height - if cfg.compact_tabs { 2.0 } else { 6.0 }).max(14.0)),
+                                egui::vec2(badge_width(index), if cfg.compact_tabs { body_height } else { (body_height - 6.0).max(14.0) }),
                             );
                             let mut badge_style = colors;
                             badge_style.fg = chrome.index;
@@ -326,9 +328,12 @@ mod tests {
                 }
             }
         }
-        // Compact spacing follows scale and leaves tall fonts unclipped.
-        assert_eq!(ui_style::tab_height(32.0, 2.0, true), 36.0);
+        // Compact spacing is exactly two physical pixels, including small fonts.
+        assert_eq!(ui_style::tab_height(10.0, 1.0, true), 12.0);
+        assert_eq!(ui_style::tab_height(11.5, 1.0, true), 14.0);
+        assert_eq!(ui_style::tab_height(32.0, 2.0, true), 34.0);
         assert_eq!(ui_style::tab_height(40.0, 1.0, true), 42.0);
+        assert_eq!(ui_style::tab_height(10.0, 1.0, false), 28.0);
     }
 
     #[test]
