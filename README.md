@@ -50,6 +50,9 @@ query, not a launch.
 Features
 ========
 
+* Font sizes in Settings → Appearance → Fonts accept up to two decimal places,
+  such as `11.2` or `11.25` pt. Click the size to type a value; the +/− buttons
+  step by one point. Config values also accept decimals, e.g. `term_font: 'Cascadia Code 11.2'`.
 * Adjustable line spacing in Settings → Appearance → Fonts. `0` keeps the
   normal spacing, `+0.1` adds 10% row height, and `-0.1` removes 10%, without
   changing font size. The `line_spacing` config key accepts -0.9 through 3.0;
