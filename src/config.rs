@@ -525,12 +525,8 @@ impl Config {
     /// top-level key's value line is replaced, anything else (comments,
     /// bindings, palettes, keys the UI does not touch) stays byte for
     /// byte. Keys the file does not have yet are appended.
-    pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path().ok_or("Cannot determine configuration path")?;
-        self.save_to(&path)
-    }
-
-    /// Save, optionally rewriting the `bindings:` block too. Bindings are
+    ///
+    /// Optionally rewrite the `bindings:` block too. Bindings are
     /// only rewritten when the configuration UI actually changed one, so a
     /// hand-written block and its comments survive every other save.
     pub fn save_with_bindings(&self, include_bindings: bool) -> Result<(), String> {
@@ -590,10 +586,6 @@ impl Config {
             }
         }
         out
-    }
-
-    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
-        self.save_to_with(path, false)
     }
 
     /// (yaml key, value text) for every field the configuration UI can change.
@@ -1650,7 +1642,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn workspace_shortcuts_use_alt_shift_digits_and_free_alt_letters() {
         let cfg = Config::default();

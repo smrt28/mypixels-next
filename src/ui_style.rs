@@ -293,7 +293,6 @@ pub(crate) enum Icon {
     Filter,
     ChevronLeft,
     ChevronRight,
-    More,
     Clock,
     Check,
     Error,
@@ -455,11 +454,6 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
         Icon::Search => {
             p.circle_stroke(pt(-2.0, -2.0), 6.0, stroke);
             line(&[(2.5, 2.5), (8.0, 8.0)]);
-        }
-        Icon::More => {
-            for x in [-6.0, 0.0, 6.0] {
-                p.circle_filled(pt(x, 0.0), 1.3, color);
-            }
         }
         Icon::Clock => {
             p.circle_stroke(center, 7.0, stroke);
