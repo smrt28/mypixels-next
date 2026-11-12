@@ -232,3 +232,16 @@ env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=/path/to/private/runtime \
 The test creates unique named sessions and a private D-Bus/MCP daemon; it never
 uses `-A` against the desktop's shared named-session registry. Screenshots use
 Gamescope's capture command or `grim` on a compositor with screencopy support.
+
+Bash shell integration has a display-independent regression check:
+
+```sh
+python3 tests/bash_shell_integration.py
+```
+
+It starts isolated interactive Bash processes on PTYs and checks OSC 133 marker
+order with dynamic multiline prompts, scalar/compound/array `PROMPT_COMMAND`
+hooks, repeated sourcing through `.sh` and `.bash`, preserved exit statuses,
+failure bells, existing `DEBUG` traps and `PS0` content. The Bash case in
+`history_smoke.py` also uses a dynamically rebuilt prompt to verify that history
+shows the command and can re-run it.

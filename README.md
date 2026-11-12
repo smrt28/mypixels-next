@@ -280,6 +280,8 @@ the XDG data dirs; see [themes/README.md](themes/README.md).
 
 For command capture, source the matching
 `scripts/shell_integration.{bash,zsh,fish}` from your shell rc.
+Bash users can also source `scripts/shell_integration.sh` from `~/.bashrc`,
+after prompt setup; it loads the same Bash integration.
 
 Layout
 ======

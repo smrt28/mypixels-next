@@ -41,7 +41,11 @@ hide_single_tab: false
         args = ['zsh', '-d', '-i']
     elif shell == 'bash':
         rc = work / 'bashrc'
-        rc.write_text("PS1='界 project\\n❯ '\n" + f"source {integration}\nsource {integration}\n")
+        # Prompt themes commonly regenerate PS1 on every prompt. The Bash
+        # integration must place its input marker after all array hooks run.
+        rc.write_text("__test_prompt() { PS1='界 project\\n❯ '; }\n"
+                      "PROMPT_COMMAND=(__test_prompt)\n"
+                      f"source {root / 'scripts/shell_integration.sh'}\nsource {integration}\n")
         args = ['bash', '--noprofile', '--rcfile', str(rc), '-i']
     else:
         init = work / 'init.fish'
