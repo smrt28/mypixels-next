@@ -158,9 +158,11 @@ Features
   missing tabs up to that number automatically (0 selects tab 10). Existing tabs
   keep their numbers; new tabs are appended. Workspaces remember the selected tab
   and keep their terminals running. Visiting an empty workspace opens its
-  first terminal. The workspace number beside the terminal icon, ruled off from
-  the icon and the tabs and drawn in its own colour, opens the workspace panel:
-  cards in their own colours, with tab counts and live terminal previews.
+  first terminal. The workspace button, drawn in its own colour, opens the workspace panel.
+  Choose **Left** (beside the menu) or **Right** (the default, at the end of the strip)
+  under **Settings → Appearance → Layout → Workspace button position**.
+  This applies immediately and saves as `workspace_button_position: left` or `right`.
+  The panel shows cards in their own colours, with tab counts and live terminal previews.
   The selected card expands; click a preview to open that exact tab. Each view
   scrolls to its focused tab, with left/right buttons when more cards are available.
   Up/Down select a workspace and Enter switches to it. Left/Right focus the

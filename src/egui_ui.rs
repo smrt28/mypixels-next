@@ -2601,6 +2601,21 @@ fn appearance_page(
         ui.label(egui::RichText::new("1× is normal. Lower is slower; 0 turns animations off.")
             .small().color(colors.muted));
     });
+    section(ui, "Layout", colors, |ui| {
+        form_grid("appearance-layout").show(ui, |ui| {
+            row(ui, "Workspace button position", |ui| {
+                use crate::config::WorkspaceButtonPosition;
+                egui::ComboBox::from_id_salt("workspace_button_position")
+                    .popup_style((**ui.style()).clone().into())
+                    .width(140.0).selected_text(cfg.workspace_button_position.label())
+                    .show_ui(ui, |ui| {
+                        for position in [WorkspaceButtonPosition::Left, WorkspaceButtonPosition::Right] {
+                            ev.apply |= ui.selectable_value(&mut cfg.workspace_button_position, position, position.label()).changed();
+                        }
+                    }).response.on_hover_text("Left: next to the menu. Right: at the end of the tab strip.");
+            });
+        });
+    });
     section(ui, "Tab colors", colors, |ui| {
         form_grid("colors-tabs").show(ui, |ui| {
             color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
@@ -3567,7 +3582,7 @@ mod regression {
     /// settings), so a control that drifts to another page fails this test
     /// instead of quietly rendering somewhere.
     const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
-        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Tab strip", "Group colors", "Workspace 1"]),
+        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Workspace button position", "Tab strip", "Group colors", "Workspace 1"]),
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
         (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),

@@ -3,7 +3,7 @@
 use crate::ui_style::{self, Icon};
 
 const MENU_WIDTH: f32 = 42.0;
-/// Minimum width of the workspace indicator at the right end of the tab strip.
+/// Minimum width of the workspace indicator at either end of the tab strip.
 const WORKSPACE_WIDTH: f32 = 32.0;
 
 pub(crate) fn menu_button_rect(height: f32) -> egui::Rect {
@@ -75,7 +75,9 @@ pub(crate) fn show(
                 (ui_style::text_width(ui, &workspace_label, 11.0) + 22.0)
                     .max(WORKSPACE_WIDTH).min((width * 0.5).clamp(WORKSPACE_WIDTH, 240.0))
             } else { 0.0 };
-            let tabs_right = width - workspace_width;
+            let workspace_left = cfg.workspace_button_position == crate::config::WorkspaceButtonPosition::Left;
+            let tabs_left = MENU_WIDTH + if workspace_left { workspace_width } else { 0.0 };
+            let tabs_right = width - if workspace_left { 0.0 } else { workspace_width };
             let menu = menu_button_rect(height);
             let response = ui.interact(menu, egui::Id::unique("app_menu_button"), egui::Sense::click());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "mypixels menu"));
@@ -89,11 +91,12 @@ pub(crate) fn show(
                 center + egui::vec2(3.0, -1.5)], egui::Stroke::new(1.0, color)));
             geometry.menu_clicked = response.clicked();
             response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
-            // Separate the menu from the tabs.
+            // Separate the menu from the next strip control.
             p.vline(MENU_WIDTH - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             if workspace_width > 0.0 {
+                let start = if workspace_left { MENU_WIDTH } else { tabs_right };
                 let workspace_rect = egui::Rect::from_min_max(
-                    egui::pos2(tabs_right + 3.0, 3.0), egui::pos2(width - 3.0, height - 3.0));
+                    egui::pos2(start + 3.0, 3.0), egui::pos2(start + workspace_width - 3.0, height - 3.0));
                 let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
                 let description = if genre.is_empty() { format!("Workspace {}", workspace + 1) }
                     else { format!("Workspace {} · {}", workspace + 1, genre) };
@@ -110,7 +113,8 @@ pub(crate) fn show(
                 response.on_hover_text(format!("{} · {} · click for the workspace panel",
                     description, crate::config::workspace_shortcut(cfg, workspace)))
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
-                p.vline(tabs_right, 0.0..=height, egui::Stroke::new(1.0, colors.border));
+                p.vline(if workspace_left { tabs_left } else { tabs_right },
+                    0.0..=height, egui::Stroke::new(1.0, colors.border));
             }
             let gap = if cfg.compact_tabs { 1.0 } else { 4.0 };
             let margin = if cfg.compact_tabs { 1.0 / ui.ctx().pixels_per_point() } else { 3.0 };
@@ -133,16 +137,16 @@ pub(crate) fn show(
                 let markers = if tab.entangled { 10.0 } else { 0.0 }
                     + if cfg.compact_tabs && tab.group.is_some() { 6.0 } else { 0.0 };
                 (title.size().x + padding + markers).clamp(minimum,
-                    (tabs_right - MENU_WIDTH - 54.0).clamp(minimum, 236.0))
+                    (tabs_right - tabs_left - 54.0).clamp(minimum, 236.0))
             }).collect();
             let content_width = widths.iter().sum::<f32>() + gap * tabs.len().saturating_sub(1) as f32;
-            let viewport_width = content_width.min((tabs_right - MENU_WIDTH - 38.0).max(30.0));
+            let viewport_width = content_width.min((tabs_right - tabs_left - 38.0).max(30.0));
             let viewport =
-                egui::Rect::from_min_size(egui::pos2(MENU_WIDTH + gap, margin), egui::vec2(viewport_width, body_height));
-            let selection = (tabs.get(active).map(|t| t.id), tabs_right.to_bits(), content_width.to_bits());
+                egui::Rect::from_min_size(egui::pos2(tabs_left + gap, margin), egui::vec2(viewport_width, body_height));
+            let selection = (tabs.get(active).map(|t| t.id), tabs_left.to_bits(), tabs_right.to_bits(), content_width.to_bits());
             let follow = ui.ctx().data_mut(|d| {
                 let id = egui::Id::unique("tab_bar_selection");
-                let old = d.get_temp::<(Option<usize>, u32, u32)>(id);
+                let old = d.get_temp::<(Option<usize>, u32, u32, u32)>(id);
                 d.insert_temp(id, selection);
                 old != Some(selection)
             });
@@ -279,6 +283,64 @@ pub(crate) fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_button_can_move_live_without_hiding_tabs_or_stealing_their_hits() {
+        use crate::config::WorkspaceButtonPosition::{Left, Right};
+        for width in [360.0, 1280.0] {
+            for compact in [false, true] {
+                for genre in ["", "A long workspace genre that still leaves room for tabs"] {
+                    let ctx = egui::Context::default();
+                    let mut cfg = crate::config::Config::default();
+                    cfg.workspaces_enabled = true;
+                    cfg.compact_tabs = compact;
+                    cfg.workspace_genres[2] = genre.into();
+                    let tabs: Vec<_> = (0..40).map(|id| TabFace {
+                        id, preview: None, title: format!("terminal {id}"), tooltip: String::new(),
+                        group: None, entangled: false, attention: 0.0,
+                    }).collect();
+                    let height = ui_style::tab_height(16.0, 1.0, compact);
+                    let mut geometry = Geometry::default();
+                    for position in [Right, Left, Right] {
+                        cfg.workspace_button_position = position;
+                        for _ in 0..5 {
+                            let mut full = ctx.run_ui(egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                                ..Default::default()
+                            }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg));
+                            full.textures_delta.clear();
+                        }
+                        let button = geometry.workspace;
+                        let selected = geometry.tabs[39];
+                        assert!(button.is_positive() && selected.is_positive());
+                        assert!(selected.contains_rect(geometry.close[39]), "active tab close target clipped");
+                        assert!(geometry.add.left() >= selected.right());
+                        assert!(geometry.add.right() <= width);
+                        assert!(!button.intersects(selected) && !button.intersects(geometry.add));
+                        if position == Left {
+                            assert_eq!(button.left(), MENU_WIDTH + 3.0);
+                            assert!(selected.left() >= button.right());
+                        } else {
+                            assert_eq!(button.right(), width - 3.0);
+                            assert!(geometry.add.right() <= button.left());
+                        }
+                        let pos = button.center();
+                        let mut events = vec![egui::Event::PointerMoved(pos)];
+                        events.extend([true, false].into_iter().map(|pressed| egui::Event::PointerButton {
+                            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                        }));
+                        let mut full = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                            events, ..Default::default()
+                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg));
+                        full.textures_delta.clear();
+                        assert!(geometry.workspace_clicked, "workspace button lost its hit target after moving");
+                        assert!(!geometry.menu_clicked);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn compact_tabs_reduce_padding_without_clipping_controls() {

@@ -4,6 +4,23 @@
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceButtonPosition { Left, Right }
+
+impl WorkspaceButtonPosition {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Left => "left", Self::Right => "right" }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self { Self::Left => "Left", Self::Right => "Right" }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value { "left" => Some(Self::Left), "right" => Some(Self::Right), _ => None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseWindowDialog { Never, Loss, Always }
 
 impl CloseWindowDialog {
@@ -140,6 +157,8 @@ pub struct Config {
     pub compact_tabs: bool,
     /// Ten independent tab sets per window. Off by default.
     pub workspaces_enabled: bool,
+    /// Which end of the tab strip holds the workspace button.
+    pub workspace_button_position: WorkspaceButtonPosition,
     /// Opt-in alternative workspace shortcut: Alt+Q..P. Off by default because
     /// bare Alt+letter collides with shell and editor bindings (word-wise
     /// backward word, readline shortcuts). The standard scheme is
@@ -309,6 +328,7 @@ impl Default for Config {
             show_tab_titles: true,
             compact_tabs: false,
             workspaces_enabled: false,
+            workspace_button_position: WorkspaceButtonPosition::Right,
             workspace_letter_keys: false,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
@@ -558,6 +578,7 @@ impl Config {
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
             ("compact_tabs".into(), self.compact_tabs.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
+            ("workspace_button_position".into(), str_(self.workspace_button_position.as_str())),
             ("workspace_letter_keys".into(), self.workspace_letter_keys.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
@@ -983,6 +1004,13 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                         cfg.workspace_letter_keys = b;
                     }
                 },
+                "workspace_button_position" => {
+                    if let Some(position) = val.as_str().and_then(WorkspaceButtonPosition::parse) {
+                        cfg.workspace_button_position = position;
+                    } else {
+                        eprintln!("bad workspace_button_position value (expected left or right)");
+                    }
+                },
                 "tab_overview_on_alt" => {
                     if let Some(b) = val.as_bool() {
                         cfg.tab_overview_on_alt = b;
@@ -1296,6 +1324,22 @@ pub fn binding_conflict(bindings: &[(String, Vec<Binding>)], action: &str, b: &B
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_button_position_round_trips_and_rejects_invalid_values() {
+        assert_eq!(Config::default().workspace_button_position, WorkspaceButtonPosition::Right);
+        let base = std::path::Path::new(".");
+        for (value, position) in [("left", WorkspaceButtonPosition::Left), ("right", WorkspaceButtonPosition::Right)] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nworkspace_button_position: {value}\n"), base).unwrap();
+            assert_eq!(cfg.workspace_button_position, position);
+            let saved = replace_top_level_values("# keep this comment\n", &cfg.ui_keys());
+            assert!(saved.starts_with("# keep this comment\n"));
+            assert_eq!(Config::from_text(&saved, base).unwrap().workspace_button_position, position);
+        }
+        for invalid in ["middle", "false", "12"] {
+            let cfg = Config::from_text(&format!("wal_palette: ''\nworkspace_button_position: {invalid}\n"), base).unwrap();
+            assert_eq!(cfg.workspace_button_position, WorkspaceButtonPosition::Right);
+        }
+    }
     #[test]
     fn close_window_dialog_policy_defaults_and_survives_save() {
         assert_eq!(Config::default().close_window_dialog, CloseWindowDialog::Always);
