@@ -1185,6 +1185,17 @@ impl App {
         } else {
             persistent::set_attached(self.wins.iter().any(|w| w.window.is_some()), false);
         }
+        self.finish_empty_named_session(event_loop);
+    }
+
+    fn finish_empty_named_session(&self, event_loop: &ActiveEventLoop) {
+        // Detached windows still own open tabs. Individually buried tabs were
+        // explicitly closed and must not keep an otherwise empty session alive.
+        if persistent::enabled() && !self.initial_window
+            && self.wins.iter().all(|w| w.all_tabs().next().is_none())
+            && self.closed_windows.iter().all(|w| w.tabs().next().is_none()) {
+            event_loop.exit();
+        }
     }
 
     fn window_retainer(&self) -> egui_ui::WindowRetainer {
@@ -1316,6 +1327,7 @@ impl App {
             self.forget_tab(id);
         }
         if let Some(id) = original { self.select_window(id); }
+        self.finish_empty_named_session(event_loop);
     }
 
     /// Hand a tab from one window to another. The tab object itself moves:
@@ -2683,6 +2695,9 @@ impl App {
                         let top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
                         let ws: Vec<_> = self.config.workspace_colors.iter().map(|c| ui_style::rgb_c32(*c)).collect();
                         egui_ui::workspaces_panel(ui, &mut egui.ui_state, ok, err, top, &ws);
+                    }
+                    if !self.config.cursor_highlight {
+                        self.ripple = None;
                     }
                     if let Some(r) = self.ripple.as_ref() {
                         let t = r.at.elapsed().as_secs_f32() / 0.18;
@@ -5583,6 +5598,9 @@ impl App {
 
     /// Visual-bell strength: 1.0 at the BEL, fading to 0 over 180ms.
     fn bell_flash(&self) -> f32 {
+        if !self.config.visual_bell {
+            return 0.0;
+        }
         let b = self.bell.lock().unwrap();
         match *b {
             Some(t) => {
@@ -6988,7 +7006,7 @@ impl ApplicationHandler for App {
                 // chord, not asking "is my keyboard here" - no ring.
                 let chorded = new.intersects(Ms::CONTROL | Ms::ALT | Ms::SUPER)
                     && old.intersects(Ms::CONTROL | Ms::ALT | Ms::SUPER);
-                if fresh && !chorded {
+                if self.config.cursor_highlight && fresh && !chorded {
                     if let Some(([x, y], color)) = self.cursor_pt {
                         self.ripple = Some(Ripple { x, y, at: Instant::now(), color });
                         window.request_redraw();
@@ -7059,10 +7077,8 @@ impl ApplicationHandler for App {
         // `wins` is routinely empty here: closing the last window empties it
         // before winit fires Exiting. And say goodbye to every window's
         // tabs, not just the current one's.
-        for w in self.wins.iter_mut() {
-            for tab in w.all_tabs() {
-                let _ = tab.sender.send(Msg::Shutdown);
-            }
+        for tab in self.all_tabs() {
+            let _ = tab.sender.send(Msg::Shutdown);
         }
     }
 }

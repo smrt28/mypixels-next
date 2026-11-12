@@ -194,6 +194,10 @@ pub struct Config {
     // tab color groups
     pub col: [Rgb; 8],
     // behavior
+    /// Flash the terminal background on BEL.
+    pub visual_bell: bool,
+    /// Ring the cursor when a bare modifier key (including Win/Super) is pressed.
+    pub cursor_highlight: bool,
     /// Enables the Alt-held visual tab switcher. Numbered shortcuts work independently.
     pub tab_overview_on_alt: bool,
     pub show_tab_titles: bool,
@@ -369,6 +373,8 @@ impl Default for Config {
                 parse_hex("#2aa198"),
                 parse_hex("#859900"),
             ],
+            visual_bell: true,
+            cursor_highlight: true,
             tab_overview_on_alt: true,
             show_tab_titles: true,
             compact_tabs: false,
@@ -613,6 +619,8 @@ impl Config {
             ("tab_title_max_length".into(), self.tab_title_max_length.to_string()),
             ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
+            ("visual_bell".into(), self.visual_bell.to_string()),
+            ("cursor_highlight".into(), self.cursor_highlight.to_string()),
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
             ("compact_tabs".into(), self.compact_tabs.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
@@ -1068,6 +1076,16 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                         eprintln!("bad workspace_button_position value (expected left or right)");
                     }
                 },
+                "visual_bell" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.visual_bell = b;
+                    }
+                },
+                "cursor_highlight" => {
+                    if let Some(b) = val.as_bool() {
+                        cfg.cursor_highlight = b;
+                    }
+                },
                 "tab_overview_on_alt" => {
                     if let Some(b) = val.as_bool() {
                         cfg.tab_overview_on_alt = b;
@@ -1381,6 +1399,26 @@ pub fn binding_conflict(bindings: &[(String, Vec<Binding>)], action: &str, b: &B
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_feedback_defaults_and_independent_toggles_survive_save() {
+        let base = std::path::Path::new(".");
+        let defaults = Config::default();
+        assert!(defaults.visual_bell && defaults.cursor_highlight);
+        for visual_bell in [false, true] {
+            for cursor_highlight in [false, true] {
+                let yaml = format!("wal_palette: ''\nvisual_bell: {visual_bell}\ncursor_highlight: {cursor_highlight}\n");
+                let cfg = Config::from_text(&yaml, base).unwrap();
+                assert_eq!((cfg.visual_bell, cfg.cursor_highlight), (visual_bell, cursor_highlight));
+                let saved = replace_top_level_values("# keep\n", &cfg.ui_keys());
+                assert!(saved.starts_with("# keep\n"));
+                let restored = Config::from_text(&saved, base).unwrap();
+                assert_eq!((restored.visual_bell, restored.cursor_highlight), (visual_bell, cursor_highlight));
+            }
+        }
+        let invalid = Config::from_text("wal_palette: ''\nvisual_bell: nope\ncursor_highlight: 42\n", base).unwrap();
+        assert!(invalid.visual_bell && invalid.cursor_highlight);
+    }
+
     #[test]
     fn workspace_button_position_round_trips_and_rejects_invalid_values() {
         assert_eq!(Config::default().workspace_button_position, WorkspaceButtonPosition::Right);

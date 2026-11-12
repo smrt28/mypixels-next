@@ -220,7 +220,9 @@ compositor (or its XWayland server with `--x11`) and requires
 retain more detached windows than `graveyard_limit`, preserve tab/window order
 and child PIDs, continue answering terminal queries while detached, and restore
 interactive input. It also exercises the default windowless daemon and its
-`--restore-window` command. For example, with a private runtime directory:
+`--restore-window` command, and verifies that a named session exits after its
+last tab exits (including while detached) or is explicitly closed. For example,
+with a private runtime directory:
 
 ```sh
 env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=/path/to/private/runtime \
@@ -245,3 +247,17 @@ hooks, repeated sourcing through `.sh` and `.bash`, preserved exit statuses,
 failure bells, existing `DEBUG` traps and `PS0` content. The Bash case in
 `history_smoke.py` also uses a dynamically rebuilt prompt to verify that history
 shows the command and can re-run it.
+
+`tests/feedback_smoke.py` checks Settings → Terminal's Visual bell and Cursor
+highlight switches on a private X11/XWayland display. It compares rendered bell
+flashes and cursor rings from real repeated Win/Super key presses, tests live
+preview, saves both switches, and verifies Cancel restores the saved values.
+It requires Pillow, libX11, libXtst, and either Gamescope's screenshot command or
+ImageMagick `import`. For example, with a private runtime directory:
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=/path/to/private/runtime \
+  MYPIXELS_ISOLATED_FEEDBACK_TEST=1 dbus-run-session -- \
+  gamescope --backend headless --expose-wayland -W 1600 -H 1000 -- \
+  python3 tests/feedback_smoke.py
+```

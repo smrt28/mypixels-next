@@ -49,6 +49,7 @@ def background():
     sent = False
     while True:
         (work / f'alive-{index}').touch()
+        if (work / f'stop-{index}').exists(): os._exit(0)
         if (work / f'query-{index}').exists() and not sent:
             os.write(1, b'\\x1b[16t')
             sent = True
@@ -143,9 +144,26 @@ try:
         sp.run(capture + [str(work / 'restored.png')], env=env, check=True, timeout=10)
         wait(lambda: (work / 'restored.png').exists(), 'screenshot missing')
 
-    # Stop the named owner before reusing the FIFO for a different app process.
-    os.kill(app_pid, signal.SIGTERM)
-    wait(lambda: not Path(f'/proc/{app_pid}/fd/0').exists(), 'named owner did not stop')
+    # Exiting the final visible tabs must retain a detached window's terminals.
+    key('window:2:ctrl+shift+w')
+    for index in (0, 1): (work / f'stop-{index}').touch()
+    wait(lambda: not json.loads(state.read_text())['attached'], 'exited window stayed attached')
+    heartbeat(2)
+    assert Path(f'/proc/{app_pid}/fd/0').exists(), 'detached tab lost its session'
+    # Once the last detached terminal exits there is no empty owner to attach to.
+    (work / 'stop-2').touch()
+    wait(lambda: not Path(f'/proc/{app_pid}/fd/0').exists(), 'empty named session did not exit')
+    assert name + '\t' not in sp.check_output([binary, '-l'], env=env, text=True)
+    app_pid = None
+
+    # Reuse the name, then explicitly close its only tab. Its graveyard burial
+    # must not keep the named owner alive after the last open tab is closed.
+    launch('-S', name)
+    wait(lambda: (work / 'alive-3').exists(), 'fresh named session missing')
+    app_pid = json.loads((work / 'pid-3').read_text())['app']
+    key('window:1:ctrl+alt+x')
+    wait(lambda: not Path(f'/proc/{app_pid}/fd/0').exists(), 'last-tab close left an empty session')
+    assert name + '\t' not in sp.check_output([binary, '-l'], env=env, text=True)
     app_pid = None
 
     # The upstream --daemon stays windowless, accepts a window, and restores it.
@@ -157,15 +175,15 @@ try:
     wait(lambda: (work / 'mcp.sock').exists(), 'daemon did not register')
     assert windows() == [], 'daemon spawned a window at startup'
     launch('--new-tab')
-    wait(lambda: len(windows()) == 1 and (work / 'alive-3').exists(), 'daemon window missing')
+    wait(lambda: len(windows()) == 1 and (work / 'alive-4').exists(), 'daemon window missing')
     before = windows()[0]
     key('window:1:ctrl+shift+w')
     wait(lambda: not windows(), 'daemon last window did not close')
-    heartbeat(3)
+    heartbeat(4)
     launch('--restore-window')
     wait(lambda: len(windows()) == 1, 'daemon window did not restore')
     assert windows()[0]['tabs'] == before['tabs'], 'daemon restore changed tabs'
-    print('PASS: background launch, named multi-window detach/restore, live input and protocol replies, daemon restore; artifacts:', work)
+    print('PASS: background launch, named multi-window detach/restore, live input and protocol replies, last-tab exit/close, daemon restore; artifacts:', work)
 finally:
     if app_pid:
         try: os.kill(app_pid, signal.SIGTERM)

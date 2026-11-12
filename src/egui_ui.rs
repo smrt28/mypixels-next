@@ -2839,9 +2839,17 @@ fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut 
     });
 }
 
-/// Terminal: deliberately sparse. Unrelated controls do not belong here just
-/// because this page has room.
+/// Terminal scrollback and visual feedback.
 fn terminal_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Visual feedback", colors, |ui| {
+        form_grid("terminal-feedback").show(ui, |ui| {
+            checkbox_row(ui, "Visual bell", &mut cfg.visual_bell, ev);
+            checkbox_row(ui, "Cursor highlight", &mut cfg.cursor_highlight, ev);
+        });
+        ui.label(egui::RichText::new(
+            "Visual bell flashes the terminal background. Cursor highlight rings the cursor when pressing Win or another modifier key.",
+        ).small().color(colors.muted));
+    });
     section(ui, "Scrollback", colors, |ui| {
         form_grid("terminal").show(ui, |ui| {
             row(ui, "Scrollback lines", |ui| {
@@ -3704,7 +3712,7 @@ mod regression {
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
         (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
-        (SettingsPage::Terminal, &["Scrollback lines"]),
+        (SettingsPage::Terminal, &["Scrollback lines", "Visual bell", "Cursor highlight"]),
         (SettingsPage::Keys, &["Copy", "Search this tab", "Text bigger"]),
     ];
 

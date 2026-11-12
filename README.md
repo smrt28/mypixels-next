@@ -51,7 +51,9 @@ new instance. `-n` remains an explicit spelling of the default window action.
 `mypixels -S work` creates a named session or reattaches its existing windows.
 Closing a window detaches it: its terminal processes keep running, and reattaching
 preserves the live tabs, ordering, titles, working directories, terminal screen,
-and configured scrollback. Tabs closed explicitly retain their normal behavior.
+and configured scrollback. Closing or exiting the final tab ends the named
+session, including when its final running tab belongs to a detached window.
+Individually closed tabs in the graveyard do not keep an empty named session alive.
 An optional command (for example `mypixels -S work sh`) runs only when creating
 the session; attaching never opens extra tabs or starts the command again.
 Names are nonempty, case-sensitive, scoped to the current user, and unrestricted
@@ -164,6 +166,13 @@ query, not a launch.
 
 Features
 ========
+
+* **Settings → Terminal → Visual feedback** offers independent **Visual bell**
+  and **Cursor highlight** switches. Both are enabled by default and preview
+  immediately; Save persists them and Cancel restores the saved values.
+  Visual bell controls the terminal-background flash. Cursor highlight controls
+  the existing cursor ring on Win/Super and other bare modifier presses.
+  The YAML settings are `visual_bell: true` and `cursor_highlight: true`.
 
 * Font sizes in Settings → Appearance → Fonts accept up to two decimal places,
   such as `11.2` or `11.25` pt. Click the size to type a value; the +/− buttons
