@@ -35,6 +35,8 @@ Usage
       -n, --new-window   open a new window in the running instance (default)
       -t, --new-tab      add a tab to the originating or first session window
       -s, --standalone   run a private instance: never join or host a session
+          --daemon      start a persistent session without opening a window
+          --restore-window  reopen the last closed window with its live tabs
 
 Without flags, mypixels finds the running instance on this display over D-Bus
 and asks it to open a new window for the command in the current directory.
@@ -42,6 +44,72 @@ It prints the instance and requested action to stdout before sending the request
 Use `-t` / `--new-tab` to add a tab to the originating window (or the first
 session window when launched elsewhere). If no session answers, it starts a
 new instance. `-n` remains an explicit spelling of the default window action.
+
+### Persistent session and window graveyard
+
+`mypixels --daemon` starts a session with **no windows and no terminal children**.
+Launch `mypixels` normally to open windows in it. Closing the last window leaves
+the daemon running; its terminals continue running in the window graveyard.
+Closing a whole window preserves its tab order, workspaces, selected workspace,
+and each workspace's selected tab. The native window and GPU resources are
+released until restoration. Restored shells retain their window's session ID,
+so `mypixels --new-tab` from one still opens in the restored window.
+
+Restore the most recently closed window with `mypixels --restore-window` from
+any launcher, or **Ctrl+Alt+Shift+Z** from another Mypixels window. The application
+menu also offers **Restore last closed window**. The graveyard panel
+(**Ctrl+Shift+G**) lists closed windows with **Restore window** and **Kill window**
+buttons, alongside individually closed tabs. **Ctrl+Shift+Z** raises the last
+closed tab into the current window.
+
+`graveyard_limit` (default 5) bounds closed tabs and closed windows separately.
+A whole window counts as one window burial regardless of its tab count. Each
+list evicts its oldest entry when full. Children that exit while buried are
+removed; restoring a window whose selected workspace emptied selects another
+live workspace. These are live processes held in memory: stopping the service,
+logging out, or a daemon crash ends them.
+
+The close dialog is enabled by default. Under **Settings → Window → Close
+window dialog**, choose **Never**, **When tabs would be lost**, or **Always**
+(the default). The YAML key `close_window_dialog` accepts `never`, `loss`, or `always`.
+Loss-only prompts when neither this session's daemon nor another open window
+can retain the terminals. Choosing Never skips the dialog and its safeguards.
+
+The dialog defaults to **Cancel**. **Move to Graveyard** appears only when
+recovery is available. **Close permanently…** opens a separate danger step;
+when recovery is unavailable the dialog opens directly at that step. The red
+permanent-close button unlocks after five seconds and requires an explicit
+action. Timer expiry never closes anything. Closing the remaining recovery
+host while a dialog is open switches it to a fresh warning and countdown.
+
+To pre-spawn the daemon for your graphical login:
+
+```sh
+cargo build --release
+scripts/install.sh install
+systemctl --user enable --now mypixels.service
+```
+
+The installer writes the unit to `$XDG_CONFIG_HOME/systemd/user/mypixels.service`
+(default `~/.config/systemd/user/mypixels.service`) with the installed binary's
+absolute path. It installs the unit without enabling or restarting it. Enable
+it before launching the first window: a foreground instance already owning this
+display must exit before a daemon can own the same session. Normal foreground
+and `--standalone` instances still exit when their last window closes.
+
+The service follows `graphical-session.target`, and needs the graphical display
+environment in the user manager. On compositors that do not import it, run:
+
+```sh
+systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY
+systemctl --user start mypixels.service
+```
+
+For compositors that do not activate `graphical-session.target`, run those
+commands from the compositor's startup configuration. This is a windowless
+graphical client: it connects to the display, but creates windows and GPU
+surfaces only when requested. Check its logs with
+`journalctl --user -u mypixels.service`.
 
 `mypixels last [n] [--copy]` prints (or clipboard-copies) the output
 of the last n commands from the running session's memory pool - a

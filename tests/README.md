@@ -3,6 +3,21 @@
 Run `cargo test --offline` from the repo root for font layout, configuration, clipboard
 transfer bounds, and PTY paste encoding checks.
 
+`dbus-run-session -- xvfb-run -a python3 tests/daemon_smoke.py` checks the
+windowless daemon: no startup windows or children, duplicate-owner rejection,
+remote launch, last-window closure, restoration with the original child PIDs,
+tab order and workspace selections, protocol replies without windows, child
+exit cleanup, whole-window graveyard eviction, stable routing from restored
+shells, and the graveyard's Restore/Kill window buttons. It uses a private session
+bus, display, MCP socket, configuration, and terminal children; it never starts
+or stops the desktop's systemd service.
+
+`dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" python3 tests/close_dialog_smoke.py`
+checks the default close dialog and all three visibility policies, Cancel
+focus, disabled destructive clicks, the five-second delay, blocked terminal
+input, recovery-host disappearance, and permanent closure with a surviving
+window. It saves screenshots of the recovery and danger states in `/tmp`.
+
 For keyboard/mouse behavior, build the debug binary, then run from the repository
 root:
 

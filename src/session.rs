@@ -1,13 +1,5 @@
-//! Single-instance ("daemon") plumbing over the session D-Bus, with the
-//! semantics the GTK original got from GApplication: the first mypixels on a
-//! display owns a bus name; later invocations forward themselves to it and
-//! exit. See `--standalone` for opting out.
-//!
-//! One deliberate divergence from the original: a forwarded invocation opens a
-//! *tab* in the running window, in the caller's working directory -- a sibling
-//! session beside the shell that ran `mypixels`, which is what "open in the
-//! current session" is for. (The original opened a new window there; that
-//! lands properly when the port has real multi-window support.)
+//! Per-display session ownership and window/tab requests over D-Bus. A
+//! `--daemon` session starts without windows and retains closed terminals.
 
 use std::sync::mpsc;
 
@@ -25,6 +17,7 @@ pub enum Request {
     /// Open another window of this session, same parameters otherwise --
     /// what `mypixels -n` asks for when a session is already up.
     NewWindow { cwd: Option<String>, argv: Vec<String> },
+    RestoreWindow,
     /// Present the window without opening anything.
     Raise,
     /// Hand the last `n` commands' captured output of `window`'s active
@@ -97,36 +90,43 @@ pub fn start(
     wake: impl Fn() + Send + 'static,
 ) -> Option<Server> {
     let base = base.to_string();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("session-dbus".into())
         .spawn(move || {
-            if let Err(e) = futures::executor::block_on(serve(&base, tx, wake)) {
+            if let Err(e) = futures::executor::block_on(serve(&base, tx, wake, ready_tx)) {
                 log::warn!("session bus: {e}; running without single-instance");
             }
         })
         .ok()?;
-    Some(Server)
+    ready_rx.recv().ok().filter(|ready| *ready).map(|_| Server)
 }
 
 async fn serve(
     base: &str,
     tx: mpsc::Sender<Request>,
     wake: impl Fn(),
+    ready: mpsc::SyncSender<bool>,
 ) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
+    let mut stream = zbus::MessageStream::from(&conn);
     // One process, one session name, as many windows behind it as wanted.
     // A plain request queues nothing: if another session holds the name the
     // answer is an immediate error, and this process is simply not the
     // session -- the normal state of a --standalone or a racing second
     // launcher, not a failure.
-    match conn.request_name(base).await {
-        Ok(()) => log::info!("session registered as {base}"),
+    match conn.request_name_with_flags(base, zbus::fdo::RequestNameFlags::DoNotQueue.into()).await {
+        Ok(zbus::fdo::RequestNameReply::PrimaryOwner | zbus::fdo::RequestNameReply::AlreadyOwner) => {
+            log::info!("session registered as {base}");
+            let _ = ready.send(true);
+        }
+        Ok(_) => { let _ = ready.send(false); return Ok(()); }
         Err(e) => {
             log::debug!("session {base} not acquired ({e}); another instance is up");
+            let _ = ready.send(false);
             return Ok(());
         }
     }
-    let mut stream = zbus::MessageStream::from(&conn);
     while let Some(msg) = futures::StreamExt::next(&mut stream).await {
         let msg = match msg {
             Ok(m) => m,
@@ -166,6 +166,10 @@ async fn serve(
             },
             Some("Raise") => {
                 let _ = tx.send(Request::Raise);
+                wake();
+            }
+            Some("RestoreWindow") => {
+                let _ = tx.send(Request::RestoreWindow);
                 wake();
             }
             Some("LastOutput") => {
@@ -236,6 +240,17 @@ pub fn remote_last(n: u64, copy: bool) -> Option<String> {
             None
         }
     }
+}
+
+/// Restoration has no local fallback: starting a new process cannot recover
+/// terminals held by a missing session.
+pub fn remote_restore_window() -> bool {
+    let Some(name) = bus_name() else { return false };
+    futures::executor::block_on(async {
+        let conn = zbus::Connection::session().await?;
+        conn.call_method(Some(name.as_str()), PATH, Some(IFACE), "RestoreWindow", &()).await?
+            .body().deserialize::<()>()
+    }).map_err(|e: zbus::Error| log::warn!("restore window: {e}")).is_ok()
 }
 
 async fn remote_last_async(name: &str, n: u64, copy: bool) -> zbus::Result<Option<String>> {

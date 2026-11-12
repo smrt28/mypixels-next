@@ -165,7 +165,7 @@ fn handle(
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "window": { "type": "number", "description": "1-based window number; the default is the window the user is looking at." },
+                            "window": { "type": "number", "description": "Stable window id from list_windows; the default is the window the user is looking at." },
                             "n": { "type": "number", "description": "How many commands to fetch (default 1)." }
                         }
                     }

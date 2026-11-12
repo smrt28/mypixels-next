@@ -283,6 +283,7 @@ fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, 
 
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
+    Archive,
     Terminal,
     Plus,
     Settings,
@@ -357,6 +358,13 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
     let line =
         |points: &[(f32, f32)]| p.add(egui::Shape::line(points.iter().map(|&(x, y)| pt(x, y)).collect(), stroke));
     match icon {
+        Icon::Archive => {
+            p.rect_stroke(egui::Rect::from_center_size(pt(0.0, 2.0), egui::vec2(18.0, 15.0)),
+                2.0, stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(egui::Rect::from_center_size(pt(0.0, -6.0), egui::vec2(21.0, 4.0)),
+                1.0, stroke, egui::StrokeKind::Inside);
+            line(&[(-3.0, -1.0), (3.0, -1.0)]);
+        }
         Icon::Plus => {
             line(&[(-6.0, 0.0), (6.0, 0.0)]);
             line(&[(0.0, -6.0), (0.0, 6.0)]);

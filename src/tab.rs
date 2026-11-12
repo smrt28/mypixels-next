@@ -37,6 +37,7 @@ pub struct SemanticMark {
 /// records title changes, and reports child exit.
 #[derive(Clone)]
 pub struct SpikeListener {
+    pub wake: winit::event_loop::EventLoopProxy<()>,
     pub window: Arc<Mutex<Vec<Arc<Window>>>>,
     pub tab_id: usize,
     pub title: Arc<Mutex<String>>,
@@ -74,7 +75,11 @@ pub struct SpikeListener {
 
 impl SpikeListener {
     fn notify_window(&self) {
-        for w in self.window.lock().unwrap().iter() {
+        let windows = self.window.lock().unwrap();
+        if windows.is_empty() {
+            let _ = self.wake.send_event(());
+        }
+        for w in windows.iter() {
             w.request_redraw();
         }
     }
@@ -102,9 +107,11 @@ impl EventListener for SpikeListener {
             },
             Event::PtyWrite(text) => {
                 self.pty_writes.lock().unwrap().push((self.tab_id, text));
+                self.notify_window();
             },
             Event::Apc { payload, line, col } => {
                 self.apcs.lock().unwrap().push((self.tab_id, payload, line, col));
+                self.notify_window();
             },
             Event::Semantic { code, exit, line, row, col, alt, command, output } => {
                 log::debug!("sem mark tab {} code {} exit {:?} line {} row {} col {} alt {}", self.tab_id, code, exit, line, row, col, alt);
@@ -198,6 +205,7 @@ impl Tab {
         window: u32,
     ) -> Tab {
         let listener = SpikeListener {
+            wake: shared.wake.clone(),
             window: Arc::clone(&shared.window),
             tab_id,
             title: Arc::new(Mutex::new(String::new())),

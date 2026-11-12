@@ -15,6 +15,9 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 
 # Sources within repo
 BIN_SRC="${REPO_ROOT}/${APP_NAME}"
+if [[ -x "${REPO_ROOT}/target/release/${APP_NAME}" ]]; then
+  BIN_SRC="${REPO_ROOT}/target/release/${APP_NAME}"
+fi
 ICON_SRC="${REPO_ROOT}/icon.png"
 
 # XDG target locations
@@ -30,13 +33,15 @@ BIN_DST="${BIN_DIR}/${APP_NAME}"
 DESKTOP_DST="${APP_DIR}/${APP_NAME}.desktop"
 ICON_DST="${ICON_SIZE_DIR}/${ICON_NAME}.png"
 PIXMAPS_DST="${PIXMAPS_DIR}/${ICON_NAME}.png"
+UNIT_DIR="${XDG_CONFIG_HOME:-"${HOME}/.config"}/systemd/user"
+UNIT_DST="${UNIT_DIR}/${APP_NAME}.service"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <install|update|remove>
 
 Actions:
-  install   Install executable, icon, and desktop entry to user directories
+  install   Install executable, icon, desktop entry, and user service
   update    Re-install files from the current repo (same as install)
   remove    Remove installed files from user directories
 
@@ -44,6 +49,7 @@ Installs to:
   bin:       ${BIN_DIR}
   desktop:   ${APP_DIR}
   icon:      ${ICON_SIZE_DIR} (and ${PIXMAPS_DIR} as fallback)
+  service:   ${UNIT_DST} (enable separately)
 EOF
 }
 
@@ -67,7 +73,7 @@ Type=Application
 Version=1.0
 Name=Mypixels
 GenericName=Terminal Emulator
-Comment=Low-clutter GTK-based terminal emulator
+Comment=Tabbed terminal emulator with a live window graveyard
 Exec=${BIN_DST} %F
 TryExec=${BIN_DST}
 Icon=${ICON_NAME}
@@ -106,19 +112,48 @@ install_desktop() {
   fi
 }
 
+install_service() {
+  mkdir -p "${UNIT_DIR}"
+  local line escaped_bin
+  # ExecStart is systemd syntax: quote the path and escape its special chars.
+  escaped_bin="${BIN_DST//\\/\\\\}"
+  escaped_bin="${escaped_bin//\"/\\\"}"
+  escaped_bin="${escaped_bin//\$/\$\$}"
+  escaped_bin="${escaped_bin//%/%%}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == 'ExecStart=@MYPIXELS_BIN@ --daemon' ]]; then
+      printf 'ExecStart="%s" --daemon\n' "${escaped_bin}"
+    else
+      printf '%s\n' "${line}"
+    fi
+  done < "${SCRIPT_DIR}/mypixels.service.in" > "${UNIT_DST}"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+}
+
 do_install() {
   ensure_requirements
   install_bin
   install_icon
   install_desktop
+  install_service
   echo "Installed ${APP_NAME} to user directories."
   echo "- Binary:   ${BIN_DST}"
   echo "- Desktop:  ${DESKTOP_DST}"
   echo "- Icon:     ${ICON_DST}"
+  echo "- Service:  ${UNIT_DST}"
+  echo "Enable the windowless session: systemctl --user enable --now ${APP_NAME}.service"
 }
 
 do_remove() {
   local removed_any=false
+  if [[ -e "${UNIT_DST}" ]]; then
+    systemctl --user disable --now "${APP_NAME}.service" 2>/dev/null || true
+    rm -f "${UNIT_DST}"
+    removed_any=true
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
   if [[ -e "${BIN_DST}" ]]; then rm -f "${BIN_DST}" && removed_any=true; fi
   if [[ -e "${DESKTOP_DST}" ]]; then rm -f "${DESKTOP_DST}" && removed_any=true; fi
   if [[ -e "${ICON_DST}" ]]; then rm -f "${ICON_DST}" && removed_any=true; fi
@@ -161,4 +196,3 @@ main() {
 }
 
 main "$@"
-
