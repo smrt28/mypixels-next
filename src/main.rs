@@ -39,7 +39,7 @@ use glyphon::{
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::wayland::WindowAttributesExtWayland as _;
 use winit::window::{Window, WindowId};
@@ -258,6 +258,22 @@ struct GraveEntry {
     closed_at: Instant,
 }
 
+/// A closed window keeps its live terminals and workspace selections, while
+/// its native window, surface and GPU resources are released.
+struct ClosedWindow {
+    id: usize,
+    workspaces: Vec<Workspace>,
+    workspace: usize,
+    size: winit::dpi::PhysicalSize<u32>,
+    maximized: bool,
+}
+
+impl ClosedWindow {
+    fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.workspaces.iter().flat_map(|ws| ws.tabs.iter())
+    }
+}
+
 /// A persistent GPU thumbnail shared by switcher cards and tab hover previews.
 /// Identity follows the tab across reordering; closed tabs release their texture.
 #[derive(Clone)]
@@ -288,6 +304,8 @@ struct Workspace {
 /// why the windows live in one process at all: a terminal is its pty, and a
 /// pty cannot cross a process boundary.
 struct Win {
+    /// Stable D-Bus identity inherited by this window's shells.
+    session_id: u32,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     /// egui side: config panel, switcher overlay, rename box -- one context
@@ -396,6 +414,9 @@ impl Win {
 }
 
 struct App {
+    persistent: bool,
+    initial_window: bool,
+    wake: EventLoopProxy<()>,
     config: Config,
     /// The windows of this session, in creation order. `cur` is the one the
     /// event being handled belongs to (set by the router at the top of
@@ -403,6 +424,7 @@ struct App {
     wins: Vec<Win>,
     cur: usize,
     next_id: usize,
+    next_window_id: u32,
     cell_w: f32,
     cell_h: f32,
     tab_char_w: f32,
@@ -511,9 +533,9 @@ struct App {
     /// Buried tabs, oldest first: closing a tab does not kill the shell.
     /// The tab keeps running here - pty, child, scrollback all live - until
     /// it is raised from the graveyard panel, the limit evicts it, its
-    /// child exits on its own, or the last window ends the session. Bounded
-    /// by `graveyard_limit`.
+    /// child exits on its own, or the session ends. Bounded by `graveyard_limit`.
     graveyard: Vec<GraveEntry>,
+    closed_windows: Vec<ClosedWindow>,
     /// URLs on the row under the pointer (only that row can underline or
     /// be clicked); reparsed only when the row's content hash moves.
     url_spans: Vec<UrlSpan>,
@@ -529,6 +551,7 @@ struct App {
     pending_move: Option<(WindowId, usize)>,
     /// A context-menu choice, run by the drain (which has the event loop).
     pending_action: Option<(WindowId, String)>,
+    pending_close: Option<(WindowId, egui_ui::CloseChoice)>,
     /// A graveyard choice (raise/kill), deferred to the drain: applying it
     /// inside the draw path would shrink the graveyard mid-frame, and the
     /// preview index space built at the frame's top would go stale under it.
@@ -547,7 +570,7 @@ struct App {
 }
 
 impl App {
-    fn new(persistent: Option<std::os::unix::net::UnixListener>, proxy: winit::event_loop::EventLoopProxy<()>) -> Self {
+    fn new(wake: EventLoopProxy<()>, daemon: bool, persistent_listener: Option<std::os::unix::net::UnixListener>) -> Self {
         let config = Config::load();
         // Pango sizes are points; cosmic-text wants pixels (@96 dpi). The
         // parsed family may still carry style words ("Foo Bold 12");
@@ -643,14 +666,12 @@ impl App {
 
         let window_slot = Arc::new(Mutex::new(Vec::new()));
         let key_rx = spawn_key_reader(Arc::clone(&window_slot));
-        // Daemon mode: claim this display's session name unless asked for a
-        // private instance. Another `mypixels` run will find us here and open
-        // its tab in *this* window instead of growing another frame; its
-        // request arrives on this channel (see the RedrawRequested drain).
+        // Named sessions own a private socket; the default daemon and ordinary
+        // windows share the display's D-Bus session. All can wake without windows.
         let standalone = persistent::enabled() || leading_flags().iter().any(|a| a == "--standalone" || a == "-s");
         let (session_tx, session_rx) = std::sync::mpsc::channel();
-        if let Some(listener) = persistent {
-            persistent::serve(listener, session_tx.clone(), proxy);
+        if let Some(listener) = persistent_listener {
+            persistent::serve(listener, session_tx.clone(), wake.clone());
         }
         let (mcp_tx, mcp_rx) = std::sync::mpsc::channel();
         let _session = if standalone {
@@ -658,32 +679,29 @@ impl App {
         } else {
             session::bus_name()
                 .and_then(|name| {
-                    let slot = Arc::clone(&window_slot);
+                    let wake = wake.clone();
                     session::start(&name, session_tx, move || {
-                        if let Ok(slot) = slot.lock() {
-                            for w in slot.iter() {
-                                w.request_redraw();
-                            }
-                        }
+                        let _ = wake.send_event(());
                     })
                 })
         };
+        if daemon && _session.is_none() {
+            eprintln!("mypixels --daemon: could not own the display session (already running or no session bus)");
+            std::process::exit(1);
+        }
         // LLM observability: read-only MCP endpoint on a per-display unix
         // socket (windows, tabs, captured command output). Same
         // standalone carve-out as the session bus.
         let _mcp = if standalone {
             None
         } else {
-            let slot = Arc::clone(&window_slot);
+            let wake = wake.clone();
             mcp::start(mcp_tx, Arc::new(move || {
-                if let Ok(slot) = slot.lock() {
-                    for w in slot.iter() {
-                        w.request_redraw();
-                    }
-                }
+                let _ = wake.send_event(());
             }))
         };
         let shared = SpikeListener {
+            wake: wake.clone(),
             window: Arc::clone(&window_slot),
             tab_id: 0,
             title: Arc::new(Mutex::new(String::new())),
@@ -774,10 +792,14 @@ impl App {
         let rows = (((config.default_height as f32 - tab_h) / cell_h) as usize).clamp(10, 400);
 
         App {
+            persistent: daemon || persistent::enabled(),
+            initial_window: !daemon,
+            wake,
             wins: Vec::new(),
             cur: 0,
             config,
             next_id: 0,
+            next_window_id: 1,
             cols,
             rows,
             cell_w,
@@ -828,10 +850,12 @@ impl App {
             mcp_rx,
             pending_move: None,
             pending_action: None,
+            pending_close: None,
             pending_grave: None,
             ripple: None,
             cursor_pt: None,
             graveyard: Vec::new(),
+            closed_windows: Vec::new(),
             url_spans: Vec::new(),
             url_cache: None,
             url_hover: None,
@@ -923,7 +947,7 @@ impl App {
             // The shell learns WHICH window of the session it lives in, so a
             // `mypixels` typed in it joins that window, not window 1. 1-based
             // because 0 in the environment means "standalone, stay out".
-            self.cur as u32 + 1,
+            if self._session.is_some() { self.wins[self.cur].session_id } else { 0 },
         )
     }
 
@@ -1107,56 +1131,191 @@ impl App {
         config::find_action(&self.config.bindings, &unshifted, self.modifiers, overview_active)
     }
 
-    /// Recreate display resources while retaining every live terminal object.
+    /// Restore named-session windows with the same live terminal objects.
+    /// Stable window IDs recover creation order even when closed out of order.
     fn reattach_windows(&mut self, event_loop: &ActiveEventLoop) {
-        let selected = self.cur;
-        for i in 0..self.wins.len() {
-            if self.wins[i].window.is_some() { continue; }
-            self.cur = i;
-            let size = winit::dpi::PhysicalSize::new(
-                (self.wins[i].cols as f32 * self.cell_w) as u32,
-                (self.wins[i].rows as f32 * self.cell_h + self.tab_h) as u32,
-            );
-            let window = Arc::new(event_loop.create_window(
-                Window::default_attributes().with_inner_size(size)
-                    .with_transparent(true).with_title("mypixels")
-                    .with_name("mypixels", "mypixels").with_window_icon(app_icon())
-            ).expect("reattach window"));
-            self.wins[i].window = Some(Arc::clone(&window));
-            self.wins[i].occluded = false;
-            self.window_slot.lock().unwrap().push(Arc::clone(&window));
-            self.init_gpu(event_loop, &window);
-            self.wins[i].frame_gen = self.wins[i].frame_gen.wrapping_add(1);
-            window.request_redraw();
+        let selected = self.wins.get(self.cur).map(|w| w.session_id);
+        while !self.closed_windows.is_empty() {
+            self.revive_window(0, event_loop);
         }
-        self.cur = selected.min(self.wins.len().saturating_sub(1));
+        if self.wins.is_empty() {
+            self.make_window(event_loop, None, None, true);
+        }
+        self.wins.sort_by_key(|w| w.session_id);
+        self.cur = selected.and_then(|id| self.wins.iter().position(|w| w.session_id == id)).unwrap_or(0);
     }
 
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
-        // A window dying buries all its tabs — the current workspace and
-        // the live terminals parked in inactive workspaces — so raising
-        // walks them back in the order they were lost.
-        let mut all = std::mem::take(&mut self.wins[i].tabs);
-        for ws in std::mem::take(&mut self.wins[i].workspaces) {
-            all.extend(ws.tabs);
-        }
-        for tab in all {
-            self.bury_tab(tab);
+        let win = &mut self.wins[i];
+        let workspace = win.workspace;
+        let mut workspaces = std::mem::take(&mut win.workspaces);
+        workspaces[workspace] = Workspace {
+            tabs: std::mem::take(&mut win.tabs), active: win.active,
+        };
+        if workspaces.iter().any(|ws| !ws.tabs.is_empty()) {
+            for tab in workspaces.iter().flat_map(|ws| &ws.tabs) {
+                tab.term.lock().is_focused = false;
+            }
+            self.closed_windows.push(ClosedWindow {
+                id: win.session_id as usize, workspaces, workspace,
+                size: win.window.as_ref().unwrap().inner_size(),
+                maximized: win.window.as_ref().unwrap().is_maximized(),
+            });
+            // A named-session detach must retain every window, independently
+            // of the ordinary/daemon graveyard eviction limit.
+            while !persistent::enabled() && self.closed_windows.len() > self.config.graveyard_limit {
+                self.kill_closed_window(0);
+            }
         }
         if let Some(w) = self.wins[i].window.as_ref() {
             let id = w.id();
             self.window_slot.lock().unwrap().retain(|w| w.id() != id);
         }
         self.wins.remove(i);
+        for win in &self.wins {
+            if let Some(window) = &win.window { window.request_redraw(); }
+        }
         self.cur = self.cur.min(self.wins.len().saturating_sub(1));
-        // Burials live while a window does: there is no UI to raise from
-        // without one, and a headless process holding shells is a leak, not
-        // a feature. The last window ending the session takes them with it.
-        if self.wins.is_empty() {
+        self.modifiers = ModifiersState::empty();
+        *self.switcher_alt_at.lock().unwrap() = None;
+        self.switcher_open.store(false, Ordering::SeqCst);
+        self.switcher_show_req.store(false, Ordering::SeqCst);
+        if self.wins.is_empty() && !self.persistent {
             event_loop.exit();
         } else {
             persistent::set_attached(self.wins.iter().any(|w| w.window.is_some()), false);
         }
+    }
+
+    fn window_retainer(&self) -> egui_ui::WindowRetainer {
+        if self.persistent { egui_ui::WindowRetainer::Daemon }
+        else if self.wins.len() > 1 { egui_ui::WindowRetainer::OtherWindow }
+        else { egui_ui::WindowRetainer::None }
+    }
+
+    fn request_window_close(&mut self, event_loop: &ActiveEventLoop) {
+        if persistent::enabled() {
+            self.close_window(self.cur, event_loop);
+            return;
+        }
+        let retainer = self.window_retainer();
+        if !self.config.close_window_dialog.should_show(retainer != egui_ui::WindowRetainer::None) {
+            self.close_window(self.cur, event_loop);
+            return;
+        }
+        self.open_close_dialog();
+    }
+
+    fn open_close_dialog(&mut self) {
+        let retainer = self.window_retainer();
+        self.close_switcher();
+        let win = &mut self.wins[self.cur];
+        let tabs = win.all_tabs().count();
+        let workspaces = usize::from(!win.tabs.is_empty())
+            + win.workspaces.iter().filter(|ws| !ws.tabs.is_empty()).count();
+        win.renaming = false;
+        win.tab_drag = None;
+        win.tab_close_press = None;
+        win.mouse_button = None;
+        if let Some(egui) = win.egui.as_mut() {
+            let st = &mut egui.ui_state;
+            // Repeated WM requests neither confirm nor restart the countdown.
+            if !st.confirm_open {
+                st.rename_open = false;
+                st.menu_open = false;
+                st.move_open = false;
+                st.info_page = None;
+                st.font_popup = None;
+                st.key_capture = None;
+                st.confirm_open = true;
+                st.confirm_seed = true;
+                st.confirm_out = None;
+                st.confirm = egui_ui::CloseDialog::new(retainer, tabs, workspaces, self.config.graveyard_limit);
+                egui_ui::release_focus(&egui.ctx);
+            }
+        }
+        if let Some(window) = &win.window { window.request_redraw(); }
+    }
+
+    fn destroy_window(&mut self, event_loop: &ActiveEventLoop) {
+        let ids: Vec<_> = self.wins[self.cur].all_tabs().map(|tab| tab.id).collect();
+        for id in ids { self.forget_tab(id); }
+        self.wins[self.cur].tabs.clear();
+        for ws in &mut self.wins[self.cur].workspaces { ws.tabs.clear(); }
+        self.close_window(self.cur, event_loop);
+    }
+
+    fn kill_closed_window(&mut self, index: usize) {
+        let window = self.closed_windows.remove(index);
+        for tab in window.tabs() { self.forget_tab(tab.id); }
+    }
+
+    fn revive_window(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        if index >= self.closed_windows.len() { return; }
+        let mut closed = self.closed_windows.remove(index);
+        self.make_window(event_loop, None, None, false);
+        let win = &mut self.wins[self.cur];
+        win.session_id = closed.id as u32;
+        win.workspace = closed.workspace;
+        let active = std::mem::take(&mut closed.workspaces[closed.workspace]);
+        win.tabs = active.tabs;
+        win.active = active.active;
+        win.workspaces = closed.workspaces;
+        // The selected workspace may have emptied while the window was buried.
+        if win.tabs.is_empty() {
+            if let Some(target) = win.other_workspace() { win.select_workspace(target); }
+        }
+        if let Some(window) = &win.window {
+            window.set_maximized(closed.maximized);
+            if !closed.maximized { let _ = window.request_inner_size(closed.size); }
+            window.request_redraw();
+        }
+        self.sync_term_size();
+    }
+
+    fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.wins.iter().flat_map(|w| w.all_tabs())
+            .chain(self.graveyard.iter().map(|entry| &entry.tab))
+            .chain(self.closed_windows.iter().flat_map(|w| w.tabs()))
+    }
+
+    /// Reap children even when no native window exists to request a redraw.
+    fn drain_exited(&mut self, event_loop: &ActiveEventLoop) {
+        let exited = std::mem::take(&mut *self.exited.lock().unwrap());
+        let original = self.wins.get(self.cur).and_then(|w| w.window.as_ref()).map(|w| w.id());
+        for id in exited {
+            if let Some(pos) = self.graveyard.iter().position(|g| g.tab.id == id) {
+                self.kill_grave(pos);
+                continue;
+            }
+            for window in &mut self.closed_windows {
+                for ws in &mut window.workspaces {
+                    remove_exited_tab(&mut ws.tabs, &mut ws.active, id);
+                }
+            }
+            self.closed_windows.retain(|w| w.tabs().next().is_some());
+            for wi in (0..self.wins.len()).rev() {
+                let win = &mut self.wins[wi];
+                let removed = remove_exited_tab(&mut win.tabs, &mut win.active, id);
+                for ws in &mut win.workspaces {
+                    remove_exited_tab(&mut ws.tabs, &mut ws.active, id);
+                }
+                if removed {
+                    win.frame_gen = win.frame_gen.wrapping_add(1);
+                    if win.tabs.is_empty() {
+                        if let Some(target) = win.other_workspace() {
+                            win.select_workspace(target);
+                            self.cur = wi;
+                            self.sync_term_size();
+                        } else {
+                            self.close_window(wi, event_loop);
+                        }
+                    }
+                }
+            }
+            self.forget_tab(id);
+        }
+        if let Some(id) = original { self.select_window(id); }
     }
 
     /// Hand a tab from one window to another. The tab object itself moves:
@@ -1247,8 +1406,8 @@ impl App {
                     // still exists the tab goes exactly there. A stale or
                     // absent number means "wherever the user is looking",
                     // which is already `cur`.
-                    if window >= 1 && (window as usize) <= self.wins.len() {
-                        self.cur = window as usize - 1;
+                    if let Some(index) = self.wins.iter().position(|w| w.session_id == window) {
+                        self.cur = index;
                     }
                     // Trust but verify the directory: the caller may have
                     // raced its own rmdir; a vanished cwd means "who cares",
@@ -1269,7 +1428,11 @@ impl App {
                             continue;
                         }
                     }
-                    self.add_tab_with(cwd, cmd);
+                    if self.wins.is_empty() {
+                        self.make_window(event_loop, cmd, cwd, true);
+                    } else {
+                        self.add_tab_with(cwd, cmd);
+                    }
                     opened = true;
                 }
                 session::Request::NewWindow { cwd, argv } => {
@@ -1290,22 +1453,28 @@ impl App {
                     self.cur = self.wins.len() - 1;
                     opened = true;
                 }
-                req @ (session::Request::Raise | session::Request::PersistentRaise { .. }) => {
-                    let detached: Vec<_> = self.wins.iter().enumerate()
-                        .filter_map(|(i, w)| w.window.is_none().then_some(i)).collect();
+                session::Request::RestoreWindow => {
+                    if !self.closed_windows.is_empty() {
+                        self.revive_window(self.closed_windows.len() - 1, event_loop);
+                        opened = true;
+                    }
+                }
+                session::Request::Raise => opened = !self.wins.is_empty(),
+                session::Request::PersistentRaise { respond } => {
+                    let existing: std::collections::HashSet<_> = self.wins.iter()
+                        .filter_map(|w| w.window.as_ref().map(|w| w.id())).collect();
                     self.reattach_windows(event_loop);
                     persistent::set_attached(true, true);
-                    if let session::Request::PersistentRaise { respond } = req {
-                        let windows: std::collections::HashSet<_> = detached.into_iter()
-                            .filter_map(|i| self.wins[i].window.as_ref().map(|w| w.id())).collect();
-                        if windows.is_empty() {
-                            let _ = respond.send(());
-                        } else {
-                            self.attach_ready.push((windows, respond));
-                        }
+                    let windows: std::collections::HashSet<_> = self.wins.iter()
+                        .filter_map(|w| w.window.as_ref().map(|w| w.id()))
+                        .filter(|id| !existing.contains(id)).collect();
+                    if windows.is_empty() {
+                        let _ = respond.send(());
+                    } else {
+                        self.attach_ready.push((windows, respond));
                     }
                     opened = true;
-                },
+                }
                 session::Request::LastOutput { window, n, copy, respond } => {
                     // Fold any marks still in the ring first: the shell
                     // that typed `mypixels last` emitted its D mark
@@ -1325,8 +1494,8 @@ impl App {
             match q {
                 mcp::Query::ListWindows { respond } => {
                     let v = serde_json::json!([
-                        self.wins.iter().enumerate().map(|(i, w)| serde_json::json!({
-                            "window": i + 1,
+                        self.wins.iter().map(|w| serde_json::json!({
+                            "window": w.session_id,
                             "active_workspace": w.workspace + 1,
                             "workspaces": (0..WORKSPACES).map(|index| {
                                 let (tabs, active) = if index == w.workspace { (&w.tabs, w.active) }
@@ -1355,7 +1524,7 @@ impl App {
                 }
             }
         }
-        if opened {
+        if opened && !self.wins.is_empty() {
             if let Some(w) = &self.wins[self.cur].window {
                 // The compositor owns focus; an attention request is how a
                 // polite app says "over here" without stealing the keyboard.
@@ -1367,6 +1536,7 @@ impl App {
 
     fn listener(&self) -> SpikeListener {
         SpikeListener {
+            wake: self.wake.clone(),
             window: Arc::clone(&self.window_slot),
             tab_id: 0,
             title: Arc::new(Mutex::new(String::new())),
@@ -1458,6 +1628,7 @@ impl App {
                 count: tabs.len(),
                 title: tabs.get(active).map(|t| t.display_title()).unwrap_or_default(),
                 genre: self.config.workspace_genres[i].clone(),
+                icon: self.config.workspace_icons[i],
                 tabs: tabs.iter().enumerate().map(|(index, tab)| egui_ui::WsTab {
                     id: tab.id,
                     title: tab.display_title(),
@@ -1644,6 +1815,7 @@ impl App {
     }
 
     fn check_theme_files(&mut self) {
+        if self.wins.is_empty() { return; }
         if self.theme_watcher.as_ref().is_some_and(|w| w.take_changed()) { self.reload_config(); }
     }
 
@@ -1848,6 +2020,7 @@ impl App {
         add("Rename tab", "rename_tab", has_tab, false);
         add("Close tab", "close_tab", has_tab, false);
         add("New window", "new_window", true, true);
+        add("Restore last closed window", "reopen_window", !self.closed_windows.is_empty(), false);
         add("Send tab to new window", "send_tab_new_window", has_tab, false);
         add("Zoom in", "enlarge_font", has_tab, true);
         add("Zoom out", "shrink_font", has_tab, false);
@@ -2342,9 +2515,23 @@ impl App {
             self.bg,
             (self.config.tab_overview_opacity.clamp(0.0, 1.0) * 255.0) as u8,
         );
+        let close_retainer = self.window_retainer();
+        let close_tabs = self.wins[self.cur].all_tabs().count();
+        let close_workspaces = usize::from(!self.wins[self.cur].tabs.is_empty())
+            + self.wins[self.cur].workspaces.iter().filter(|ws| !ws.tabs.is_empty()).count();
+        let close_retained_tabs = self.graveyard.len()
+            + self.closed_windows.iter().map(|w| w.tabs().count()).sum::<usize>();
         {
             let mut egui = self.wins[self.cur].egui.take();
             if let Some(egui) = egui.as_mut() {
+                if egui.ui_state.confirm_open {
+                    let st = &mut egui.ui_state;
+                    if st.confirm.set_retainer(close_retainer) { st.confirm_seed = true; }
+                    st.confirm.tabs = close_tabs;
+                    st.confirm.workspaces = close_workspaces;
+                    st.confirm.limit = self.config.graveyard_limit;
+                    st.confirm.retained_tabs = close_retained_tabs;
+                }
                 let mut raw = egui.state.take_egui_input(window);
                 raw.events
                     .extend(std::mem::take(&mut self.wins[self.cur].fifo_egui_events));
@@ -2389,6 +2576,12 @@ impl App {
                 // retitles itself shows up in the list on the next frame.
                 if egui.ui_state.panel_is(egui_ui::RightPanel::Graveyard) {
                     egui.ui_state.grave_rows = self.grave_rows();
+                    egui.ui_state.grave_windows = self.closed_windows.iter().rev().map(|w| {
+                        let ws = &w.workspaces[w.workspace];
+                        let title = ws.tabs.get(ws.active).or_else(|| w.tabs().next())
+                            .map(|tab| tab.display_title()).unwrap_or_default();
+                        (w.id, title, w.tabs().count())
+                    }).collect();
                 }
                 egui.ui_state.panel_top = if show_strip { self.tab_h / ctx.pixels_per_point() } else { 0.0 };
                 let full = ctx.run_ui(raw, |ui| {
@@ -2514,6 +2707,7 @@ impl App {
                             self.ripple = None;
                         }
                     }
+                    egui_ui::confirm_box(ui, &mut egui.ui_state);
                 });
                 egui.ui_state.release_passive_focus(&ctx, &full.platform_output);
                 // egui owns animation/tooltip timing. Preserve delayed
@@ -2541,6 +2735,12 @@ impl App {
                     }
                     window.request_redraw();
                 }
+                if let Some(choice) = egui.ui_state.confirm_out.take() {
+                    egui.ui_state.confirm_open = false;
+                    egui_ui::release_focus(&ctx);
+                    self.pending_close = Some((window.id(), choice));
+                    window.request_redraw();
+                }
                 if let Some(pick) = egui.ui_state.move_out.take() {
                     let to_workspace = egui.ui_state.move_workspace;
                     egui.ui_state.move_open = false;
@@ -2561,6 +2761,11 @@ impl App {
                     // frame already counted the burials it is rendering.
                     self.pending_grave = Some((window.id(), index, action));
                     egui.ui_state.grave_sel = None;
+                    window.request_redraw();
+                }
+                if let Some((id, raise)) = egui.ui_state.grave_window_out.take() {
+                    let action = if raise { "reopen_window" } else { "kill_window" };
+                    self.pending_action = Some((window.id(), format!("{action}_{id}")));
                     window.request_redraw();
                 }
                 if let Some(index) = egui.ui_state.ws_out.take() {
@@ -2593,6 +2798,7 @@ impl App {
                 }
                 let popup_open = egui.ui_state.font_popup.as_ref().is_some_and(|p| p.open)
                     || egui.ui_state.rename_open
+                    || egui.ui_state.confirm_open
                     || egui.ui_state.move_open
                     || egui.ui_state.menu_open
                     || egui.ui_state.info_page.is_some();
@@ -3251,6 +3457,7 @@ impl App {
             return;
         }
         for spec in &specs {
+            if self.wins.is_empty() { break; }
             // Explicit routing keeps multi-window tests independent of which
             // window happened to receive the most recent compositor event.
             let line = if let Some(rest) = spec.strip_prefix("window:") {
@@ -3718,8 +3925,10 @@ impl App {
 
     fn show_error(&mut self, error: String) {
         log::warn!("{error}");
-        self.wins[self.cur].notice = Some((error, Instant::now()));
-        if let Some(window) = &self.wins[self.cur].window { window.request_redraw(); }
+        if let Some(win) = self.wins.get_mut(self.cur) {
+            win.notice = Some((error, Instant::now()));
+            if let Some(window) = &win.window { window.request_redraw(); }
+        }
     }
 
     fn copy_text(&mut self, kind: clipboard::Kind, text: String) {
@@ -3840,10 +4049,10 @@ impl App {
         let cap = self.config.history_block_bytes;
         for SemanticMark { tab_id, code, exit, line, row, col, alt, command, output, when } in evs {
             // The tab the mark belongs to, wherever it lives now.
-            let tab = match self
-                .wins
-                .iter()
-                .find_map(|w| w.all_tabs().find(|t| t.id == tab_id))
+            let tab = match self.wins.iter().flat_map(|w| w.all_tabs())
+                .chain(self.graveyard.iter().map(|g| &g.tab))
+                .chain(self.closed_windows.iter().flat_map(|w| w.tabs()))
+                .find(|t| t.id == tab_id)
             {
                 Some(t) => t,
                 None => continue,
@@ -3925,16 +4134,12 @@ impl App {
     }
 
     /// The last `n` commands' captured output of `window`'s active tab
-    /// (1-based; 0 or out of range = the window the user is looking at).
+    /// (stable session id; 0 or unknown = the window the user is looking at).
     /// Shared by the session bus's `mypixels last` and the MCP endpoint:
     /// one extraction core, thin transports.
     fn last_output_text(&mut self, window: u32, n: u64) -> String {
         self.drain_sems();
-        let win = if window >= 1 && (window as usize) <= self.wins.len() {
-            window as usize - 1
-        } else {
-            self.cur
-        };
+        let win = self.wins.iter().position(|w| w.session_id == window).unwrap_or(self.cur);
         self.wins
             .get(win)
             .and_then(|w| w.tabs.get(w.active))
@@ -4095,18 +4300,14 @@ impl App {
                     let _ = f.write_all(&payload);
                 }
             }
-            let live = self.wins.iter().any(|w| w.all_tabs().any(|t| t.id == tab_id));
+            let live = self.all_tabs().any(|t| t.id == tab_id);
             if !live {
                 continue;
             }
             log::debug!("apc drained for tab {tab_id}: {} bytes at {line}:{col}", payload.len());
             let reply = self.kitty.entry(tab_id).or_default().on_apc(&payload, line, col);
             if !reply.is_empty() {
-                if let Some(tab) = self
-                    .wins
-                    .iter()
-                    .flat_map(|w| w.all_tabs())
-                    .find(|t| t.id == tab_id)
+                if let Some(tab) = self.all_tabs().find(|t| t.id == tab_id)
                 {
                     tab.write(&reply);
                 }
@@ -4149,11 +4350,7 @@ impl App {
         let evs: Vec<(usize, String)> =
             std::mem::take(&mut *self.pty_writes_ring.lock().unwrap());
         for (tab_id, text) in evs {
-            if let Some(tab) = self
-                .wins
-                .iter()
-                .flat_map(|w| w.all_tabs())
-                .find(|t| t.id == tab_id)
+            if let Some(tab) = self.all_tabs().find(|t| t.id == tab_id)
             {
                 tab.write(text.as_bytes());
             }
@@ -4193,12 +4390,8 @@ impl App {
             self.cell_h.round() as u32,
             self.cell_w.round() as u32
         );
-        for w in self.wins.iter_mut() {
-            for t in w.all_tabs() {
-                if ids.contains(&t.id) {
-                    t.write(reply.as_bytes());
-                }
-            }
+        for tab in self.all_tabs().filter(|tab| ids.contains(&tab.id)) {
+            tab.write(reply.as_bytes());
         }
     }
 
@@ -4215,6 +4408,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: &Key, kev: Option<&winit::event::KeyEvent>, event_loop: &ActiveEventLoop) {
+        if self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.confirm_open) { return; }
         if self.wins[self.cur].drag.take().is_some() { self.publish_primary(); }
         // A key release is not an action, never scrolls, never selects. Its
         // only legitimate use is the Kitty keyboard protocol, where apps
@@ -4371,7 +4565,7 @@ impl App {
             && self.wins[self.cur].egui.as_ref().is_some_and(|e| {
             let st = &e.ui_state;
             st.right_panel == panel
-                && !st.rename_open && !st.menu_open && !st.move_open
+                && !st.rename_open && !st.confirm_open && !st.menu_open && !st.move_open
                 && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx)
         })
     }
@@ -4585,6 +4779,25 @@ impl App {
     /// Menu results belong to the window that queued them, even when another
     /// window's redraw is the first opportunity to execute the deferred work.
     fn drain_window_actions(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some((window, choice)) = self.pending_close.take()
+            && self.select_window(window) {
+            match choice {
+                egui_ui::CloseChoice::Cancel => {}
+                egui_ui::CloseChoice::Graveyard => {
+                    if self.window_retainer() == egui_ui::WindowRetainer::None {
+                        self.open_close_dialog();
+                    } else {
+                        self.close_window(self.cur, event_loop);
+                    }
+                }
+                egui_ui::CloseChoice::Permanent => {
+                    let ready = self.wins[self.cur].egui.as_ref().is_some_and(|e|
+                        e.ui_state.confirm.permanent_ready(e.ctx.input(|i| i.time)));
+                    if ready { self.destroy_window(event_loop); }
+                    else { self.open_close_dialog(); }
+                }
+            }
+        }
         if let Some((window, action)) = self.pending_action.take() {
             if self.select_window(window) { self.do_action(&action, event_loop); }
         }
@@ -4606,6 +4819,18 @@ impl App {
     fn do_action(&mut self, action: &str, event_loop: &ActiveEventLoop) {
         let n = self.wins[self.cur].tabs.len();
         match action {
+            "reopen_window" => {
+                if !self.closed_windows.is_empty() {
+                    self.revive_window(self.closed_windows.len() - 1, event_loop);
+                }
+            }
+            a if a.starts_with("reopen_window_") || a.starts_with("kill_window_") => {
+                if let Some(id) = a.rsplit('_').next().and_then(|id| id.parse::<usize>().ok())
+                    && let Some(index) = self.closed_windows.iter().position(|w| w.id == id) {
+                    if a.starts_with("reopen_") { self.revive_window(index, event_loop); }
+                    else { self.kill_closed_window(index); }
+                }
+            }
             a if a.starts_with("workspace_tab_") => {
                 if let Some((workspace, id)) = a["workspace_tab_".len()..].split_once('_')
                     && let (Ok(workspace), Ok(id)) = (workspace.parse::<usize>(), id.parse::<usize>())
@@ -4719,6 +4944,7 @@ impl App {
                 }
             },
             "close_tab" => self.close_tab_at(self.wins[self.cur].active, event_loop),
+            "close_window" => self.request_window_close(event_loop),
             "prev_command" => self.jump_command(true),
             "next_command" => self.jump_command(false),
             "reopen_tab" => {
@@ -4856,7 +5082,9 @@ impl App {
                 self.switcher_show_req.store(false, Ordering::SeqCst);
                 // Toggle: the chord that summoned the panel is the natural
                 // way to dismiss it (same as every transient overlay here).
+                let workspace = self.wins[self.cur].workspace;
                 if let Some(e) = self.wins[self.cur].egui.as_mut() {
+                    e.ui_state.workspace_edit = workspace;
                     e.ui_state.toggle_panel(egui_ui::RightPanel::Settings);
                     egui_ui::release_focus(&e.ctx);
                 }
@@ -5240,6 +5468,7 @@ impl App {
             let cols = self.cols;
             let rows = self.rows;
             self.wins.push(Win {
+                session_id: self.next_window_id,
                 window: Some(Arc::clone(&window)),
                 gpu: None,
                 egui: None,
@@ -5283,6 +5512,7 @@ impl App {
                 occluded: false,
                 frame_gen: 0,
             });
+            self.next_window_id += 1;
             // The newest window is the one the user just asked for.
             self.cur = self.wins.len() - 1;
             // The window may have landed on a monitor with a different factor
@@ -5848,6 +6078,13 @@ fn move_active_follow(len: usize, active: usize, removed: usize) -> Option<usize
     }
 }
 
+fn remove_exited_tab(tabs: &mut Vec<Tab>, active: &mut usize, id: usize) -> bool {
+    let Some(index) = tabs.iter().position(|tab| tab.id == id) else { return false };
+    *active = move_active_follow(tabs.len(), *active, index).unwrap_or(0);
+    tabs.remove(index);
+    true
+}
+
 fn new_tab_index(position: &str, len: usize, active: usize) -> usize {
     match position {
         "end" => len,
@@ -6145,16 +6382,20 @@ fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bo
 // ---------------------------------------------------------------------------
 
 impl ApplicationHandler for App {
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
-        self.drain_session_requests(event_loop);
-    }
-
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.wins.is_empty() {
+        if self.initial_window {
+            self.initial_window = false;
             self.make_window(event_loop, None, None, true);
         }
     }
 
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        self.drain_exited(event_loop);
+        self.drain_session_requests(event_loop);
+        for win in &self.wins {
+            if let Some(window) = &win.window { window.request_redraw(); }
+        }
+    }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.check_theme_files();
@@ -6167,6 +6408,8 @@ impl ApplicationHandler for App {
         self.drain_resets();
         self.drain_cell_sizes();
         self.drain_test_keys(event_loop);
+        self.drain_session_requests(event_loop);
+        self.drain_exited(event_loop);
         let now = Instant::now();
         for win in &mut self.wins {
             if win.repaint_at.is_some_and(|at| at <= now) {
@@ -6176,12 +6419,6 @@ impl ApplicationHandler for App {
             }
         }
         let next = self.wins.iter().filter_map(|w| w.repaint_at).min();
-        // With no native windows, PTY callbacks have no redraw target. Keep
-        // draining terminal protocol replies and bounded event queues.
-        let next = if persistent::enabled() && self.wins.iter().any(|w| w.window.is_none()) {
-            Some(next.map_or(now + std::time::Duration::from_millis(50),
-                |at| at.min(now + std::time::Duration::from_millis(50))))
-        } else { next };
         event_loop.set_control_flow(next.map_or(winit::event_loop::ControlFlow::Wait,
             winit::event_loop::ControlFlow::WaitUntil));
     }
@@ -6233,7 +6470,7 @@ impl ApplicationHandler for App {
                 self.wins[self.cur].egui.as_ref().filter(|e| {
                     let st = &e.ui_state;
                     !st.menu_open && !st.move_open
-                        && !st.rename_open && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx) && !st.font_popup.as_ref().is_some_and(|p| p.open)
+                        && !st.rename_open && !st.confirm_open && st.info_page.is_none() && !egui::Popup::is_any_open(&e.ctx) && !st.font_popup.as_ref().is_some_and(|p| p.open)
                 }).map(|e| {
                     if e.ui_state.right_panel == egui_ui::RightPanel::Closed { return false; }
                     let (x, y) = match &event {
@@ -6255,7 +6492,7 @@ impl ApplicationHandler for App {
         };
         let strip_pointer = pointer_at.is_some_and(|(_, y)| self.show_tab_strip() && y >= 0.0 && y < self.tab_h)
             && self.wins[self.cur].overview.is_none()
-            && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.info_page.is_some() || egui::Popup::is_any_open(&e.ctx) || e.ui_state.rename_open);
+            && !self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.menu_open || e.ui_state.move_open || e.ui_state.info_page.is_some() || egui::Popup::is_any_open(&e.ctx) || e.ui_state.rename_open || e.ui_state.confirm_open);
         let egui_consumed = if pointer_at.is_some() && (strip_pointer || self.wins[self.cur].tab_drag.is_some()
             || self.wins[self.cur].tab_close_press.is_some()) { false } else { egui_consumed };
         // An event egui claimed was claimed *for* a visual change -- hover,
@@ -6281,34 +6518,14 @@ impl ApplicationHandler for App {
         {
             window.request_redraw();
         }
+        if self.wins[self.cur].egui.as_ref().is_some_and(|e| e.ui_state.confirm_open)
+            && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }) {
+            window.request_redraw();
+            return;
+        }
         match event {
-            WindowEvent::CloseRequested => {
-                // Named sessions discard display resources only. Ordinary
-                // windows keep their original close-and-terminate behavior.
-                if persistent::enabled() {
-                    let win = &mut self.wins[self.cur];
-                    if let Some(w) = win.window.take() {
-                        self.window_slot.lock().unwrap().retain(|other| other.id() != w.id());
-                    }
-                    win.sw_thumbs.clear();
-                    win.grave_thumbs.clear();
-                    win.overview = None;
-                    win.tab_drag = None;
-                    win.drag = None;
-                    win.mouse_button = None;
-                    win.egui = None;
-                    win.gpu = None;
-                    win.focused = false;
-                    win.occluded = true;
-                    self.modifiers = ModifiersState::empty();
-                    self.switcher_open.store(false, Ordering::SeqCst);
-                    self.switcher_show_req.store(false, Ordering::SeqCst);
-                    *self.switcher_alt_at.lock().unwrap() = None;
-                    persistent::set_attached(self.wins.iter().any(|w| w.window.is_some()), false);
-                } else {
-                    self.close_window(self.cur, event_loop);
-                }
-            },
+            WindowEvent::CloseRequested => self.request_window_close(event_loop),
             WindowEvent::RedrawRequested => {
                 // This frame belongs to the window that asked for it. The
                 // Deferred work can change the selected window. Restore this
@@ -6347,70 +6564,7 @@ impl ApplicationHandler for App {
                     }
                     self.switcher_open.store(true, Ordering::SeqCst);
                 }
-                // Drain tabs whose child exited
-                let mut to_close: Vec<usize> = Vec::new();
-                {
-                    let mut exited = self.exited.lock().unwrap();
-                    if !exited.is_empty() {
-                        to_close = exited.drain(..).collect();
-                    }
-                }
-                // A window can die with these closes (the last tab closes
-                // its window, the last window empties `wins`), and the
-                // event loop still has queued work after `exit()`: every
-                // `wins[self.cur]` below is guarded, or shutdown ends in a
-                // panic on the second exited event instead of a clean exit.
-                if !to_close.is_empty() {
-                    // map stable ids back to current indices (ids are stable)
-                    for id in to_close.iter().rev() {
-                        if self.wins.is_empty() {
-                            return;
-                        }
-                        // A buried shell that exits on its own is dead
-                        // weight: evict it, never re-bury a corpse.
-                        if let Some(pos) = self.graveyard.iter().position(|g| g.tab.id == *id) {
-                            self.kill_grave(pos);
-                            continue;
-                        }
-                        // The dying tab may live in another window, or be
-                        // parked in an inactive workspace; find it first.
-                        let visible = self.wins.iter().enumerate().find_map(|(wi, w)| {
-                            w.tabs.iter().position(|t| t.id == *id).map(|ti| (wi, ti))
-                        });
-                        if let Some((wi, ti)) = visible {
-                            let original_window = self.wins[self.cur].window.as_ref().map(|w| w.id());
-                            self.cur = wi;
-                            self.close_tab_at(ti, event_loop);
-                            if let Some(index) = self.wins.iter().position(|w| w.window.as_ref().map(|w| w.id()) == original_window) {
-                                self.cur = index;
-                            }
-                        } else {
-                            let mut removed = None;
-                            for w in &mut self.wins {
-                                for workspace in &mut w.workspaces {
-                                    if let Some(ti) = workspace.tabs.iter().position(|t| t.id == *id) {
-                                        workspace.active = move_active_follow(workspace.tabs.len(), workspace.active, ti).unwrap_or(0);
-                                        removed = Some(workspace.tabs.remove(ti));
-                                        break;
-                                    }
-                                }
-                                if removed.is_some() { break; }
-                            }
-                            if let Some(tab) = removed {
-                                self.bury_tab(tab);
-                            }
-                        }
-                    }
-                    if self.wins.is_empty() || self.wins[self.cur].tabs.is_empty() {
-                        return;
-                    }
-                    if self.wins[self.cur].window.as_ref().map(|w| w.id()) != Some(window.id()) {
-                        for win in &self.wins {
-                            if let Some(window) = &win.window { window.request_redraw(); }
-                        }
-                        return;
-                    }
-                }
+                self.drain_exited(event_loop);
                 if !self.select_window(id) { return; }
                 // Draw unconditionally: winit only sends RedrawRequested when a
                 // frame is actually wanted (our own request_redraw, resize, or
@@ -7069,6 +7223,8 @@ Options:
   -A                attach the lowest detached #N session, or create one
   -S <name>         create or attach a persistent session; window close detaches
   -s, --standalone   run a private instance: never join or host a session
+      --daemon      start a persistent session without opening a window
+      --restore-window  reopen the last closed window with its live tabs
   -h, --help         show this text
 
   mypixels last [n] [--copy]
@@ -7088,6 +7244,23 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
                 eprintln!("mypixels: {e}");
                 std::process::exit(1);
             }
+        }
+        return;
+    }
+    let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
+    let daemon = flags.iter().any(|a| a == "--daemon");
+    let restore = flags.iter().any(|a| a == "--restore-window");
+    let named = flags.iter().any(|a| a == "-S" || a == "-A");
+    if (daemon && (standalone || restore || named || !positional_terms().is_empty()
+        || flags.iter().any(|a| matches!(a.as_str(), "-t" | "--new-tab" | "-n" | "--new-window"))))
+        || (restore && (standalone || named || !positional_terms().is_empty())) {
+        eprintln!("mypixels: --daemon and --restore-window must be used on their own");
+        std::process::exit(2);
+    }
+    if restore {
+        if !session::remote_restore_window() {
+            eprintln!("mypixels: no running session supports window restoration");
+            std::process::exit(1);
         }
         return;
     }
@@ -7145,8 +7318,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
             return;
         }
     }
-    let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
-    if !standalone && !persistent::enabled() {
+    if !standalone && !daemon && !persistent::enabled() {
         let new_window = opens_new_window(&flags);
         let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
         if session::remote_open(cwd, positional_terms(), new_window) {
@@ -7174,7 +7346,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
         event_loop.run_app(&mut AlphaProbe).expect("alpha probe");
         return;
     }
-    let mut app = App::new(persistent_listener, event_loop.create_proxy());
+    let mut app = App::new(event_loop.create_proxy(), daemon, persistent_listener);
     event_loop.run_app(&mut app).expect("run");
     persistent::startup_failed("session exited before opening a window");
     log::info!("exited");

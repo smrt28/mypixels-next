@@ -15,7 +15,7 @@ binary = Path(os.environ.get('MYPIXELS_BIN', 'target/debug/mypixels')).resolve()
 env = dict(os.environ)
 env.pop('DISPLAY', None)
 env.pop('WAYLAND_DISPLAY', None)
-for args in (['-S'], ['-S', ''], ['-S', 'a', '-S', 'b'], ['-S', 'a', '-s'], ['-A', '-S', 'a'], ['-S', 'a', '-A'], ['-A', '-s']):
+for args in (['-S'], ['-S', ''], ['-S', 'a', '-S', 'b'], ['-S', 'a', '-s'], ['-A', '-S', 'a'], ['-S', 'a', '-A'], ['-A', '-s'], ['-S', 'a', '--daemon'], ['-A', '--daemon'], ['-S', 'a', '--restore-window']):
     result = subprocess.run([str(binary), *args], env=env, capture_output=True, timeout=5)
     assert result.returncode == 2, (args, result.stderr)
 

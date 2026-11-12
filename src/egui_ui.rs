@@ -61,6 +61,7 @@ pub struct UiState {
     pub theme_choice: Vec<String>,
     pub theme_fetched: bool,
     pub settings_page: SettingsPage,
+    pub workspace_edit: usize,
     /// Last geometry logged for the category selector, so the line is written
     /// when the layout moves rather than on every frame. The smoke tests click
     /// a category by name from this line instead of guessing an offset.
@@ -92,6 +93,12 @@ pub struct UiState {
     /// Set by `rename_box` when the user commits (Some(Some(_))) or cancels
     /// (Some(None)); the app applies and clears it after the frame.
     pub rename_out: Option<Option<String>>,
+    /// Window-close modal. Cancel receives initial focus; permanent closure
+    /// requires a separate, timed danger step. Outcomes are applied by the app.
+    pub confirm_open: bool,
+    pub confirm_seed: bool,
+    pub confirm: CloseDialog,
+    pub confirm_out: Option<CloseChoice>,
     /// A font row toggled its popup closed on button-press; the matching
     /// release must not count as a fresh open click (see `font_row`).
     font_suppress: bool,
@@ -156,6 +163,9 @@ pub struct UiState {
     pub ws_collapsed: Option<usize>,
     pub ws_visible_tabs: Vec<usize>,
     pub grave_rows: Vec<GraveRow>,
+    /// Stable window id, active title, and total live tab count, newest first.
+    pub grave_windows: Vec<(usize, String, usize)>,
+    pub grave_window_out: Option<(usize, bool)>,
     pub grave_sel: Option<usize>,
     pub grave_out: Option<(usize, String)>,
 }
@@ -196,6 +206,7 @@ pub struct WsRow {
     /// Caption of the workspace's selected tab, empty when it holds none.
     pub title: String,
     pub genre: String,
+    pub icon: crate::config::WorkspaceIcon,
     pub tabs: Vec<WsTab>,
     /// The workspace this window is looking at right now.
     pub current: bool,
@@ -234,7 +245,7 @@ impl UiState {
     pub fn owns_keyboard(&self, ctx: &egui::Context) -> bool {
         // The list panels own navigation like menus; the app also routes
         // typing to the workspace search while its editor has focus.
-        self.rename_open || self.menu_open || self.move_open || self.info_page.is_some()
+        self.rename_open || self.confirm_open || self.menu_open || self.move_open || self.info_page.is_some()
             || self.key_capture.is_some()
             || matches!(self.right_panel, RightPanel::Graveyard | RightPanel::Workspaces)
             || egui::Popup::is_any_open(ctx)
@@ -249,7 +260,7 @@ impl UiState {
         let pending_editor = focus != self.sidebar_focus
             && focus.is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some());
         self.sidebar_focus = focus;
-        if self.right_panel != RightPanel::Closed && !self.rename_open && !self.menu_open && !self.move_open && self.info_page.is_none() && !egui::Popup::is_any_open(ctx)
+        if self.right_panel != RightPanel::Closed && !self.rename_open && !self.confirm_open && !self.menu_open && !self.move_open && self.info_page.is_none() && !egui::Popup::is_any_open(ctx)
             && output.ime.is_none() {
             // DragValue and history search request edit focus after layout;
             // allow the next frame to render their editor before deciding.
@@ -975,6 +986,7 @@ pub fn graveyard_panel(
         return;
     }
     st.grave_out = None;
+    st.grave_window_out = None;
     if !st.menu_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         release_focus(ui.ctx());
         st.close_panel(RightPanel::Graveyard);
@@ -1043,7 +1055,7 @@ pub fn graveyard_panel(
                         egui::pos2(header.left() + 36.0, header.top()),
                         egui::pos2(header.right() - 68.0, header.bottom()),
                     ),
-                    &format!("Graveyard {}", count).trim_end().to_string(),
+                    &format!("Graveyard {}", count + st.grave_windows.len()).trim_end().to_string(),
                     fg,
                     16.0,
                     true,
@@ -1062,14 +1074,6 @@ pub fn graveyard_panel(
                 text(ui, hint, "\u{2191}\u{2193} select \u{b7} Enter raise \u{b7} Del kill \u{b7} Esc close",
                     muted, 11.0, false);
                 ui.add_space(14.0);
-                if count == 0 {
-                    ui.add_space(14.0);
-                    ui.label(
-                        egui::RichText::new("No buried tabs.\nClosed tabs keep running here.")
-                            .color(muted),
-                    );
-                    return;
-                }
                 // Keep an explicit selection on a visible row after eviction.
                 if let Some(sel) = st.grave_sel.filter(|s| *s >= count) {
                     st.grave_sel = Some(sel.min(count.saturating_sub(1)));
@@ -1078,6 +1082,31 @@ pub fn graveyard_panel(
                     .id_salt("graveyard_list")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if !st.grave_windows.is_empty() {
+                            ui.label(egui::RichText::new("Closed windows").color(fg));
+                            for (id, title, tabs) in &st.grave_windows {
+                                ui.add_space(6.0);
+                                ui.label(format!("{title} ({tabs} tabs)"));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Restore window").clicked() {
+                                        st.grave_window_out = Some((*id, true));
+                                    }
+                                    if ui.button("Kill window").clicked() {
+                                        st.grave_window_out = Some((*id, false));
+                                    }
+                                });
+                            }
+                            ui.add_space(12.0);
+                            ui.separator();
+                        }
+                        if count == 0 {
+                            ui.add_space(14.0);
+                            ui.label(
+                                egui::RichText::new("No buried tabs.\nClosed tabs keep running here.")
+                                    .color(muted),
+                            );
+                            return;
+                        }
                         // Newest first: the tab buried last is the one a
                         // mistaken Ctrl+Shift+x is most likely to mourn.
                         for index in (0..count).rev() {
@@ -1357,7 +1386,7 @@ pub fn workspaces_panel(
                             ui.painter().rect(rect, 11.0, fill, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
                                 if selected { color } else if hover { border.lerp_to_gamma(color, 0.45) } else { border }), egui::StrokeKind::Inside);
                             let mark = egui::Rect::from_center_size(egui::pos2(rect.left() + 27.0, heading.center().y), egui::vec2(30.0, 32.0));
-                            crate::ui_style::text_centered(ui, mark, &(index + 1).to_string(), color, 20.0, true);
+                            crate::ui_style::workspace_icon(ui.painter(), row.icon, mark.center(), color);
                             let name_x = rect.left() + 53.0;
                             let badge = egui::Rect::from_center_size(egui::pos2(rect.right() - 60.0, heading.center().y), egui::vec2(62.0, 24.0));
                             ui.painter().rect_filled(badge, 12.0, fill.lerp_to_gamma(fg, 0.07));
@@ -1604,6 +1633,199 @@ pub fn rename_box(ui: &egui::Ui, st: &mut UiState) {
             }
         });
     st.rename_out = out;
+}
+
+/// Only this session's daemon or another native window can retain terminals.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowRetainer {
+    Daemon,
+    OtherWindow,
+    #[default]
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseChoice { Cancel, Graveyard, Permanent }
+
+#[derive(Default)]
+pub struct CloseDialog {
+    pub retainer: WindowRetainer,
+    pub tabs: usize,
+    pub workspaces: usize,
+    pub limit: usize,
+    pub retained_tabs: usize,
+    permanent: bool,
+    unlock_at: Option<f64>,
+}
+
+impl CloseDialog {
+    pub const DELAY: f64 = 5.0;
+
+    pub fn new(retainer: WindowRetainer, tabs: usize, workspaces: usize, limit: usize) -> Self {
+        Self { retainer, tabs, workspaces, limit, ..Default::default() }
+    }
+
+    /// A lost recovery host requires a fresh warning and countdown. Never
+    /// reinterpret an already displayed recovery action as permanent closure.
+    pub fn set_retainer(&mut self, retainer: WindowRetainer) -> bool {
+        if self.retainer == retainer { return false; }
+        self.retainer = retainer;
+        self.permanent = false;
+        self.unlock_at = None;
+        true
+    }
+
+    fn danger(&self) -> bool {
+        self.permanent || self.retainer == WindowRetainer::None
+    }
+
+    pub fn permanent_ready(&self, now: f64) -> bool {
+        self.danger() && self.unlock_at.is_some_and(|at| now >= at)
+    }
+}
+
+/// A centered, input-blocking close card. Cancel is always the default;
+/// recovery is explicit, and no timer or bare Enter can destroy terminals.
+pub fn confirm_box(ui: &egui::Ui, st: &mut UiState) {
+    st.confirm_out = None;
+    if !st.confirm_open { return; }
+    let ctx = ui.ctx();
+    let now = ctx.input(|i| i.time);
+    let danger = st.confirm.danger();
+    let remaining = if danger {
+        let at = *st.confirm.unlock_at.get_or_insert(now + CloseDialog::DELAY);
+        (at - now).max(0.0)
+    } else { 0.0 };
+    if remaining > 0.0 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    let c = TermStyle::new(ui, egui::Color32::from_rgb(59, 193, 126),
+        egui::Color32::from_rgb(239, 97, 109));
+    let seed = std::mem::take(&mut st.confirm_seed);
+    let width = (ctx.content_rect().width() - 48.0).clamp(220.0, 640.0);
+    let mut out = None;
+    let response = egui::Modal::new(egui::Id::unique("confirm_box"))
+        .backdrop_color(egui::Color32::from_black_alpha(115))
+        .frame(egui::Frame::new().fill(c.bg)
+            .stroke(egui::Stroke::new(1.0, c.bg.lerp_to_gamma(c.fg, 0.32)))
+            .corner_radius(12.0).inner_margin(24.0))
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            c.apply_controls(ui);
+            // Proportional typography matches the reference's dialog, while
+            // the terminal and the rest of the UI retain their own font.
+            for style in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                ui.style_mut().text_styles.insert(style, egui::FontId::proportional(15.0));
+            }
+            let title = if danger { "Close window permanently?" } else { "Close window?" };
+            let title_galley = ui.painter().layout(title.into(), egui::FontId::proportional(22.0), c.fg, (width - 95.0).max(100.0));
+            let title_height = title_galley.size().y;
+            let (header, _) = ui.allocate_exact_size(egui::vec2(width, (title_height + 30.0).max(54.0)), egui::Sense::hover());
+            draw_icon(ui.painter(), if danger { Icon::Error } else { Icon::Archive },
+                egui::pos2(header.left() + 14.0, header.top() + 16.0), if danger { c.err } else { c.fg });
+            ui.painter().galley(header.min + egui::vec2(48.0, 0.0), title_galley, c.fg);
+            let counts = format!("{} workspace{}  ·  {} tab{}", st.confirm.workspaces,
+                if st.confirm.workspaces == 1 { "" } else { "s" }, st.confirm.tabs,
+                if st.confirm.tabs == 1 { "" } else { "s" });
+            ui.painter().text(header.min + egui::vec2(48.0, title_height + 6.0), egui::Align2::LEFT_TOP,
+                counts, egui::FontId::proportional(14.0), c.muted);
+            let dismiss = egui::Rect::from_center_size(
+                egui::pos2(header.right() - 7.0, header.top() + 9.0), egui::vec2(30.0, 30.0));
+            if icon_button(ui, dismiss, Icon::Dismiss, "Cancel window close", &c).clicked() {
+                out = Some(CloseChoice::Cancel);
+            }
+            ui.add_space(10.0);
+            let footer_height = if width < 500.0 {
+                if st.confirm.retainer == WindowRetainer::None { 88.0 } else { 136.0 }
+            } else { 40.0 };
+            egui::ScrollArea::vertical().id_salt("close_dialog_details")
+                .max_height((ctx.content_rect().height() - header.height() - footer_height - 110.0).max(64.0))
+                .auto_shrink([false, true]).show(ui, |ui| {
+                    ui.label(egui::RichText::new(if danger && st.confirm.retainer == WindowRetainer::None && st.confirm.retained_tabs > 0 {
+                        format!("This will end the session, terminating this window and {} previously closed terminal(s). Workspaces, running programs and terminal contents cannot be restored.", st.confirm.retained_tabs)
+                    } else if danger {
+                        "This will terminate every terminal in this window. Its workspaces, running programs and terminal contents cannot be restored.".into()
+                    } else {
+                        "Closing this window will move it to the Graveyard. Its workspaces and tabs can be restored while the session keeps them alive.".into()
+                    }).color(c.fg).size(16.0));
+                    ui.add_space(16.0);
+                    let mut detail = |glyph, label: String, color| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::hover());
+                            draw_icon(ui.painter(), glyph, rect.center(), color);
+                            ui.add(egui::Label::new(egui::RichText::new(label).color(color).size(14.0)).wrap());
+                        });
+                    };
+                    if danger {
+                        detail(Icon::Layers, if st.confirm.retainer == WindowRetainer::None {
+                            "No background daemon or other open window can retain these terminals.".into()
+                        } else { "Permanent close bypasses the Graveyard.".into() }, c.muted);
+                        detail(Icon::Clock, if remaining > 0.0 {
+                            format!("Take a moment to check — permanent close unlocks in {} s.", remaining.ceil() as u64)
+                        } else { "This cannot be undone.".into() }, c.err);
+                    } else {
+                        detail(Icon::Clock, format!("Keeps up to {} closed window{}; the oldest is evicted when full.", st.confirm.limit, if st.confirm.limit == 1 { "" } else { "s" }), c.muted);
+                        detail(Icon::Layers, match st.confirm.retainer {
+                            WindowRetainer::Daemon => "Window retained by the background daemon",
+                            _ => "Window retained by another open window",
+                        }.into(), c.muted);
+                    }
+                });
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(10.0);
+            // Explicit footer geometry keeps the primary action at the right
+            // edge without allowing button widths to expand the centered card.
+            let compact = width < 500.0;
+            let has_back = st.confirm.retainer != WindowRetainer::None;
+            let primary_w: f32 = if danger { 220.0 } else { 185.0 };
+            let height = if compact { if has_back { 136.0 } else { 88.0 } } else { 40.0 };
+            let (footer, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            let primary = egui::Rect::from_min_size(
+                if compact { footer.min + egui::vec2(0.0, 48.0) }
+                else { egui::pos2(footer.right() - primary_w, footer.top()) },
+                egui::vec2(if compact { width } else { primary_w }, 40.0));
+            let cancel_rect = egui::Rect::from_min_size(
+                if compact { footer.min } else { egui::pos2(primary.left() - 102.0, footer.top()) },
+                egui::vec2(if compact { width } else { 90.0 }, 40.0));
+            let cancel = ui.put(cancel_rect, egui::Button::new("Cancel"));
+            if seed { cancel.request_focus(); }
+            if cancel.clicked() { out = Some(CloseChoice::Cancel); }
+            if danger {
+                let label = if remaining > 0.0 { format!("Close permanently ({} s)", remaining.ceil() as u64) }
+                    else { "Close permanently".into() };
+                let red = if remaining > 0.0 { c.bg.lerp_to_gamma(c.err, 0.25) } else { c.err };
+                let clicked = ui.push_id("permanent_close", |ui| {
+                    ui.add_enabled_ui(remaining == 0.0, |ui| {
+                        ui.put(primary, egui::Button::new(egui::RichText::new(label)
+                            .color(if remaining > 0.0 { c.muted } else { egui::Color32::BLACK }))
+                            .fill(red).stroke(egui::Stroke::new(1.0, c.err))).clicked()
+                    }).inner
+                }).inner;
+                if clicked && st.confirm.permanent_ready(now) { out = Some(CloseChoice::Permanent); }
+            } else if ui.push_id("graveyard_close", |ui| ui.put(primary,
+                egui::Button::new(egui::RichText::new("Move to Graveyard").color(egui::Color32::BLACK))
+                    .fill(c.accent))).inner.clicked() {
+                out = Some(CloseChoice::Graveyard);
+            }
+            if has_back {
+                let rect = if compact {
+                    egui::Rect::from_min_size(footer.min + egui::vec2(0.0, 96.0), egui::vec2(width, 40.0))
+                } else { egui::Rect::from_min_size(footer.min, egui::vec2(165.0, 40.0)) };
+                let label = if danger { "Back to recovery" } else { "Close permanently…" };
+                if ui.put(rect, egui::Button::new(egui::RichText::new(label).color(c.muted)).frame(false)).clicked() {
+                    st.confirm.permanent = !danger;
+                    st.confirm.unlock_at = if danger { None } else { Some(now + CloseDialog::DELAY) };
+                    st.confirm_seed = true;
+                    ctx.request_repaint();
+                }
+            }
+        });
+    if response.should_close() || (out.is_none() && ctx.memory(|m| m.focused()).is_none()
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))) {
+        out = Some(CloseChoice::Cancel);
+    }
+    st.confirm_out = out;
 }
 
 /// The font selector popup, opened from one of the two font rows. It works
@@ -2357,6 +2579,7 @@ fn appearance_page(
             });
         });
     });
+    workspace_settings(ui, cfg, st, ev, colors);
     section(ui, "Fonts", colors, |ui| {
         form_grid("fonts").show(ui, |ui| {
             font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, ev);
@@ -2386,9 +2609,7 @@ fn appearance_page(
             color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
             color_row(ui, "Add button", &mut cfg.add_button_color, ev);
         });
-        // Two palettes color tabs, and they are not the same choice: one tags a
-        // tab by hand, the other is the workspace the tab sits in. Both live here
-        // because both are "what color is my tab", and each says which it is.
+        // Manual tab groups have a separate palette from workspace identities.
         ui.add_space(8.0);
         ui.label("Group colors");
         ui.label(egui::RichText::new("The palette a tab is tagged with.").small().color(colors.muted));
@@ -2401,15 +2622,101 @@ fn appearance_page(
                 });
             }
         });
-        ui.add_space(8.0);
-        ui.label("Workspace colors");
-        ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
-        ui.add_space(4.0);
-        form_grid("colors-workspaces").show(ui, |ui| {
-            for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
-                color_row(ui, &format!("Workspace {}", index + 1), color, ev);
+
+    });
+}
+
+/// A single workspace editor keeps identity choices together, as in the mockup.
+fn workspace_settings(ui: &mut egui::Ui, cfg: &mut crate::config::Config, st: &mut UiState,
+    ev: &mut ConfigEvents, colors: &TermStyle) {
+    use crate::config::{WorkspaceButtonDisplay, WorkspaceButtonPosition, WorkspaceIcon};
+    let mut card = *colors;
+    card.border = colors.accent.gamma_multiply(0.65);
+    section(ui, "Workspaces", &card, |ui| {
+        ui.label(egui::RichText::new("Manage workspace names, colors, and icons.").small().color(colors.muted));
+        st.workspace_edit = st.workspace_edit.min(crate::config::WORKSPACES - 1);
+        let selected = st.workspace_edit;
+        let caption = format!("    {} {}", selected + 1, cfg.workspace_genres[selected].trim());
+        let picker = egui::ComboBox::from_id_salt("workspace_editor")
+            .popup_style((**ui.style()).clone().into()).width(ui.available_width() - 8.0)
+            .selected_text(caption).truncate().show_ui(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                for index in 0..crate::config::WORKSPACES {
+                    let label = format!("    {} {}", index + 1, cfg.workspace_genres[index].trim());
+                    let response = ui.selectable_value(&mut st.workspace_edit, index, label);
+                    crate::ui_style::workspace_icon(ui.painter(), cfg.workspace_icons[index],
+                        egui::pos2(response.rect.left() + 14.0, response.rect.center().y), rgb_c32(cfg.workspace_colors[index]));
+                    response.on_hover_text(format!("Workspace {} · {}", index + 1, cfg.workspace_genres[index]));
+                }
+            });
+        crate::ui_style::workspace_icon(ui.painter(), cfg.workspace_icons[selected],
+            egui::pos2(picker.response.rect.left() + 14.0, picker.response.rect.center().y), rgb_c32(cfg.workspace_colors[selected]));
+        let index = st.workspace_edit;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("Number");
+                let mut number = (index + 1).to_string();
+                ui.add(egui::TextEdit::singleline(&mut number).interactive(false).desired_width(40.0));
+            });
+            ui.vertical(|ui| {
+                ui.label("Name");
+                ev.apply |= ui.add(egui::TextEdit::singleline(&mut cfg.workspace_genres[index])
+                    .hint_text("e.g. Development").desired_width(ui.available_width() - 8.0)).changed();
+            });
+        });
+        ui.label("Color");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for hex in ["#f07b72", "#ec9756", "#e7b85a", "#bbc96a", "#71c58c", "#5fc7d0", "#5e9eff", "#b792ed", "#e998be", "#95a8c4"] {
+                let color = crate::config::parse_hex(hex);
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(25.0, 25.0), egui::Sense::click());
+                let selected = cfg.workspace_colors[index] == color;
+                ui.painter().rect_filled(rect.shrink(3.0), 4.0, rgb_c32(color));
+                if selected || response.hovered() || response.has_focus() {
+                    ui.painter().rect_stroke(rect, 5.0, egui::Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+                }
+                if selected { crate::ui_style::icon(ui.painter(), Icon::Check, rect.center(), crate::ui_style::black_or_white_text(rgb_c32(color))); }
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Workspace color {hex}")));
+                if response.on_hover_text(hex).clicked() { cfg.workspace_colors[index] = color; ev.apply = true; }
             }
         });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Custom color").small().color(colors.muted));
+            ev.apply |= color_cell(ui, &mut cfg.workspace_colors[index]);
+        });
+        ui.label("Icon");
+        let cell_width = ((ui.available_width() - 32.0) / 5.0).max(30.0);
+        egui::Grid::new("workspace_icons").spacing(egui::vec2(8.0, 8.0)).show(ui, |ui| {
+            for (slot, icon) in WorkspaceIcon::ALL.into_iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_width, 36.0), egui::Sense::click());
+                let selected = cfg.workspace_icons[index] == icon;
+                let hot = response.hovered() || response.has_focus();
+                ui.painter().rect(rect, 5.0, colors.bg.lerp_to_gamma(colors.accent, if selected { 0.12 } else { 0.02 }),
+                    egui::Stroke::new(1.0, if selected || hot { colors.accent } else { colors.border }), egui::StrokeKind::Inside);
+                crate::ui_style::workspace_icon(ui.painter(), icon, rect.center(), rgb_c32(cfg.workspace_colors[index]));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Workspace icon {}", icon.label())));
+                if response.on_hover_text(icon.label()).clicked() { cfg.workspace_icons[index] = icon; ev.apply = true; }
+                if slot % 5 == 4 { ui.end_row(); }
+            }
+        });
+        ui.add_space(4.0);
+        form_grid("workspace_button_options").show(ui, |ui| {
+            row(ui, "Button display", |ui| {
+                egui::ComboBox::from_id_salt("workspace_button_display").width(140.0)
+                    .popup_style((**ui.style()).clone().into()).selected_text(cfg.workspace_button_display.label())
+                    .show_ui(ui, |ui| { for mode in WorkspaceButtonDisplay::ALL {
+                        ev.apply |= ui.selectable_value(&mut cfg.workspace_button_display, mode, mode.label()).changed();
+                    }});
+            });
+            row(ui, "Button position", |ui| {
+                egui::ComboBox::from_id_salt("workspace_button_position").width(140.0)
+                    .popup_style((**ui.style()).clone().into()).selected_text(cfg.workspace_button_position.label())
+                    .show_ui(ui, |ui| { for position in [WorkspaceButtonPosition::Left, WorkspaceButtonPosition::Right] {
+                        ev.apply |= ui.selectable_value(&mut cfg.workspace_button_position, position, position.label()).changed();
+                    }}).response.on_hover_text("Left: next to the menu. Right: at the end of the tab strip.");
+            });
+        });
+        ui.label(egui::RichText::new("Button display and position apply to all workspaces.").small().color(colors.muted));
     });
 }
 
@@ -2429,6 +2736,17 @@ fn window_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut Conf
     section(ui, "Window behavior", colors, |ui| {
         form_grid("window-behavior").show(ui, |ui| {
             checkbox_row(ui, "Start maximized", &mut cfg.default_maximize, ev);
+            row(ui, "Close window dialog", |ui| {
+                use crate::config::CloseWindowDialog;
+                egui::ComboBox::from_id_salt("close_window_dialog")
+                    .popup_style((**ui.style()).clone().into())
+                    .width(210.0).selected_text(cfg.close_window_dialog.label())
+                    .show_ui(ui, |ui| {
+                        for policy in [CloseWindowDialog::Never, CloseWindowDialog::Loss, CloseWindowDialog::Always] {
+                            ev.apply |= ui.selectable_value(&mut cfg.close_window_dialog, policy, policy.label()).changed();
+                        }
+                    });
+            });
             row(ui, "Transparency", |ui| {
                 ev.apply |= ui.add(egui::Slider::new(&mut cfg.term_transparency, 0.0..=1.0))
                     .on_hover_text("0 is opaque; 1 is fully transparent. Brightness is separate under Appearance.").changed();
@@ -2516,14 +2834,8 @@ fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut 
         .small()
         .color(colors.muted));
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Optional genres describe what each workspace is for.").small().color(colors.muted));
-        form_grid("workspace_genres").show(ui, |ui| {
-            for (index, genre) in cfg.workspace_genres.iter_mut().enumerate() {
-                row(ui, &format!("Workspace {} genre", index + 1), |ui| {
-                    ev.apply |= ui.add(egui::TextEdit::singleline(genre).hint_text("e.g. Development").desired_width(180.0)).changed();
-                });
-            }
-        });
+        ui.label(egui::RichText::new("Manage names, colors, icons, and button display in Appearance → Workspaces.")
+            .small().color(colors.muted));
     });
 }
 
@@ -2572,7 +2884,7 @@ fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) 
 const KEY_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ("Tabs", &[
         ("new_tab", "New tab"), ("new_window", "New window"), ("close_tab", "Close tab"),
-        ("reopen_tab", "Raise last closed"), ("rename_tab", "Rename tab"),
+        ("reopen_tab", "Raise last closed tab"), ("reopen_window", "Restore last closed window"), ("rename_tab", "Rename tab"),
         ("toggle_hide_tabs", "Hide the tab strip"), ("toggle_entangle", "Type in all tabs"),
         ("prev_color", "Previous tab color"), ("next_color", "Next tab color"),
     ]),
@@ -3306,14 +3618,66 @@ mod regression {
     }
 
     #[test]
-    fn appearance_colors_exposes_workspaces_instead_of_general_tab_colors() {
+    fn workspace_editor_changes_only_the_selected_workspace() {
+        use crate::config::{WorkspaceIcon, parse_hex};
+        let ctx = Context::default();
+        let mut cfg = crate::config::Config::default();
+        let original = cfg.clone();
+        let mut st = UiState { workspace_edit: 9, ..Default::default() };
+        fn frame(ctx: &Context, cfg: &mut crate::config::Config, st: &mut UiState, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 700.0))),
+                events, ..Default::default()
+            }, |ui| {
+                let colors = TermStyle::new(ui, egui::Color32::GREEN, egui::Color32::RED);
+                colors.apply_controls(ui);
+                workspace_settings(ui, cfg, st, &mut ConfigEvents { apply: false, save: false, revert: false }, &colors);
+            });
+            output.textures_delta.clear();
+            output.shapes
+        }
+        fn click(ctx: &Context, cfg: &mut crate::config::Config, st: &mut UiState, pos: egui::Pos2) {
+            frame(ctx, cfg, st, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+            frame(ctx, cfg, st, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..3 { shapes = frame(&ctx, &mut cfg, &mut st, vec![]); }
+        let icons: Vec<_> = shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if (rect.rect.height() - 36.0).abs() < 0.1 => Some(rect.rect), _ => None,
+        }).collect();
+        assert_eq!(icons.len(), 10);
+        click(&ctx, &mut cfg, &mut st, icons[4].center());
+        assert_eq!(cfg.workspace_icons[9], WorkspaceIcon::Cube);
+        let red = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if rect.fill == rgb_c32(parse_hex("#f07b72")) && rect.rect.width() == 19.0 => Some(rect.rect.center()), _ => None,
+        }).unwrap();
+        click(&ctx, &mut cfg, &mut st, red);
+        assert_eq!(cfg.workspace_colors[9], parse_hex("#f07b72"));
+        let name_label = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Name" => Some(text.pos), _ => None,
+        }).unwrap();
+        click(&ctx, &mut cfg, &mut st, name_label + egui::vec2(35.0, 35.0));
+        frame(&ctx, &mut cfg, &mut st, vec![egui::Event::Text("Research".into())]);
+        assert_eq!(cfg.workspace_genres[9], "Research");
+        assert_eq!(cfg.workspace_icons[..9], original.workspace_icons[..9]);
+        assert_eq!(cfg.workspace_colors[..9], original.workspace_colors[..9]);
+        assert_eq!(cfg.workspace_genres[..9], original.workspace_genres[..9]);
+        st.workspace_edit = 0;
+        frame(&ctx, &mut cfg, &mut st, vec![]);
+        assert_eq!(cfg.workspace_icons[9], WorkspaceIcon::Cube);
+    }
+
+    #[test]
+    fn appearance_exposes_workspace_identity_controls() {
         let ctx = Context::default();
         let mut st = UiState { settings_page: SettingsPage::Appearance, ..Default::default() };
         let mut cfg = crate::config::Config::default();
         let mut labels = Vec::new();
         for _ in 0..3 {
             let mut full = ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 1500.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 2200.0))),
                 ..Default::default()
             }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
             labels = full.shapes.iter().filter_map(|shape| match &shape.shape {
@@ -3322,8 +3686,8 @@ mod regression {
             }).collect();
             full.textures_delta.clear();
         }
-        for index in 1..=10 {
-            assert!(labels.contains(&format!("Workspace {index}")), "missing workspace {index}");
+        for label in ["Manage workspace names, colors, and icons.", "Number", "Name", "Color", "Icon", "Button display"] {
+            assert!(labels.iter().any(|text| text == label), "missing {label}");
         }
         for retired in ["Tab", "Tab (active)", "Tab text", "Tab text (active)"] {
             assert!(!labels.iter().any(|label| label == retired));
@@ -3336,8 +3700,8 @@ mod regression {
     /// settings), so a control that drifts to another page fails this test
     /// instead of quietly rendering somewhere.
     const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
-        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Tab strip", "Group colors", "Workspace 1"]),
-        (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized"]),
+        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Button position", "Tab strip", "Group colors", "Button display"]),
+        (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
         (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
         (SettingsPage::Terminal, &["Scrollback lines"]),
@@ -3367,7 +3731,7 @@ mod regression {
     fn every_category_is_selectable_and_owns_its_controls() {
         let ctx = Context::default();
         for (page, marks) in PAGE_MARKS {
-            let labels = page_labels(&ctx, page, (1100.0, 1500.0));
+            let labels = page_labels(&ctx, page, (1100.0, 2200.0));
             for mark in marks {
                 assert!(labels.iter().any(|l| l == *mark), "{page:?} lost its {mark:?} control");
             }
@@ -3940,6 +4304,123 @@ mod input_regression {
         );
     }
 
+    fn close_frame(ctx: &Context, st: &mut UiState, time: f64, events: Vec<egui::Event>) -> Vec<egui::epaint::Shape> {
+        let mut full = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            time: Some(time), events, ..Default::default()
+        }, |ui| confirm_box(ui, st));
+        full.textures_delta.clear();
+        full.shapes.into_iter().map(|clipped| clipped.shape).collect()
+    }
+
+    fn close_key(key: egui::Key) -> Vec<egui::Event> {
+        [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+        }).collect()
+    }
+
+    fn close_button(shapes: &[egui::epaint::Shape], label: &str) -> egui::Pos2 {
+        shapes.iter().find_map(|shape| match shape {
+            egui::epaint::Shape::Text(t) if t.galley.job.text == label => Some(t.pos + t.galley.size() * 0.5),
+            egui::epaint::Shape::Vec(shapes) => {
+                // Normally text is flattened; nested shapes are legal too.
+                shapes.iter().find_map(|shape| match shape {
+                    egui::epaint::Shape::Text(t) if t.galley.job.text == label => Some(t.pos + t.galley.size() * 0.5),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }).unwrap_or_else(|| panic!("button {label} not drawn"))
+    }
+
+    fn close_click(pos: egui::Pos2) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        events.extend([true, false].into_iter().map(|pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        }));
+        events
+    }
+
+    fn close_state(retainer: WindowRetainer) -> UiState {
+        UiState { confirm_open: true, confirm_seed: true,
+            confirm: CloseDialog::new(retainer, 8, 3, 5), ..Default::default() }
+    }
+
+    #[test]
+    fn close_modal_defaults_to_cancel_and_recovery_is_explicit() {
+        let ctx = Context::default();
+        let mut st = close_state(WindowRetainer::Daemon);
+        close_frame(&ctx, &mut st, 0.0, vec![]);
+        let shapes = close_frame(&ctx, &mut st, 0.01, vec![]);
+        assert!(st.owns_keyboard(&ctx));
+        assert!(st.confirm_out.is_none());
+        assert!(ctx.memory(|m| m.focused()).is_some());
+        close_frame(&ctx, &mut st, 0.02, close_key(egui::Key::Enter));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Cancel), "bare Enter must select Cancel");
+        close_frame(&ctx, &mut st, 0.03, close_click(close_button(&shapes, "Move to Graveyard")));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Graveyard));
+        close_frame(&ctx, &mut st, 0.04, close_key(egui::Key::Escape));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Cancel));
+        close_frame(&ctx, &mut st, 0.05, close_click(egui::pos2(5.0, 5.0)));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Cancel), "backdrop must dismiss safely");
+    }
+
+    #[test]
+    fn destructive_close_waits_five_seconds_and_never_auto_confirms() {
+        let ctx = Context::default();
+        let mut st = close_state(WindowRetainer::None);
+        close_frame(&ctx, &mut st, 10.0, vec![]);
+        let shapes = close_frame(&ctx, &mut st, 10.01, vec![]);
+        let button = close_button(&shapes, "Close permanently (5 s)");
+        close_frame(&ctx, &mut st, 10.1, close_click(button));
+        assert_eq!(st.confirm_out, None, "disabled destructive button fired");
+        assert!(!st.confirm.permanent_ready(14.999));
+        close_frame(&ctx, &mut st, 15.0, vec![]);
+        assert_eq!(st.confirm_out, None, "countdown must never close the window");
+        assert!(st.confirm.permanent_ready(15.0));
+        close_frame(&ctx, &mut st, 15.01, close_key(egui::Key::Enter));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Cancel), "Enter still defaults to Cancel after unlocking");
+        let shapes = close_frame(&ctx, &mut st, 15.02, vec![]);
+        close_frame(&ctx, &mut st, 15.03, close_click(close_button(&shapes, "Close permanently")));
+        assert_eq!(st.confirm_out, Some(CloseChoice::Permanent));
+    }
+
+    #[test]
+    fn permanent_close_from_recoverable_window_starts_a_new_countdown() {
+        let ctx = Context::default();
+        let mut st = close_state(WindowRetainer::OtherWindow);
+        close_frame(&ctx, &mut st, 0.0, vec![]);
+        let shapes = close_frame(&ctx, &mut st, 100.0, vec![]);
+        close_frame(&ctx, &mut st, 100.01, close_click(close_button(&shapes, "Close permanently…")));
+        assert!(st.confirm_out.is_none());
+        assert!(!st.confirm.permanent_ready(105.0));
+        assert!(st.confirm.permanent_ready(105.01));
+        assert!(st.confirm.set_retainer(WindowRetainer::None));
+        close_frame(&ctx, &mut st, 110.0, vec![]);
+        assert!(!st.confirm.permanent_ready(114.999), "losing the recovery host must restart the warning");
+        assert!(st.confirm.permanent_ready(115.0));
+    }
+
+    #[test]
+    fn close_modal_keeps_cancel_visible_in_small_windows() {
+        for retainer in [WindowRetainer::Daemon, WindowRetainer::None] {
+            let ctx = Context::default();
+            let mut st = close_state(retainer);
+            let mut shapes = Vec::new();
+            for frame in 0..2 {
+                let mut full = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 420.0))),
+                    time: Some(frame as f64 * 0.01), ..Default::default()
+                }, |ui| confirm_box(ui, &mut st));
+                full.textures_delta.clear();
+                shapes = full.shapes.into_iter().map(|s| s.shape).collect::<Vec<_>>();
+            }
+            let cancel = close_button(&shapes, "Cancel");
+            assert!(cancel.x > 0.0 && cancel.x < 320.0 && cancel.y > 0.0 && cancel.y < 420.0,
+                "Cancel fell outside the window: {cancel:?}");
+        }
+    }
+
     #[test]
     fn keyboard_focus_released_when_ui_steps_aside() {
         let mut db = glyphon::fontdb::Database::new();
@@ -4138,6 +4619,7 @@ mod workspace_panel_tests {
                 index, count: if index < 3 { 2 } else { 0 },
                 title: format!("Terminal {index}"),
                 genre: if index == 1 { "Research".into() } else { String::new() },
+                icon: crate::config::WorkspaceIcon::Layers,
                 tabs: if index < 3 { (0..2).map(|tab| WsTab {
                     id: index * 10 + tab, title: format!("Terminal {index}-{tab}"),
                     selected: tab == 0, preview: None,

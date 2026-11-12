@@ -1,0 +1,18 @@
+[Unit]
+Description=Mypixels terminal session and window graveyard
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+ConditionEnvironment=|WAYLAND_DISPLAY
+ConditionEnvironment=|DISPLAY
+
+[Service]
+Type=exec
+ExecStart=@MYPIXELS_BIN@ --daemon
+UnsetEnvironment=MYPIXELS_WINDOW MYPIXELS_BUS MYPIXELS_KEYS
+Restart=on-failure
+RestartSec=2
+# A session already owning the display is a startup error, not a crash loop.
+RestartPreventExitStatus=1
+
+[Install]
+WantedBy=graphical-session.target

@@ -283,6 +283,7 @@ fn draw_text(ui: &egui::Ui, rect: egui::Rect, text: &str, color: egui::Color32, 
 
 #[derive(Clone, Copy)]
 pub(crate) enum Icon {
+    Archive,
     Terminal,
     Plus,
     Settings,
@@ -350,6 +351,54 @@ pub(crate) fn icon_button_faded(
     response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Workspace identities use vectors so every choice works with every terminal font.
+pub(crate) fn workspace_icon(p: &egui::Painter, glyph: crate::config::WorkspaceIcon, center: egui::Pos2, color: egui::Color32) {
+    use crate::config::WorkspaceIcon as W;
+    let stroke = egui::Stroke::new(1.5, color);
+    let pt = |x, y| center + egui::vec2(x, y);
+    let line = |points: &[(f32, f32)]| p.add(egui::Shape::line(points.iter().map(|&(x, y)| pt(x, y)).collect(), stroke));
+    match glyph {
+        W::Layers => icon(p, Icon::Layers, center, color),
+        W::Terminal => icon(p, Icon::Terminal, center, color),
+        W::Code => {
+            line(&[(-4.0, -5.0), (-9.0, 0.0), (-4.0, 5.0)]);
+            line(&[(4.0, -5.0), (9.0, 0.0), (4.0, 5.0)]);
+            line(&[(2.0, -8.0), (-2.0, 8.0)]);
+        }
+        W::Grid => for x in [-8.0, 2.0] { for y in [-8.0, 2.0] {
+            p.rect_stroke(egui::Rect::from_min_size(pt(x, y), egui::vec2(6.0, 6.0)), 1.0, stroke, egui::StrokeKind::Inside);
+        } },
+        W::Cube => {
+            line(&[(0.0, -9.0), (8.0, -5.0), (8.0, 5.0), (0.0, 9.0), (-8.0, 5.0), (-8.0, -5.0), (0.0, -9.0)]);
+            line(&[(-8.0, -5.0), (0.0, 0.0), (8.0, -5.0)]);
+            line(&[(0.0, 0.0), (0.0, 9.0)]);
+        }
+        W::Branch => {
+            line(&[(-5.0, -5.0), (-5.0, 5.0)]);
+            line(&[(-5.0, 2.0), (5.0, -2.0), (5.0, -5.0)]);
+            for (x, y) in [(-5.0, -7.0), (-5.0, 7.0), (5.0, -7.0)] { p.circle_stroke(pt(x, y), 2.0, stroke); }
+        }
+        W::Database => {
+            p.add(egui::epaint::EllipseShape::stroke(pt(0.0, -6.0), egui::vec2(8.0, 3.0), stroke));
+            line(&[(-8.0, -6.0), (-8.0, 6.0), (-4.0, 8.0), (4.0, 8.0), (8.0, 6.0), (8.0, -6.0)]);
+            line(&[(-8.0, 0.0), (-4.0, 2.0), (4.0, 2.0), (8.0, 0.0)]);
+        }
+        W::Flask => {
+            line(&[(-4.0, -9.0), (4.0, -9.0)]);
+            line(&[(-3.0, -9.0), (-3.0, -2.0), (-8.0, 6.0), (-7.0, 8.0), (7.0, 8.0), (8.0, 6.0), (3.0, -2.0), (3.0, -9.0)]);
+            line(&[(-5.0, 3.0), (5.0, 3.0)]);
+        }
+        W::Stack => for y in [-7.0, -1.0, 5.0] {
+            p.rect_stroke(egui::Rect::from_min_size(pt(-8.0, y), egui::vec2(16.0, 4.0)), 1.0, stroke, egui::StrokeKind::Inside);
+        },
+        W::Sliders => for (x, y) in [(-7.0, 3.0), (0.0, -3.0), (7.0, 1.0)] {
+            line(&[(x, -8.0), (x, y - 2.0)]);
+            line(&[(x, y + 2.0), (x, 8.0)]);
+            p.circle_stroke(pt(x, y), 2.0, stroke);
+        },
+    }
+}
+
 /// Small vector icons avoid missing-glyph boxes in the bundled egui font.
 pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.4, color);
@@ -357,6 +406,13 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
     let line =
         |points: &[(f32, f32)]| p.add(egui::Shape::line(points.iter().map(|&(x, y)| pt(x, y)).collect(), stroke));
     match icon {
+        Icon::Archive => {
+            p.rect_stroke(egui::Rect::from_center_size(pt(0.0, 2.0), egui::vec2(18.0, 15.0)),
+                2.0, stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(egui::Rect::from_center_size(pt(0.0, -6.0), egui::vec2(21.0, 4.0)),
+                1.0, stroke, egui::StrokeKind::Inside);
+            line(&[(-3.0, -1.0), (3.0, -1.0)]);
+        }
         Icon::Plus => {
             line(&[(-6.0, 0.0), (6.0, 0.0)]);
             line(&[(0.0, -6.0), (0.0, 6.0)]);
