@@ -18,6 +18,7 @@ mod mcp;
 mod notifications;
 mod tab;
 mod session;
+mod persistent;
 mod theme;
 
 use std::cell::RefCell;
@@ -544,7 +545,7 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(persistent: Option<std::os::unix::net::UnixListener>, proxy: winit::event_loop::EventLoopProxy<()>) -> Self {
         let config = Config::load();
         // Pango sizes are points; cosmic-text wants pixels (@96 dpi). The
         // parsed family may still carry style words ("Foo Bold 12");
@@ -644,11 +645,11 @@ impl App {
         // private instance. Another `mypixels` run will find us here and open
         // its tab in *this* window instead of growing another frame; its
         // request arrives on this channel (see the RedrawRequested drain).
-        let standalone = std::env::args()
-            .skip(1)
-            .take_while(|a| a.starts_with('-'))
-            .any(|a| a == "--standalone" || a == "-s");
+        let standalone = persistent::enabled() || leading_flags().iter().any(|a| a == "--standalone" || a == "-s");
         let (session_tx, session_rx) = std::sync::mpsc::channel();
+        if let Some(listener) = persistent {
+            persistent::serve(listener, session_tx.clone(), proxy);
+        }
         let (mcp_tx, mcp_rx) = std::sync::mpsc::channel();
         let _session = if standalone {
             None
@@ -1103,6 +1104,31 @@ impl App {
         config::find_action(&self.config.bindings, &unshifted, self.modifiers, overview_active)
     }
 
+    /// Recreate display resources while retaining every live terminal object.
+    fn reattach_windows(&mut self, event_loop: &ActiveEventLoop) {
+        let selected = self.cur;
+        for i in 0..self.wins.len() {
+            if self.wins[i].window.is_some() { continue; }
+            self.cur = i;
+            let size = winit::dpi::PhysicalSize::new(
+                (self.wins[i].cols as f32 * self.cell_w) as u32,
+                (self.wins[i].rows as f32 * self.cell_h + self.tab_h) as u32,
+            );
+            let window = Arc::new(event_loop.create_window(
+                Window::default_attributes().with_inner_size(size)
+                    .with_transparent(true).with_title("mypixels")
+                    .with_name("mypixels", "mypixels").with_window_icon(app_icon())
+            ).expect("reattach window"));
+            self.wins[i].window = Some(Arc::clone(&window));
+            self.wins[i].occluded = false;
+            self.window_slot.lock().unwrap().push(Arc::clone(&window));
+            self.init_gpu(event_loop, &window);
+            self.wins[i].frame_gen = self.wins[i].frame_gen.wrapping_add(1);
+            window.request_redraw();
+        }
+        self.cur = selected.min(self.wins.len().saturating_sub(1));
+    }
+
     fn close_window(&mut self, i: usize, event_loop: &ActiveEventLoop) {
         // A window dying buries all its tabs — the current workspace and
         // the live terminals parked in inactive workspaces — so raising
@@ -1259,7 +1285,10 @@ impl App {
                     self.cur = self.wins.len() - 1;
                     opened = true;
                 }
-                session::Request::Raise => opened = true,
+                session::Request::Raise => {
+                    self.reattach_windows(event_loop);
+                    opened = true;
+                },
                 session::Request::LastOutput { window, n, copy, respond } => {
                     // Fold any marks still in the ring first: the shell
                     // that typed `mypixels last` emitted its D mark
@@ -5048,7 +5077,7 @@ fn preview_rects(
 /// Flags are only flags *before* the first positional argument: `mypixels -s
 /// sh -c "sleep 1"` hands `-s` to us and `-c "sleep 1"` to the shell.
 fn leading_flags() -> Vec<String> {
-    std::env::args().skip(1).take_while(|a| a.starts_with('-')).collect()
+    persistent::split_args(std::env::args().skip(1).collect()).0
 }
 
 /// A launcher joins the existing process with a new window by default.
@@ -5062,11 +5091,7 @@ fn opens_new_window(flags: &[String]) -> bool {
 }
 
 fn positional_terms() -> Vec<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.iter().position(|a| !a.starts_with('-')) {
-        Some(i) => args[i..].to_vec(),
-        None => vec![],
-    }
+    persistent::split_args(std::env::args().skip(1).collect()).1
 }
 
 /// A PATH lookup, because a remote request is not trusted to name a real
@@ -6102,6 +6127,10 @@ fn mouse_report_bytes(mode: TermMode, code: u16, col: u16, row: u16, release: bo
 // ---------------------------------------------------------------------------
 
 impl ApplicationHandler for App {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        self.drain_session_requests(event_loop);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.wins.is_empty() {
             self.make_window(event_loop, None, None, true);
@@ -6129,6 +6158,12 @@ impl ApplicationHandler for App {
             }
         }
         let next = self.wins.iter().filter_map(|w| w.repaint_at).min();
+        // With no native windows, PTY callbacks have no redraw target. Keep
+        // draining terminal protocol replies and bounded event queues.
+        let next = if persistent::enabled() && self.wins.iter().any(|w| w.window.is_none()) {
+            Some(next.map_or(now + std::time::Duration::from_millis(50),
+                |at| at.min(now + std::time::Duration::from_millis(50))))
+        } else { next };
         event_loop.set_control_flow(next.map_or(winit::event_loop::ControlFlow::Wait,
             winit::event_loop::ControlFlow::WaitUntil));
     }
@@ -6230,10 +6265,30 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => {
-                // A window closes; its tabs die with it (they are pty
-                // children and nowhere else to go). The session ends with
-                // the last window, like the original's GApplication.
-                self.close_window(self.cur, event_loop);
+                // Named sessions discard display resources only. Ordinary
+                // windows keep their original close-and-terminate behavior.
+                if persistent::enabled() {
+                    let win = &mut self.wins[self.cur];
+                    if let Some(w) = win.window.take() {
+                        self.window_slot.lock().unwrap().retain(|other| other.id() != w.id());
+                    }
+                    win.sw_thumbs.clear();
+                    win.grave_thumbs.clear();
+                    win.overview = None;
+                    win.tab_drag = None;
+                    win.drag = None;
+                    win.mouse_button = None;
+                    win.egui = None;
+                    win.gpu = None;
+                    win.focused = false;
+                    win.occluded = true;
+                    self.modifiers = ModifiersState::empty();
+                    self.switcher_open.store(false, Ordering::SeqCst);
+                    self.switcher_show_req.store(false, Ordering::SeqCst);
+                    *self.switcher_alt_at.lock().unwrap() = None;
+                } else {
+                    self.close_window(self.cur, event_loop);
+                }
             },
             WindowEvent::RedrawRequested => {
                 // This frame belongs to the window that asked for it. The
@@ -6979,6 +7034,7 @@ fn main() {
 Options:
   -n, --new-window   open a new window in the running instance (default)
   -t, --new-tab      open a tab in the originating or first session window
+  -S <name>         create or attach a persistent session; window close detaches
   -s, --standalone   run a private instance: never join or host a session
   -h, --help         show this text
 
@@ -6992,6 +7048,14 @@ prints the instance and requested action to stdout before sending it.
 Use --new-tab to add a tab instead. If no session answers, start a new instance."#);
         return;
     }
+    let persistent_listener = match persistent::prepare() {
+        Ok(persistent::Launch::Attached) => return,
+        Ok(persistent::Launch::Start(listener)) => listener,
+        Err(e) => {
+            eprintln!("mypixels: {e}");
+            std::process::exit(2);
+        }
+    };
     // Forward new-window requests (or explicit --new-tab requests) to the
     // live session. Missing/incompatible sessions fall back to starting here.
     // `mypixels last [n] [--copy]`: the running session's memory pool of
@@ -7027,7 +7091,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
         }
     }
     let standalone = flags.iter().any(|a| a == "--standalone" || a == "-s");
-    if !standalone {
+    if !standalone && !persistent::enabled() {
         let new_window = opens_new_window(&flags);
         let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
         if session::remote_open(cwd, positional_terms(), new_window) {
@@ -7055,7 +7119,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
         event_loop.run_app(&mut AlphaProbe).expect("alpha probe");
         return;
     }
-    let mut app = App::new();
+    let mut app = App::new(persistent_listener, event_loop.create_proxy());
     event_loop.run_app(&mut app).expect("run");
     log::info!("exited");
 }

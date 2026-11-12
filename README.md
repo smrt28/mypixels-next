@@ -34,6 +34,7 @@ Usage
     usage: mypixels [options] [command args...]
       -n, --new-window   open a new window in the running instance (default)
       -t, --new-tab      add a tab to the originating or first session window
+      -S <name>         create or attach a persistent named session
       -s, --standalone   run a private instance: never join or host a session
 
 Without flags, mypixels finds the running instance on this display over D-Bus
@@ -42,6 +43,21 @@ It prints the instance and requested action to stdout before sending the request
 Use `-t` / `--new-tab` to add a tab to the originating window (or the first
 session window when launched elsewhere). If no session answers, it starts a
 new instance. `-n` remains an explicit spelling of the default window action.
+
+`mypixels -S work` creates a named session or reattaches its existing windows.
+Closing a window detaches it: its terminal processes keep running, and reattaching
+preserves the live tabs, ordering, titles, working directories, terminal screen,
+and configured scrollback. Tabs closed explicitly retain their normal behavior.
+An optional command (for example `mypixels -S work sh`) runs only when creating
+the session; attaching never opens extra tabs or starts the command again.
+Names are case-sensitive, 1–32 UTF-8 bytes, and scoped to the current user.
+Named sessions are independent of the default D-Bus instance and cannot be
+combined with `--standalone`.
+
+The session process keeps running in the background after detaching. It still
+requires its original display server: sessions do not survive logout, display
+server shutdown, process termination, or reboot. Reattach from the same desktop.
+Without `-S`, closing windows retains the existing process termination behavior.
 
 `mypixels last [n] [--copy]` prints (or clipboard-copies) the output
 of the last n commands from the running session's memory pool - a

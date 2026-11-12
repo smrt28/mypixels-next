@@ -153,3 +153,22 @@ The reviewed fork adds these checks:
   image ids, navigation, large tiled previews, and resizing. Use a private
   Wayland compositor with grim and Yazi installed; `--x11` uses its XWayland
   display. Checks select the most recent upload when Yazi reuses image ids.
+
+Named-session launcher IPC checks (no display required):
+
+```sh
+cargo build --offline
+python3 tests/persistent_ipc.py
+```
+
+This checks argument validation, concurrent clients attaching during session
+startup, preserving the existing session rather than respawning commands, and
+error reporting when the owner stops responding. It creates private Unix sockets.
+
+For the display lifecycle, run `target/debug/mypixels -S test`, open several
+tabs, rename/reorder them, change directories, and start a long-running command.
+Scroll up in another tab, close the window, then reattach with the same command.
+Check the command's PID and progress, tab order/titles/cwd, screen and scrollback,
+and repeat the detach/attach cycle on both X11 and Wayland. A different name
+should open an independent session. Without `-S`, closing the last window should
+terminate its processes as before.
