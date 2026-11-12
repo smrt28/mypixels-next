@@ -21,6 +21,48 @@ impl WorkspaceButtonPosition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceButtonDisplay { Number, Name, Icon, IconAndName }
+
+impl WorkspaceButtonDisplay {
+    pub const ALL: [Self; 4] = [Self::Number, Self::Name, Self::Icon, Self::IconAndName];
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Number => "number", Self::Name => "name", Self::Icon => "icon", Self::IconAndName => "icon_and_name" }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Number => "Number", Self::Name => "Name", Self::Icon => "Icon", Self::IconAndName => "Icon and name" }
+    }
+    pub fn parse(value: &str) -> Option<Self> { Self::ALL.into_iter().find(|mode| mode.as_str() == value) }
+    pub fn shows_icon(self) -> bool { matches!(self, Self::Icon | Self::IconAndName) }
+    pub fn text(self, number: usize, name: &str) -> String {
+        match self {
+            Self::Icon => String::new(),
+            Self::Number => number.to_string(),
+            _ if name.trim().is_empty() => number.to_string(),
+            _ => name.trim().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceIcon { Code, Layers, Grid, Terminal, Cube, Branch, Database, Flask, Stack, Sliders }
+
+impl WorkspaceIcon {
+    pub const ALL: [Self; 10] = [Self::Code, Self::Layers, Self::Grid, Self::Terminal, Self::Cube,
+        Self::Branch, Self::Database, Self::Flask, Self::Stack, Self::Sliders];
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Code => "code", Self::Layers => "layers", Self::Grid => "grid", Self::Terminal => "terminal",
+            Self::Cube => "cube", Self::Branch => "branch", Self::Database => "database", Self::Flask => "flask",
+            Self::Stack => "stack", Self::Sliders => "sliders" }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Code => "Code", Self::Layers => "Layers", Self::Grid => "Grid", Self::Terminal => "Terminal",
+            Self::Cube => "Cube", Self::Branch => "Branch", Self::Database => "Database", Self::Flask => "Flask",
+            Self::Stack => "Stack", Self::Sliders => "Sliders" }
+    }
+    pub fn parse(value: &str) -> Option<Self> { Self::ALL.into_iter().find(|icon| icon.as_str() == value) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseWindowDialog { Never, Loss, Always }
 
 impl CloseWindowDialog {
@@ -106,6 +148,7 @@ pub struct Config {
     pub workspace_colors: [Rgb; 10],
     /// Optional purpose labels, independent of any terminal working directory.
     pub workspace_genres: [String; 10],
+    pub workspace_icons: [WorkspaceIcon; 10],
     pub tab_color_bg: Rgb,
     pub tab_color_bg_selected: Rgb,
     pub tab_color_fg: Rgb,
@@ -159,6 +202,7 @@ pub struct Config {
     pub workspaces_enabled: bool,
     /// Which end of the tab strip holds the workspace button.
     pub workspace_button_position: WorkspaceButtonPosition,
+    pub workspace_button_display: WorkspaceButtonDisplay,
     /// Opt-in alternative workspace shortcut: Alt+Q..P. Off by default because
     /// bare Alt+letter collides with shell and editor bindings (word-wise
     /// backward word, readline shortcuts). The standard scheme is
@@ -288,6 +332,7 @@ impl Default for Config {
                 "#5fc7d0", "#e998be", "#ec9756", "#bbc96a", "#95a8c4",
             ].map(parse_hex),
             workspace_genres: std::array::from_fn(|_| String::new()),
+            workspace_icons: [WorkspaceIcon::Layers; 10],
             tab_color_bg: parse_hex("#303030"),
             tab_color_bg_selected: parse_hex("#505020"),
             tab_color_fg: parse_hex("#888888"),
@@ -329,6 +374,7 @@ impl Default for Config {
             compact_tabs: false,
             workspaces_enabled: false,
             workspace_button_position: WorkspaceButtonPosition::Right,
+            workspace_button_display: WorkspaceButtonDisplay::Name,
             workspace_letter_keys: false,
             tab_overview_opacity: 0.3,
             tab_overview_delay_ms: 500,
@@ -579,6 +625,7 @@ impl Config {
             ("compact_tabs".into(), self.compact_tabs.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
             ("workspace_button_position".into(), str_(self.workspace_button_position.as_str())),
+            ("workspace_button_display".into(), str_(self.workspace_button_display.as_str())),
             ("workspace_letter_keys".into(), self.workspace_letter_keys.to_string()),
             ("tab_overview_opacity".into(), self.tab_overview_opacity.to_string()),
             ("tab_overview_delay_ms".into(), self.tab_overview_delay_ms.to_string()),
@@ -603,6 +650,9 @@ impl Config {
         }
         for (i, genre) in self.workspace_genres.iter().enumerate() {
             keys.push((format!("workspace_genre_{}", i + 1), str_(genre)));
+        }
+        for (i, icon) in self.workspace_icons.iter().enumerate() {
+            keys.push((format!("workspace_icon_{}", i + 1), str_(icon.as_str())));
         }
         for (i, c) in self.col.iter().enumerate() {
             keys.push((format!("col_{i}"), rgb(c)));
@@ -815,6 +865,11 @@ fn workspace_genre_index(key: &str) -> Option<usize> {
     (index < WORKSPACES).then_some(index)
 }
 
+fn workspace_icon_index(key: &str) -> Option<usize> {
+    let index = key.strip_prefix("workspace_icon_")?.parse::<usize>().ok()?.checked_sub(1)?;
+    (index < WORKSPACES).then_some(index)
+}
+
 pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
         let Some(map) = v.as_mapping() else {
             return;
@@ -830,6 +885,16 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 key if workspace_genre_index(key).is_some() => {
                     if let Some(genre) = val.as_str() {
                         cfg.workspace_genres[workspace_genre_index(key).unwrap()] = genre.trim().to_string();
+                    }
+                }
+                key if workspace_icon_index(key).is_some() => {
+                    if let Some(icon) = val.as_str().and_then(WorkspaceIcon::parse) {
+                        cfg.workspace_icons[workspace_icon_index(key).unwrap()] = icon;
+                    }
+                }
+                "workspace_button_display" => {
+                    if let Some(mode) = val.as_str().and_then(WorkspaceButtonDisplay::parse) {
+                        cfg.workspace_button_display = mode;
                     }
                 }
                 "bindings" => merge_bindings(&mut cfg.bindings, val),
@@ -1519,6 +1584,29 @@ mod tests {
             let saved = replace_top_level_values("", &cfg.ui_keys());
             assert_eq!(Config::from_text(&saved, base).unwrap().animation_speed, expected);
         }
+    }
+
+    #[test]
+    fn workspace_identity_choices_round_trip_and_reject_invalid_values() {
+        for mode in WorkspaceButtonDisplay::ALL {
+            let mut cfg = Config::default();
+            cfg.workspace_button_display = mode;
+            cfg.workspace_icons = WorkspaceIcon::ALL;
+            cfg.workspace_genres[9] = "Research: notes & ideas".into();
+            let text = replace_top_level_values("", &cfg.ui_keys());
+            let loaded = Config::from_text(&text, std::path::Path::new(".")).unwrap();
+            assert_eq!(loaded.workspace_button_display, mode);
+            assert_eq!(loaded.workspace_icons, WorkspaceIcon::ALL);
+            assert_eq!(loaded.workspace_genres, cfg.workspace_genres);
+        }
+        let cfg = Config::from_text("workspace_button_display: invalid\nworkspace_icon_1: invalid\nworkspace_icon_0: code\nworkspace_icon_11: terminal\nworkspace_icon_2: cube\n", std::path::Path::new(".")).unwrap();
+        assert_eq!(cfg.workspace_button_display, WorkspaceButtonDisplay::Name);
+        assert_eq!(cfg.workspace_icons[0], WorkspaceIcon::Layers);
+        assert_eq!(cfg.workspace_icons[1], WorkspaceIcon::Cube);
+        assert_eq!(WorkspaceButtonDisplay::Name.text(3, "  "), "3");
+        assert_eq!(WorkspaceButtonDisplay::IconAndName.text(3, " Development "), "Development");
+        assert_eq!(WorkspaceButtonDisplay::Number.text(3, "Development"), "3");
+        assert!(WorkspaceButtonDisplay::Icon.text(3, "Development").is_empty());
     }
 
     #[test]

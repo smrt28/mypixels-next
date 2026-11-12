@@ -1586,6 +1586,7 @@ impl App {
                 count: tabs.len(),
                 title: tabs.get(active).map(|t| t.display_title()).unwrap_or_default(),
                 genre: self.config.workspace_genres[i].clone(),
+                icon: self.config.workspace_icons[i],
                 tabs: tabs.iter().enumerate().map(|(index, tab)| egui_ui::WsTab {
                     id: tab.id,
                     title: tab.display_title(),
@@ -5039,7 +5040,9 @@ impl App {
                 self.switcher_show_req.store(false, Ordering::SeqCst);
                 // Toggle: the chord that summoned the panel is the natural
                 // way to dismiss it (same as every transient overlay here).
+                let workspace = self.wins[self.cur].workspace;
                 if let Some(e) = self.wins[self.cur].egui.as_mut() {
+                    e.ui_state.workspace_edit = workspace;
                     e.ui_state.toggle_panel(egui_ui::RightPanel::Settings);
                     egui_ui::release_focus(&e.ctx);
                 }

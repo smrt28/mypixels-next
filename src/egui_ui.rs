@@ -61,6 +61,7 @@ pub struct UiState {
     pub theme_choice: Vec<String>,
     pub theme_fetched: bool,
     pub settings_page: SettingsPage,
+    pub workspace_edit: usize,
     /// Last geometry logged for the category selector, so the line is written
     /// when the layout moves rather than on every frame. The smoke tests click
     /// a category by name from this line instead of guessing an offset.
@@ -205,6 +206,7 @@ pub struct WsRow {
     /// Caption of the workspace's selected tab, empty when it holds none.
     pub title: String,
     pub genre: String,
+    pub icon: crate::config::WorkspaceIcon,
     pub tabs: Vec<WsTab>,
     /// The workspace this window is looking at right now.
     pub current: bool,
@@ -1384,7 +1386,7 @@ pub fn workspaces_panel(
                             ui.painter().rect(rect, 11.0, fill, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
                                 if selected { color } else if hover { border.lerp_to_gamma(color, 0.45) } else { border }), egui::StrokeKind::Inside);
                             let mark = egui::Rect::from_center_size(egui::pos2(rect.left() + 27.0, heading.center().y), egui::vec2(30.0, 32.0));
-                            crate::ui_style::text_centered(ui, mark, &(index + 1).to_string(), color, 20.0, true);
+                            crate::ui_style::workspace_icon(ui.painter(), row.icon, mark.center(), color);
                             let name_x = rect.left() + 53.0;
                             let badge = egui::Rect::from_center_size(egui::pos2(rect.right() - 60.0, heading.center().y), egui::vec2(62.0, 24.0));
                             ui.painter().rect_filled(badge, 12.0, fill.lerp_to_gamma(fg, 0.07));
@@ -2577,6 +2579,7 @@ fn appearance_page(
             });
         });
     });
+    workspace_settings(ui, cfg, st, ev, colors);
     section(ui, "Fonts", colors, |ui| {
         form_grid("fonts").show(ui, |ui| {
             font_row(ui, "Terminal font", &mut cfg.term_font, FontWhich::Term, st, choices, ev);
@@ -2601,29 +2604,12 @@ fn appearance_page(
         ui.label(egui::RichText::new("1× is normal. Lower is slower; 0 turns animations off.")
             .small().color(colors.muted));
     });
-    section(ui, "Layout", colors, |ui| {
-        form_grid("appearance-layout").show(ui, |ui| {
-            row(ui, "Workspace button position", |ui| {
-                use crate::config::WorkspaceButtonPosition;
-                egui::ComboBox::from_id_salt("workspace_button_position")
-                    .popup_style((**ui.style()).clone().into())
-                    .width(140.0).selected_text(cfg.workspace_button_position.label())
-                    .show_ui(ui, |ui| {
-                        for position in [WorkspaceButtonPosition::Left, WorkspaceButtonPosition::Right] {
-                            ev.apply |= ui.selectable_value(&mut cfg.workspace_button_position, position, position.label()).changed();
-                        }
-                    }).response.on_hover_text("Left: next to the menu. Right: at the end of the tab strip.");
-            });
-        });
-    });
     section(ui, "Tab colors", colors, |ui| {
         form_grid("colors-tabs").show(ui, |ui| {
             color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
             color_row(ui, "Add button", &mut cfg.add_button_color, ev);
         });
-        // Two palettes color tabs, and they are not the same choice: one tags a
-        // tab by hand, the other is the workspace the tab sits in. Both live here
-        // because both are "what color is my tab", and each says which it is.
+        // Manual tab groups have a separate palette from workspace identities.
         ui.add_space(8.0);
         ui.label("Group colors");
         ui.label(egui::RichText::new("The palette a tab is tagged with.").small().color(colors.muted));
@@ -2636,15 +2622,101 @@ fn appearance_page(
                 });
             }
         });
-        ui.add_space(8.0);
-        ui.label("Workspace colors");
-        ui.label(egui::RichText::new("Tabs use the color of their workspace.").small().color(colors.muted));
-        ui.add_space(4.0);
-        form_grid("colors-workspaces").show(ui, |ui| {
-            for (index, color) in cfg.workspace_colors.iter_mut().enumerate() {
-                color_row(ui, &format!("Workspace {}", index + 1), color, ev);
+
+    });
+}
+
+/// A single workspace editor keeps identity choices together, as in the mockup.
+fn workspace_settings(ui: &mut egui::Ui, cfg: &mut crate::config::Config, st: &mut UiState,
+    ev: &mut ConfigEvents, colors: &TermStyle) {
+    use crate::config::{WorkspaceButtonDisplay, WorkspaceButtonPosition, WorkspaceIcon};
+    let mut card = *colors;
+    card.border = colors.accent.gamma_multiply(0.65);
+    section(ui, "Workspaces", &card, |ui| {
+        ui.label(egui::RichText::new("Manage workspace names, colors, and icons.").small().color(colors.muted));
+        st.workspace_edit = st.workspace_edit.min(crate::config::WORKSPACES - 1);
+        let selected = st.workspace_edit;
+        let caption = format!("    {} {}", selected + 1, cfg.workspace_genres[selected].trim());
+        let picker = egui::ComboBox::from_id_salt("workspace_editor")
+            .popup_style((**ui.style()).clone().into()).width(ui.available_width() - 8.0)
+            .selected_text(caption).truncate().show_ui(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                for index in 0..crate::config::WORKSPACES {
+                    let label = format!("    {} {}", index + 1, cfg.workspace_genres[index].trim());
+                    let response = ui.selectable_value(&mut st.workspace_edit, index, label);
+                    crate::ui_style::workspace_icon(ui.painter(), cfg.workspace_icons[index],
+                        egui::pos2(response.rect.left() + 14.0, response.rect.center().y), rgb_c32(cfg.workspace_colors[index]));
+                    response.on_hover_text(format!("Workspace {} · {}", index + 1, cfg.workspace_genres[index]));
+                }
+            });
+        crate::ui_style::workspace_icon(ui.painter(), cfg.workspace_icons[selected],
+            egui::pos2(picker.response.rect.left() + 14.0, picker.response.rect.center().y), rgb_c32(cfg.workspace_colors[selected]));
+        let index = st.workspace_edit;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("Number");
+                let mut number = (index + 1).to_string();
+                ui.add(egui::TextEdit::singleline(&mut number).interactive(false).desired_width(40.0));
+            });
+            ui.vertical(|ui| {
+                ui.label("Name");
+                ev.apply |= ui.add(egui::TextEdit::singleline(&mut cfg.workspace_genres[index])
+                    .hint_text("e.g. Development").desired_width(ui.available_width() - 8.0)).changed();
+            });
+        });
+        ui.label("Color");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for hex in ["#f07b72", "#ec9756", "#e7b85a", "#bbc96a", "#71c58c", "#5fc7d0", "#5e9eff", "#b792ed", "#e998be", "#95a8c4"] {
+                let color = crate::config::parse_hex(hex);
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(25.0, 25.0), egui::Sense::click());
+                let selected = cfg.workspace_colors[index] == color;
+                ui.painter().rect_filled(rect.shrink(3.0), 4.0, rgb_c32(color));
+                if selected || response.hovered() || response.has_focus() {
+                    ui.painter().rect_stroke(rect, 5.0, egui::Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+                }
+                if selected { crate::ui_style::icon(ui.painter(), Icon::Check, rect.center(), crate::ui_style::black_or_white_text(rgb_c32(color))); }
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Workspace color {hex}")));
+                if response.on_hover_text(hex).clicked() { cfg.workspace_colors[index] = color; ev.apply = true; }
             }
         });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Custom color").small().color(colors.muted));
+            ev.apply |= color_cell(ui, &mut cfg.workspace_colors[index]);
+        });
+        ui.label("Icon");
+        let cell_width = ((ui.available_width() - 32.0) / 5.0).max(30.0);
+        egui::Grid::new("workspace_icons").spacing(egui::vec2(8.0, 8.0)).show(ui, |ui| {
+            for (slot, icon) in WorkspaceIcon::ALL.into_iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_width, 36.0), egui::Sense::click());
+                let selected = cfg.workspace_icons[index] == icon;
+                let hot = response.hovered() || response.has_focus();
+                ui.painter().rect(rect, 5.0, colors.bg.lerp_to_gamma(colors.accent, if selected { 0.12 } else { 0.02 }),
+                    egui::Stroke::new(1.0, if selected || hot { colors.accent } else { colors.border }), egui::StrokeKind::Inside);
+                crate::ui_style::workspace_icon(ui.painter(), icon, rect.center(), rgb_c32(cfg.workspace_colors[index]));
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Workspace icon {}", icon.label())));
+                if response.on_hover_text(icon.label()).clicked() { cfg.workspace_icons[index] = icon; ev.apply = true; }
+                if slot % 5 == 4 { ui.end_row(); }
+            }
+        });
+        ui.add_space(4.0);
+        form_grid("workspace_button_options").show(ui, |ui| {
+            row(ui, "Button display", |ui| {
+                egui::ComboBox::from_id_salt("workspace_button_display").width(140.0)
+                    .popup_style((**ui.style()).clone().into()).selected_text(cfg.workspace_button_display.label())
+                    .show_ui(ui, |ui| { for mode in WorkspaceButtonDisplay::ALL {
+                        ev.apply |= ui.selectable_value(&mut cfg.workspace_button_display, mode, mode.label()).changed();
+                    }});
+            });
+            row(ui, "Button position", |ui| {
+                egui::ComboBox::from_id_salt("workspace_button_position").width(140.0)
+                    .popup_style((**ui.style()).clone().into()).selected_text(cfg.workspace_button_position.label())
+                    .show_ui(ui, |ui| { for position in [WorkspaceButtonPosition::Left, WorkspaceButtonPosition::Right] {
+                        ev.apply |= ui.selectable_value(&mut cfg.workspace_button_position, position, position.label()).changed();
+                    }}).response.on_hover_text("Left: next to the menu. Right: at the end of the tab strip.");
+            });
+        });
+        ui.label(egui::RichText::new("Button display and position apply to all workspaces.").small().color(colors.muted));
     });
 }
 
@@ -2762,14 +2834,8 @@ fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut 
         .small()
         .color(colors.muted));
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Optional genres describe what each workspace is for.").small().color(colors.muted));
-        form_grid("workspace_genres").show(ui, |ui| {
-            for (index, genre) in cfg.workspace_genres.iter_mut().enumerate() {
-                row(ui, &format!("Workspace {} genre", index + 1), |ui| {
-                    ev.apply |= ui.add(egui::TextEdit::singleline(genre).hint_text("e.g. Development").desired_width(180.0)).changed();
-                });
-            }
-        });
+        ui.label(egui::RichText::new("Manage names, colors, icons, and button display in Appearance → Workspaces.")
+            .small().color(colors.muted));
     });
 }
 
@@ -3552,14 +3618,66 @@ mod regression {
     }
 
     #[test]
-    fn appearance_colors_exposes_workspaces_instead_of_general_tab_colors() {
+    fn workspace_editor_changes_only_the_selected_workspace() {
+        use crate::config::{WorkspaceIcon, parse_hex};
+        let ctx = Context::default();
+        let mut cfg = crate::config::Config::default();
+        let original = cfg.clone();
+        let mut st = UiState { workspace_edit: 9, ..Default::default() };
+        fn frame(ctx: &Context, cfg: &mut crate::config::Config, st: &mut UiState, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 700.0))),
+                events, ..Default::default()
+            }, |ui| {
+                let colors = TermStyle::new(ui, egui::Color32::GREEN, egui::Color32::RED);
+                colors.apply_controls(ui);
+                workspace_settings(ui, cfg, st, &mut ConfigEvents { apply: false, save: false, revert: false }, &colors);
+            });
+            output.textures_delta.clear();
+            output.shapes
+        }
+        fn click(ctx: &Context, cfg: &mut crate::config::Config, st: &mut UiState, pos: egui::Pos2) {
+            frame(ctx, cfg, st, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+            frame(ctx, cfg, st, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..3 { shapes = frame(&ctx, &mut cfg, &mut st, vec![]); }
+        let icons: Vec<_> = shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if (rect.rect.height() - 36.0).abs() < 0.1 => Some(rect.rect), _ => None,
+        }).collect();
+        assert_eq!(icons.len(), 10);
+        click(&ctx, &mut cfg, &mut st, icons[4].center());
+        assert_eq!(cfg.workspace_icons[9], WorkspaceIcon::Cube);
+        let red = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if rect.fill == rgb_c32(parse_hex("#f07b72")) && rect.rect.width() == 19.0 => Some(rect.rect.center()), _ => None,
+        }).unwrap();
+        click(&ctx, &mut cfg, &mut st, red);
+        assert_eq!(cfg.workspace_colors[9], parse_hex("#f07b72"));
+        let name_label = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Name" => Some(text.pos), _ => None,
+        }).unwrap();
+        click(&ctx, &mut cfg, &mut st, name_label + egui::vec2(35.0, 35.0));
+        frame(&ctx, &mut cfg, &mut st, vec![egui::Event::Text("Research".into())]);
+        assert_eq!(cfg.workspace_genres[9], "Research");
+        assert_eq!(cfg.workspace_icons[..9], original.workspace_icons[..9]);
+        assert_eq!(cfg.workspace_colors[..9], original.workspace_colors[..9]);
+        assert_eq!(cfg.workspace_genres[..9], original.workspace_genres[..9]);
+        st.workspace_edit = 0;
+        frame(&ctx, &mut cfg, &mut st, vec![]);
+        assert_eq!(cfg.workspace_icons[9], WorkspaceIcon::Cube);
+    }
+
+    #[test]
+    fn appearance_exposes_workspace_identity_controls() {
         let ctx = Context::default();
         let mut st = UiState { settings_page: SettingsPage::Appearance, ..Default::default() };
         let mut cfg = crate::config::Config::default();
         let mut labels = Vec::new();
         for _ in 0..3 {
             let mut full = ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 1500.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 2200.0))),
                 ..Default::default()
             }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
             labels = full.shapes.iter().filter_map(|shape| match &shape.shape {
@@ -3568,8 +3686,8 @@ mod regression {
             }).collect();
             full.textures_delta.clear();
         }
-        for index in 1..=10 {
-            assert!(labels.contains(&format!("Workspace {index}")), "missing workspace {index}");
+        for label in ["Manage workspace names, colors, and icons.", "Number", "Name", "Color", "Icon", "Button display"] {
+            assert!(labels.iter().any(|text| text == label), "missing {label}");
         }
         for retired in ["Tab", "Tab (active)", "Tab text", "Tab text (active)"] {
             assert!(!labels.iter().any(|label| label == retired));
@@ -3582,7 +3700,7 @@ mod regression {
     /// settings), so a control that drifts to another page fails this test
     /// instead of quietly rendering somewhere.
     const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
-        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Workspace button position", "Tab strip", "Group colors", "Workspace 1"]),
+        (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Button position", "Tab strip", "Group colors", "Button display"]),
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
         (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
@@ -3613,7 +3731,7 @@ mod regression {
     fn every_category_is_selectable_and_owns_its_controls() {
         let ctx = Context::default();
         for (page, marks) in PAGE_MARKS {
-            let labels = page_labels(&ctx, page, (1100.0, 1500.0));
+            let labels = page_labels(&ctx, page, (1100.0, 2200.0));
             for mark in marks {
                 assert!(labels.iter().any(|l| l == *mark), "{page:?} lost its {mark:?} control");
             }
@@ -4501,6 +4619,7 @@ mod workspace_panel_tests {
                 index, count: if index < 3 { 2 } else { 0 },
                 title: format!("Terminal {index}"),
                 genre: if index == 1 { "Research".into() } else { String::new() },
+                icon: crate::config::WorkspaceIcon::Layers,
                 tabs: if index < 3 { (0..2).map(|tab| WsTab {
                     id: index * 10 + tab, title: format!("Terminal {index}-{tab}"),
                     selected: tab == 0, preview: None,

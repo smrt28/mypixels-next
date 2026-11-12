@@ -69,10 +69,12 @@ pub(crate) fn show(
             p.rect_filled(bar, 0.0, colors.bg);
             p.hline(bar.x_range(), height - 0.5, egui::Stroke::new(1.0, colors.border));
             let genre = cfg.workspace_genres.get(workspace).map_or("", |genre| genre.trim());
-            let workspace_label = if genre.is_empty() { (workspace + 1).to_string() } else { genre.to_owned() };
+            let workspace_label = cfg.workspace_button_display.text(workspace + 1, genre);
+            let show_icon = cfg.workspace_button_display.shows_icon();
             let workspace_width = if cfg.workspaces_enabled {
                 // Leave room for tabs and the add button; long genres are ellipsized.
-                (ui_style::text_width(ui, &workspace_label, 11.0) + 22.0)
+                (ui_style::text_width(ui, &workspace_label, 11.0) + 22.0
+                    + if show_icon && !workspace_label.is_empty() { 24.0 } else { 0.0 })
                     .max(WORKSPACE_WIDTH).min((width * 0.5).clamp(WORKSPACE_WIDTH, 240.0))
             } else { 0.0 };
             let workspace_left = cfg.workspace_button_position == crate::config::WorkspaceButtonPosition::Left;
@@ -106,8 +108,16 @@ pub(crate) fn show(
                 if workspace_open || response.hovered() || response.has_focus() {
                     p.rect_stroke(workspace_rect, 4.0, egui::Stroke::new(1.0, text_color), egui::StrokeKind::Inside);
                 }
-                ui_style::text_centered(ui, workspace_rect.shrink2(egui::vec2(8.0, 0.0)),
-                    &workspace_label, text_color, 11.0, false);
+                let mut label_rect = workspace_rect.shrink2(egui::vec2(8.0, 0.0));
+                if show_icon {
+                    let center = if workspace_label.is_empty() { workspace_rect.center() }
+                        else { egui::pos2(workspace_rect.left() + 14.0, workspace_rect.center().y) };
+                    ui_style::workspace_icon(p, cfg.workspace_icons[workspace], center, text_color);
+                    label_rect.min.x += 24.0;
+                }
+                if !workspace_label.is_empty() {
+                    ui_style::text_centered(ui, label_rect, &workspace_label, text_color, 11.0, false);
+                }
                 geometry.workspace_clicked = response.clicked();
                 geometry.workspace = workspace_rect;
                 response.on_hover_text(format!("{} · {} · click for the workspace panel",
@@ -478,6 +488,47 @@ mod tests {
             out.textures_delta.clear();
             assert!(!off.workspace.is_positive(), "a hidden indicator still claims a rect");
             assert_eq!(off.tabs[0].left(), geometry.tabs[0].left(), "hiding the indicator moved the tabs' left edge");
+        }
+    }
+
+    #[test]
+    fn workspace_display_modes_draw_the_chosen_identity_and_preserve_tab_space() {
+        use crate::config::{WorkspaceButtonDisplay as D, WorkspaceButtonPosition as P};
+        for mode in D::ALL {
+            for position in [P::Left, P::Right] {
+                let ctx = egui::Context::default();
+                let mut cfg = crate::config::Config::default();
+                cfg.workspaces_enabled = true;
+                cfg.workspace_button_display = mode;
+                cfg.workspace_button_position = position;
+                cfg.workspace_genres[2] = "Development".into();
+                cfg.workspace_icons[2] = crate::config::WorkspaceIcon::Code;
+                let tabs = [TabFace { id: 0, preview: None, title: "Terminal".into(),
+                    tooltip: String::new(), group: None, entangled: false, attention: 0.0 }];
+                let mut geometry = Geometry::default();
+                for frame in 0..3 {
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 480.0))),
+                        ..Default::default()
+                    }, |ui| geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg));
+                    output.textures_delta.clear();
+                    if frame < 2 { continue; }
+                    let label = mode.text(3, "Development");
+                    let text: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if geometry.workspace.contains(text.pos) => Some(text.galley.text()), _ => None,
+                    }).collect();
+                    if mode == D::Icon { assert!(text.is_empty()); }
+                    else { assert_eq!(text, [label.as_str()]); }
+                    if mode.shows_icon() {
+                        let icon_lines = output.shapes.iter().filter(|shape| matches!(&shape.shape,
+                            egui::Shape::Path(path) if path.points.iter().all(|point| geometry.workspace.contains(*point)))).count();
+                        assert!(icon_lines >= 3, "missing chosen code icon");
+                    }
+                    assert!(!geometry.workspace.intersects(geometry.tabs[0]));
+                    assert!(!geometry.workspace.intersects(geometry.add));
+                    output.textures_delta.clear();
+                }
+            }
         }
     }
 

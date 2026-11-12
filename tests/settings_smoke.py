@@ -141,12 +141,13 @@ try:
     page('Keys')
     shot('keys')
     page('Appearance')
-    # Theme & colors now leads the page, so the fonts sit below the fold of the
-    # color grid.
-    click(left + 291, row_y(552))
+    # Scroll past the workspace editor to reach Fonts.
+    run('xdotool', 'mousemove', '--window', wid, str(width - 80), '620', 'click', '--repeat', '7', '--delay', '100', '5')
+    click(left + 291, row_y(532))
     shot('font-picker')
     # Clicking outside the picker leaves settings open.
     click(left + 75, strip + 34)
+    run('xdotool', 'mousemove', '--window', wid, str(width - 80), '620', 'click', '--repeat', '20', '--delay', '30', '4')
     click(left + 220, row_y(223))
     color_popup = shot('color-picker')
     assert color_popup.getpixel((left - 30, height - 100)) != terminal.getpixel((left - 30, height - 100)), 'color picker missing'

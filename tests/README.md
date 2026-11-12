@@ -151,6 +151,12 @@ creation, the small-window layout, focused tabs beyond the first page, and
 left/right overflow buttons. It leaves screenshots in
 `/tmp/mypixels-workspace-panel-*`. Requires xdotool, ImageMagick and Pillow.
 
+`xvfb-run -a -s "-screen 0 1600x1200x24" python3 tests/workspace_settings_smoke.py`
+checks selecting a workspace, editing its name, choosing a palette color and
+icon, changing the button display and position, saving, live button color, and
+Cancel. It also checks that settings input stays out of the terminal and keeps
+screenshots in `/tmp/mypixels-workspace-settings-*`.
+
 The reviewed fork adds these checks:
 
 - `xvfb-run -a -s "-screen 0 1600x1000x24" python3 tests/menu_window_smoke.py --x11`

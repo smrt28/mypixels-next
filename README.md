@@ -160,8 +160,13 @@ Features
   and keep their terminals running. Visiting an empty workspace opens its
   first terminal. The workspace button, drawn in its own colour, opens the workspace panel.
   Choose **Left** (beside the menu) or **Right** (the default, at the end of the strip)
-  under **Settings → Appearance → Layout → Workspace button position**.
+  under **Settings → Appearance → Workspaces → Button position**.
   This applies immediately and saves as `workspace_button_position: left` or `right`.
+  In the same card, select a workspace to edit its name, color, and icon. Choose
+  **Number**, **Name** (default), **Icon**, or **Icon and name** for the strip button.
+  Names fall back to the workspace number when empty. The display choice applies
+  to every workspace (`workspace_button_display: number|name|icon|icon_and_name`);
+  icons are saved separately as `workspace_icon_1` through `workspace_icon_10`.
   The panel shows cards in their own colours, with tab counts and live terminal previews.
   The selected card expands; click a preview to open that exact tab. Each view
   scrolls to its focused tab, with left/right buttons when more cards are available.
@@ -170,7 +175,7 @@ Features
   strip animates to reveal the focused tab when needed. Search (or Ctrl+F) finds workspaces by
   number, genre or tab title; the filter hides empty slots, and + opens the next
   empty workspace. The panel stays open as you switch. Esc closes search first,
-  then the panel. Optional genres live in Settings → Navigation → Workspaces
+  then the panel. Workspace names retain the existing config keys
   (`workspace_genre_1` through `workspace_genre_10`); they describe a purpose,
   independent of terminal directories. `show_workspaces` is its action, shipped unbound
   so it collides with nothing, and bindable in Settings → Keys. Closing a workspace's last tab
