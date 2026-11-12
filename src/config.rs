@@ -1677,6 +1677,8 @@ mod tests {
             parse_font("Terminus (TTF) 12"),
             ("Terminus (TTF)".to_string(), 12.0)
         );
+        assert_eq!(parse_font("Cascadia Code 11.2"), ("Cascadia Code".to_string(), 11.2));
+        assert_eq!(parse_font("Cascadia Code 11.25"), ("Cascadia Code".to_string(), 11.25));
         // no size -> default 12.
         assert_eq!(parse_font("Monospace"), ("Monospace".to_string(), 12.0));
     }

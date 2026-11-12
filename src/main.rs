@@ -1835,7 +1835,7 @@ impl App {
             &[self.term_family.to_string()],
         ));
         log::info!(
-            "term font: {} {:.0}pt; cell = {:.2} x {:.2}",
+            "term font: {} {}pt; cell = {:.2} x {:.2}",
             self.term_family, self.term_pt, cell_w, cell_h
         );
     }
@@ -1894,7 +1894,7 @@ impl App {
 
         self.sync_all_term_sizes(false);
         log::info!(
-            "tab font: {} {:.0}pt; text {:.0}, strip {:.0}",
+            "tab font: {} {}pt; text {:.0}, strip {:.0}",
             tab_family, tab_pt, self.tab_text_h, self.tab_h
         );
     }

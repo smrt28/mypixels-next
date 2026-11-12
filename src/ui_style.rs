@@ -599,8 +599,24 @@ pub(crate) fn form_grid(id: &str) -> egui::Grid {
 
 /// Compact chrome stays readable while reserving terminal rows.
 pub(crate) fn tab_height(text_height: f32, scale: f32, compact: bool) -> f32 {
-    let (padding, minimum) = if compact { (2.0, 18.0) } else { (8.0, 28.0) };
-    (text_height + padding * scale).max(minimum * scale).round()
+    if compact {
+        // One physical pixel above and below the text, without the normal
+        // strip's minimum height imposing extra space on small tab fonts.
+        text_height.ceil() + 2.0
+    } else {
+        (text_height + 8.0 * scale).max(28.0 * scale).round()
+    }
+}
+
+/// Choose the greater contrast ratio against an opaque background.
+pub(crate) fn black_or_white_text(background: egui::Color32) -> egui::Color32 {
+    let linear = egui::Rgba::from(background);
+    let luminance = 0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b();
+    if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
 }
 
 /// Keep theme text when readable; otherwise choose black or white for the fill.
