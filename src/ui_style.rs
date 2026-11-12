@@ -755,7 +755,9 @@ impl TabStyle {
         let defaults = &*DEFAULTS;
         let resolve = |value, default, fallback| if value == default { fallback } else { rgb_c32(value) };
         let mut base = TermStyle::new(ui, rgb_c32(cfg.col[2]), rgb_c32(cfg.col[1]));
-        if cfg.tablist_background != defaults.tablist_background {
+        // A theme can explicitly choose the legacy default gray. Once a
+        // palette is active, that color must not be mistaken for "unset".
+        if cfg.palette.is_some() || cfg.tablist_background != defaults.tablist_background {
             base.bg = rgb_c32(cfg.tablist_background);
             base.card = base.bg.lerp_to_gamma(base.fg, 0.025);
             base.border = base.bg.lerp_to_gamma(base.fg, 0.16);
@@ -870,6 +872,14 @@ mod motion_tests {
         });
         full.textures_delta.clear();
         style.unwrap()
+    }
+
+    #[test]
+    fn themed_tab_strip_honors_the_legacy_default_gray() {
+        let mut cfg = crate::config::Config::default();
+        crate::theme::apply_name(&mut cfg, "hispixel").unwrap();
+        assert_eq!(cfg.tablist_background, crate::config::Config::default().tablist_background);
+        assert_eq!(workspace_style(&cfg, 0, false).base.bg, egui::Color32::from_rgb(48, 48, 48));
     }
 
     #[test]

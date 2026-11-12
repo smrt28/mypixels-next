@@ -1,6 +1,6 @@
 # Color themes
 
-Select a theme in the settings panel (COLORS → Preset) or write it in the
+Select a theme in Settings → Appearance → Theme or write it in the
 configuration file, then Ctrl+Shift+R to reload:
 
 ```yaml
@@ -12,12 +12,45 @@ The configuration file lives at `$XDG_CONFIG_HOME/mypixels/config.yml`
 keeps working until an XDG file exists; saving always writes the file that was
 loaded.
 
-Presets: `default`, `badwolf`, `dracula`, `catppuccin-mocha`,
+Presets: `default`, `hispixel`, `badwolf`, `dracula`, `catppuccin-mocha`,
 `catppuccin-latte`, `gruvbox-dark`, `nord`, `wal`. Explicit color settings in
 the config override the theme — remove them to accept a preset wholesale.
 Picking a preset in the panel applies it live and records it as `theme:` on
 save, with the resolved colors written alongside so the file stays readable
 without theme support.
+
+## Hispixel
+
+`hispixel` reproduces the supplied legacy hispixel configuration: background
+`#181926`, foreground `#e5e5e5`, tab strip `#303030`, and its six workspace hues
+(magenta, lavender, cyan, yellow, red, green). The original renderer multiplied
+only the ANSI palette channels by 1.4 (`gama = 40`) and clamped at full intensity.
+Those adjusted colors are baked into this theme; leave Terminal brightness at
+**0%** to avoid applying the adjustment twice. Foreground, background, and
+application-supplied truecolor are not brightened.
+
+Select **hispixel** under **Settings → Appearance → Theme** and Save. Existing
+explicit foreground/background/workspace colors in a configuration file can
+override a hand-edited `theme:` line; selecting the preset in Settings applies
+all of its colors together.
+
+For the closest overall appearance, [examples/hispixel.yml](../examples/hispixel.yml)
+also supplies the old 11 pt JetBrains Mono font, an approximate Terminus label
+font, 90% opacity, compact numbered tabs, Q/W/E/R/T/Y workspace names, and window
+dimensions. Preview it without changing your saved settings:
+
+```sh
+MYPIXELS_CONFIG="$PWD/examples/hispixel.yml" target/debug/mypixels --standalone
+```
+
+Fonts, transparency, and geometry are deliberately separate from the color
+preset. The old `transparency = 0.9` is an alpha/opacity value and maps to
+`term_transparency: 0.1`. Its `line_spacing = 0.85` is a height multiplier;
+mypixels uses an adjustment added to 1, so the profile uses `line_spacing: -0.15`.
+The reference VTE rendering and this profile both use 17-pixel terminal rows
+with the installed 11 pt JetBrains Mono font.
+Rounded tab backgrounds and translucent selection highlighting differ from
+the old GTK/VTE renderer; the color theme does not replace those controls.
 
 ## Where theme files live
 

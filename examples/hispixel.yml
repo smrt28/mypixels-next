@@ -1,0 +1,30 @@
+# Optional appearance profile to accompany the hispixel color theme.
+# Copy the desired settings into your own config, or preview independently:
+# MYPIXELS_CONFIG=/absolute/path/to/this/file mypixels --standalone
+theme: hispixel
+wal_palette: ''
+terminal_brightness: 0
+term_font: 'JetBrainsMono Nerd Font 11'
+tablist_font: 'Terminus 10'
+# Hispixel's cell-height scale of 0.85 maps to 1 + line_spacing in mypixels.
+line_spacing: -0.15
+# Legacy transparency=0.9 actually meant 90% opacity.
+term_transparency: 0.1
+default_width: 1400
+default_height: 900
+default_maximize: false
+show_tab_titles: false
+compact_tabs: true
+tablist_top: true
+tablist_hide: false
+hide_single_tab: false
+multiline_tabs: false
+workspaces_enabled: true
+workspace_button_position: left
+workspace_button_display: name
+workspace_genre_1: Q
+workspace_genre_2: W
+workspace_genre_3: E
+workspace_genre_4: R
+workspace_genre_5: T
+workspace_genre_6: Y

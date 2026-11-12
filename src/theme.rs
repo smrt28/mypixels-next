@@ -14,6 +14,7 @@ use serde_yaml::Value;
 
 pub const NAMES: &[&str] = &[
     "default",
+    "hispixel",
     "badwolf",
     "dracula",
     "catppuccin-mocha",
@@ -293,6 +294,7 @@ fn is_ui_color(name: &str) -> bool {
 
 fn builtin(name: &str) -> Option<&'static str> {
     match name {
+        "hispixel" => Some(include_str!("../themes/hispixel.yml")),
         "badwolf" => Some(include_str!("../themes/badwolf.yml")),
         "dracula" => Some(include_str!("../themes/dracula.yml")),
         "catppuccin-mocha" | "mocha" => Some(include_str!("../themes/catppuccin-mocha.yml")),

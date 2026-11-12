@@ -1,0 +1,42 @@
+# Matches the legacy hispixel configuration, including its palette-only
+# gama=40 adjustment: min(255, round(channel * 1.4)). The default foreground
+# and background were not gamma-adjusted by hispixel and stay unchanged.
+foreground_color: '#e5e5e5'
+background_color: '#181926'
+cursor_color: '#e5e5e5'
+# Approximate VTE's default inverse selection with the foreground color.
+selection_color: '#e5e5e5'
+accent_color: '#ff44ff'
+tablist_background: '#303030'
+add_button_color: '#ff44ff'
+
+# Legacy z_color_1 hues, cycling after the original six workspaces.
+workspace_color_1: '#ff44ff'
+workspace_color_2: '#aaaaff'
+workspace_color_3: '#44ffff'
+workspace_color_4: '#ffff44'
+workspace_color_5: '#ff4444'
+workspace_color_6: '#44ff44'
+workspace_color_7: '#ff44ff'
+workspace_color_8: '#aaaaff'
+workspace_color_9: '#44ffff'
+workspace_color_10: '#ffff44'
+
+# ANSI slots 0-7, then bright slots 8-15, after gama=40.
+palette:
+  - '#000000'
+  - '#f93030'
+  - '#00e000'
+  - '#ffff00'
+  - '#2a8fff'
+  - '#ee00ee'
+  - '#7bffff'
+  - '#ffffff'
+  - '#6c6c6c'
+  - '#ff3950'
+  - '#46ff46'
+  - '#ffff00'
+  - '#a0bdff'
+  - '#ff76ff'
+  - '#00ffff'
+  - '#ffffff'
