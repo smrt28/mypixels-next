@@ -172,3 +172,23 @@ Check the command's PID and progress, tab order/titles/cwd, screen and scrollbac
 and repeat the detach/attach cycle on both X11 and Wayland. A different name
 should open an independent session. Without `-S`, closing the last window should
 terminate its processes as before.
+
+Automatic selection is also covered by `cargo test --offline persistent::tests`:
+numbered sessions created explicitly and automatically share one namespace,
+concurrent launches reserve a detached session only once and allocate distinct
+numbers, interrupted attachments release their reservation, and stale session
+records do not occupy numbers. These tests use isolated temporary registries
+and real file locks/Unix sockets, with no display or desktop sessions involved.
+For a UI check, close all windows of `mypixels -S '#2'`, keep `#1` and `#4`
+attached, then launch `mypixels -A` three times: it should restore `#2`, then
+create `#3` and `#5`. Verify that closing just one of multiple windows keeps
+the session attached, and that `-A -S name` fails before opening a window.
+
+Persistent launches (`-S` and `-A`) should return to the invoking shell after
+the window appears, while the app remains alive. The session unit tests check
+the background readiness handshake, separate Unix session/process group, null
+standard I/O, inherited working directory, startup error propagation, and waiting
+for restored windows without holding the registry lock. The headless CLI test
+also checks real winit initialization failure reaches the launcher and releases
+the session lock. For a desktop check, launch from a terminal, close that invoking
+terminal, and verify the session window and its running commands remain usable.

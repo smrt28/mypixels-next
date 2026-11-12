@@ -27,6 +27,8 @@ pub enum Request {
     NewWindow { cwd: Option<String>, argv: Vec<String> },
     /// Present the window without opening anything.
     Raise,
+    /// Restore persistent windows, then acknowledge the foreground launcher.
+    PersistentRaise { respond: mpsc::Sender<()> },
     /// Hand the last `n` commands' captured output of `window`'s active
     /// tab to the requester (`mypixels last`): reply on `respond` for
     /// stdout, and/or place it on the clipboard when `copy`. The pool

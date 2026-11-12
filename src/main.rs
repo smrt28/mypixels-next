@@ -497,6 +497,8 @@ struct App {
     sem_blocks: std::collections::HashMap<usize, std::collections::VecDeque<CommandBlock>>,
     /// Daemon: tab/rise requests forwarded by other mypixels processes.
     session_rx: std::sync::mpsc::Receiver<session::Request>,
+    /// Foreground attach clients waiting for restored windows' first frames.
+    attach_ready: Vec<(std::collections::HashSet<WindowId>, std::sync::mpsc::Sender<()>)>,
     mcp_rx: std::sync::mpsc::Receiver<mcp::Query>,
     /// The egui window picker's answer, applied next frame by the drain
     /// (which has the event loop; the draw path does not). usize::MAX =
@@ -822,6 +824,7 @@ impl App {
             kitty: Default::default(),
             sem_blocks: Default::default(),
             session_rx,
+            attach_ready: Vec::new(),
             mcp_rx,
             pending_move: None,
             pending_action: None,
@@ -1151,6 +1154,8 @@ impl App {
         // a feature. The last window ending the session takes them with it.
         if self.wins.is_empty() {
             event_loop.exit();
+        } else {
+            persistent::set_attached(self.wins.iter().any(|w| w.window.is_some()), false);
         }
     }
 
@@ -1285,8 +1290,20 @@ impl App {
                     self.cur = self.wins.len() - 1;
                     opened = true;
                 }
-                session::Request::Raise => {
+                req @ (session::Request::Raise | session::Request::PersistentRaise { .. }) => {
+                    let detached: Vec<_> = self.wins.iter().enumerate()
+                        .filter_map(|(i, w)| w.window.is_none().then_some(i)).collect();
                     self.reattach_windows(event_loop);
+                    persistent::set_attached(true, true);
+                    if let session::Request::PersistentRaise { respond } = req {
+                        let windows: std::collections::HashSet<_> = detached.into_iter()
+                            .filter_map(|i| self.wins[i].window.as_ref().map(|w| w.id())).collect();
+                        if windows.is_empty() {
+                            let _ = respond.send(());
+                        } else {
+                            self.attach_ready.push((windows, respond));
+                        }
+                    }
                     opened = true;
                 },
                 session::Request::LastOutput { window, n, copy, respond } => {
@@ -5323,6 +5340,7 @@ impl App {
             }
             self.window_slot.lock().unwrap().push(Arc::clone(&window));
             log::info!("session: window {} up", self.wins.len());
+            persistent::set_attached(true, false);
             self.sync_term_size();
             if with_tab {
                 // Every ordinary window is born with one tab: the shell the
@@ -6286,6 +6304,7 @@ impl ApplicationHandler for App {
                     self.switcher_open.store(false, Ordering::SeqCst);
                     self.switcher_show_req.store(false, Ordering::SeqCst);
                     *self.switcher_alt_at.lock().unwrap() = None;
+                    persistent::set_attached(self.wins.iter().any(|w| w.window.is_some()), false);
                 } else {
                     self.close_window(self.cur, event_loop);
                 }
@@ -6399,6 +6418,14 @@ impl ApplicationHandler for App {
                 // to be remembered by every caller -- and silently swallow
                 // frames for the ones that didn't (e.g. the cursor blink).
                 self.draw(&window);
+                self.attach_ready.retain_mut(|(windows, respond)| {
+                    windows.remove(&window.id());
+                    if windows.is_empty() {
+                        let _ = respond.send(());
+                        false
+                    } else { true }
+                });
+                persistent::startup_ready();
             },
             WindowEvent::CursorMoved { position, .. } => {
                 let px = position.x as f32;
@@ -7020,6 +7047,10 @@ pub fn build_stamp() -> String {
 }
 
 fn main() {
+    if let Err(e) = persistent::initialize_background() {
+        eprintln!("mypixels: {e}");
+        std::process::exit(2);
+    }
     if std::env::args().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
         println!("mypixels, build {}", build_stamp());
         return;
@@ -7034,6 +7065,8 @@ fn main() {
 Options:
   -n, --new-window   open a new window in the running instance (default)
   -t, --new-tab      open a tab in the originating or first session window
+  -l                list persistent sessions and exit
+  -A                attach the lowest detached #N session, or create one
   -S <name>         create or attach a persistent session; window close detaches
   -s, --standalone   run a private instance: never join or host a session
   -h, --help         show this text
@@ -7048,10 +7081,32 @@ prints the instance and requested action to stdout before sending it.
 Use --new-tab to add a tab instead. If no session answers, start a new instance."#);
         return;
     }
+    if flags.iter().any(|a| a == "-l") {
+        match persistent::list() {
+            Ok(sessions) => print!("{sessions}"),
+            Err(e) => {
+                eprintln!("mypixels: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    match persistent::launch_background(&flags) {
+        Ok(true) => return,
+        Ok(false) => (),
+        Err(e) => {
+            eprintln!("mypixels: {e}");
+            std::process::exit(2);
+        }
+    }
     let persistent_listener = match persistent::prepare() {
-        Ok(persistent::Launch::Attached) => return,
+        Ok(persistent::Launch::Attached) => {
+            persistent::startup_ready();
+            return;
+        },
         Ok(persistent::Launch::Start(listener)) => listener,
         Err(e) => {
+            persistent::startup_failed(&e.to_string());
             eprintln!("mypixels: {e}");
             std::process::exit(2);
         }
@@ -7061,7 +7116,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
     // `mypixels last [n] [--copy]`: the running session's memory pool of
     // command output, queried, not launched. Intercepted before the
     // open-a-tab path below, or "last" would spawn a program named last.
-    {
+    if !persistent::enabled() {
         let terms = positional_terms();
         if terms.first().map(|s| s.as_str()) == Some("last") {
             let mut n: u64 = 1;
@@ -7121,6 +7176,7 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
     }
     let mut app = App::new(persistent_listener, event_loop.create_proxy());
     event_loop.run_app(&mut app).expect("run");
+    persistent::startup_failed("session exited before opening a window");
     log::info!("exited");
 }
 

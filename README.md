@@ -34,6 +34,8 @@ Usage
     usage: mypixels [options] [command args...]
       -n, --new-window   open a new window in the running instance (default)
       -t, --new-tab      add a tab to the originating or first session window
+      -l                list persistent sessions and exit
+      -A                attach the lowest detached #N session, or create one
       -S <name>         create or attach a persistent named session
       -s, --standalone   run a private instance: never join or host a session
 
@@ -50,14 +52,38 @@ preserves the live tabs, ordering, titles, working directories, terminal screen,
 and configured scrollback. Tabs closed explicitly retain their normal behavior.
 An optional command (for example `mypixels -S work sh`) runs only when creating
 the session; attaching never opens extra tabs or starts the command again.
-Names are case-sensitive, 1–32 UTF-8 bytes, and scoped to the current user.
+Names are nonempty, case-sensitive, scoped to the current user, and unrestricted
+by the automatic naming scheme (including names such as `#2`).
 Named sessions are independent of the default D-Bus instance and cannot be
 combined with `--standalone`.
 
-The session process keeps running in the background after detaching. It still
-requires its original display server: sessions do not survive logout, display
+`mypixels -l` lists live persistent sessions and their `attached` or `detached`
+status, then exits without opening a window. Numbered sessions sort numerically,
+followed by other names alphabetically. Pending attachments count as attached;
+exited sessions are omitted. With no sessions, it prints `No persistent sessions.`.
+
+`mypixels -A` automatically attaches the detached numbered session with the lowest
+number. Numbered names have the form `#1`, `#2`, etc. (positive decimal integers,
+without leading zeros). If all numbered sessions are attached, it creates the
+lowest unused numbered session. For example, with `#1` and `#4` attached and `#2`
+detached, successive launches attach `#2`, create `#3`, then create `#5`.
+Sessions named explicitly with `-S` participate in exactly the same way.
+A session is detached when all its windows are closed; pending attachments and
+sessions still starting count as attached. Selection and creation are serialized
+across concurrent launches, and stale files from exited sessions do not reserve
+numbers. `-A` and `-S` are mutually exclusive, and neither can be combined with
+`--standalone`. Quote numbered names in the shell: `mypixels -S '#2'`.
+
+With `-S` or `-A`, the command opens or restores the session window and returns
+to the invoking shell. The terminal app runs in a separate background process,
+independent of the shell's standard input/output and controlling terminal. For a
+new session, the launcher waits for the first frame; for an existing session,
+it waits for the restored windows to render. Startup failures are reported to the
+launcher instead of silently succeeding. Closing the window detaches as before.
+
+The background session still requires its original display server: sessions do not survive logout, display
 server shutdown, process termination, or reboot. Reattach from the same desktop.
-Without `-S`, closing windows retains the existing process termination behavior.
+Without `-S` or `-A`, closing windows retains the existing process termination behavior.
 
 `mypixels last [n] [--copy]` prints (or clipboard-copies) the output
 of the last n commands from the running session's memory pool - a
