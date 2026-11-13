@@ -2640,6 +2640,9 @@ impl App {
                     egui.config_changed = ev.apply;
                     egui.save_requested = ev.save;
                     egui.revert_requested = ev.revert;
+                    if ev.copy_revision {
+                        self.copy_text(clipboard::Kind::Clipboard, BUILD_REVISION.to_string());
+                    }
                     if sw_open {
                         egui_ui::switcher_screen(
                             ui,
@@ -7162,6 +7165,8 @@ fn alpha_probe(event_loop: &ActiveEventLoop) {
 /// by --version, because a single-instance session can outlive its own
 /// binary and then argue about what it contains.
 pub const BUILD: &str = env!("MYPIXELS_BUILD");
+/// Full source revision embedded in this binary, including tracked modifications.
+pub const BUILD_REVISION: &str = env!("MYPIXELS_GIT_REVISION");
 
 /// The stamp as a local clock string: build.rs carries epoch seconds
 /// (constant-expression land has no formatter), we render it here.

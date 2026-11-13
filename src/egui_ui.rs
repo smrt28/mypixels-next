@@ -41,6 +41,7 @@ pub struct EguiFrame<'a> {
 
 /// What the configuration UI asked for this frame.
 pub struct ConfigEvents {
+    pub copy_revision: bool,
     pub apply: bool,
     pub save: bool,
     pub revert: bool,
@@ -2425,7 +2426,7 @@ pub fn config_window(
     st: &mut UiState,
     choices: &[crate::fonts::FontChoice],
 ) -> ConfigEvents {
-    let mut ev = ConfigEvents { apply: false, save: false, revert: false };
+    let mut ev = ConfigEvents { copy_revision: false, apply: false, save: false, revert: false };
     if !*open { return ev; }
     let colors = TermStyle::new(ui, rgb_c32(cfg.col[2]), rgb_c32(cfg.col[1]));
     let top = st.panel_top;
@@ -2846,6 +2847,22 @@ fn navigation_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut 
 
 /// Terminal scrollback and visual feedback.
 fn terminal_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut ConfigEvents, colors: &TermStyle) {
+    section(ui, "Build", colors, |ui| {
+        form_grid("terminal-build").show(ui, |ui| {
+            row(ui, "Git revision", |ui| {
+                ui.horizontal(|ui| {
+                    let revision = crate::BUILD_REVISION;
+                    let (hash, suffix) = revision.split_once(' ').unwrap_or((revision, ""));
+                    let short = &hash[..hash.len().min(12)];
+                    ui.monospace(format!("{short}{}", if suffix.is_empty() { "" } else { "*" })).on_hover_text(revision);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    ev.copy_revision |= icon_button(ui, rect, Icon::Copy, "Copy full Git revision", colors).clicked();
+                });
+            });
+        });
+        ui.label(egui::RichText::new("Source revision used to build this app. An asterisk marks local changes to tracked files.")
+            .small().color(colors.muted));
+    });
     section(ui, "Visual feedback", colors, |ui| {
         form_grid("terminal-feedback").show(ui, |ui| {
             checkbox_row(ui, "Visual bell", &mut cfg.visual_bell, ev);
@@ -3644,7 +3661,7 @@ mod regression {
             }, |ui| {
                 let colors = TermStyle::new(ui, egui::Color32::GREEN, egui::Color32::RED);
                 colors.apply_controls(ui);
-                workspace_settings(ui, cfg, st, &mut ConfigEvents { apply: false, save: false, revert: false }, &colors);
+                workspace_settings(ui, cfg, st, &mut ConfigEvents { copy_revision: false, apply: false, save: false, revert: false }, &colors);
             });
             output.textures_delta.clear();
             output.shapes
@@ -3717,7 +3734,7 @@ mod regression {
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
         (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
-        (SettingsPage::Terminal, &["Scrollback lines", "Visual bell", "Cursor highlight"]),
+        (SettingsPage::Terminal, &["Git revision", "Scrollback lines", "Visual bell", "Cursor highlight"]),
         (SettingsPage::Keys, &["Copy", "Search this tab", "Text bigger"]),
     ];
 
