@@ -104,9 +104,9 @@ pub(crate) fn show(
                     else { format!("Workspace {} · {}", workspace + 1, genre) };
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &description));
                 let text_color = ui_style::black_or_white_text(colors.accent);
-                p.rect_filled(workspace_rect, 4.0, colors.accent);
+                p.rect_filled(workspace_rect, 0.0, colors.accent);
                 if workspace_open || response.hovered() || response.has_focus() {
-                    p.rect_stroke(workspace_rect, 4.0, egui::Stroke::new(1.0, text_color), egui::StrokeKind::Inside);
+                    p.rect_stroke(workspace_rect, 0.0, egui::Stroke::new(1.0, text_color), egui::StrokeKind::Inside);
                 }
                 let mut label_rect = workspace_rect.shrink2(egui::vec2(8.0, 0.0));
                 if show_icon {
