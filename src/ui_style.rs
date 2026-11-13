@@ -352,20 +352,37 @@ pub(crate) fn icon_button_faded(
 
 /// Workspace identities use vectors so every choice works with every terminal font.
 pub(crate) fn workspace_icon(p: &egui::Painter, glyph: crate::config::WorkspaceIcon, center: egui::Pos2, color: egui::Color32) {
+    workspace_icon_sized(p, glyph, center, 20.0, color);
+}
+
+/// Fit every workspace glyph, including its stroke, inside a square of `size`.
+pub(crate) fn workspace_icon_sized(p: &egui::Painter, glyph: crate::config::WorkspaceIcon,
+    center: egui::Pos2, size: f32, color: egui::Color32) {
     use crate::config::WorkspaceIcon as W;
-    let stroke = egui::Stroke::new(1.5, color);
-    let pt = |x, y| center + egui::vec2(x, y);
+    let scale = size / 20.0;
+    let stroke = egui::Stroke::new((1.5 * scale).max(1.0), color);
+    let pt = |x, y| center + egui::vec2(x, y) * scale;
     let line = |points: &[(f32, f32)]| p.add(egui::Shape::line(points.iter().map(|&(x, y)| pt(x, y)).collect(), stroke));
     match glyph {
-        W::Layers => icon(p, Icon::Layers, center, color),
-        W::Terminal => icon(p, Icon::Terminal, center, color),
+        W::Layers => {
+            for y in [-5.0, 0.0, 5.0] {
+                line(&[(-8.0, y), (0.0, y + 4.0), (8.0, y)]);
+            }
+            line(&[(-8.0, -5.0), (0.0, -9.0), (8.0, -5.0)]);
+        }
+        W::Terminal => {
+            p.rect_stroke(egui::Rect::from_center_size(center, egui::vec2(18.0, 16.0) * scale),
+                3.0 * scale, stroke, egui::StrokeKind::Inside);
+            line(&[(-5.0, -4.0), (-1.0, 0.0), (-5.0, 4.0)]);
+            line(&[(1.0, 4.0), (5.0, 4.0)]);
+        }
         W::Code => {
             line(&[(-4.0, -5.0), (-9.0, 0.0), (-4.0, 5.0)]);
             line(&[(4.0, -5.0), (9.0, 0.0), (4.0, 5.0)]);
             line(&[(2.0, -8.0), (-2.0, 8.0)]);
         }
         W::Grid => for x in [-8.0, 2.0] { for y in [-8.0, 2.0] {
-            p.rect_stroke(egui::Rect::from_min_size(pt(x, y), egui::vec2(6.0, 6.0)), 1.0, stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(egui::Rect::from_min_size(pt(x, y), egui::vec2(6.0, 6.0) * scale), scale, stroke, egui::StrokeKind::Inside);
         } },
         W::Cube => {
             line(&[(0.0, -9.0), (8.0, -5.0), (8.0, 5.0), (0.0, 9.0), (-8.0, 5.0), (-8.0, -5.0), (0.0, -9.0)]);
@@ -375,10 +392,10 @@ pub(crate) fn workspace_icon(p: &egui::Painter, glyph: crate::config::WorkspaceI
         W::Branch => {
             line(&[(-5.0, -5.0), (-5.0, 5.0)]);
             line(&[(-5.0, 2.0), (5.0, -2.0), (5.0, -5.0)]);
-            for (x, y) in [(-5.0, -7.0), (-5.0, 7.0), (5.0, -7.0)] { p.circle_stroke(pt(x, y), 2.0, stroke); }
+            for (x, y) in [(-5.0, -7.0), (-5.0, 7.0), (5.0, -7.0)] { p.circle_stroke(pt(x, y), 2.0 * scale, stroke); }
         }
         W::Database => {
-            p.add(egui::epaint::EllipseShape::stroke(pt(0.0, -6.0), egui::vec2(8.0, 3.0), stroke));
+            p.add(egui::epaint::EllipseShape::stroke(pt(0.0, -6.0), egui::vec2(8.0, 3.0) * scale, stroke));
             line(&[(-8.0, -6.0), (-8.0, 6.0), (-4.0, 8.0), (4.0, 8.0), (8.0, 6.0), (8.0, -6.0)]);
             line(&[(-8.0, 0.0), (-4.0, 2.0), (4.0, 2.0), (8.0, 0.0)]);
         }
@@ -388,12 +405,12 @@ pub(crate) fn workspace_icon(p: &egui::Painter, glyph: crate::config::WorkspaceI
             line(&[(-5.0, 3.0), (5.0, 3.0)]);
         }
         W::Stack => for y in [-7.0, -1.0, 5.0] {
-            p.rect_stroke(egui::Rect::from_min_size(pt(-8.0, y), egui::vec2(16.0, 4.0)), 1.0, stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(egui::Rect::from_min_size(pt(-8.0, y), egui::vec2(16.0, 4.0) * scale), scale, stroke, egui::StrokeKind::Inside);
         },
         W::Sliders => for (x, y) in [(-7.0, 3.0), (0.0, -3.0), (7.0, 1.0)] {
             line(&[(x, -8.0), (x, y - 2.0)]);
             line(&[(x, y + 2.0), (x, 8.0)]);
-            p.circle_stroke(pt(x, y), 2.0, stroke);
+            p.circle_stroke(pt(x, y), 2.0 * scale, stroke);
         },
     }
 }

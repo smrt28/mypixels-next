@@ -73,10 +73,13 @@ pub(crate) fn show(
             let genre = cfg.workspace_genres.get(workspace).map_or("", |genre| genre.trim());
             let workspace_label = cfg.workspace_button_display.text(workspace + 1, genre);
             let show_icon = cfg.workspace_button_display.shows_icon();
+            let workspace_icon_size = if cfg.compact_tabs { (height - 4.0).clamp(6.0, 18.0) } else { 20.0 };
+            let workspace_font_size = if cfg.compact_tabs { (height - 4.0).clamp(6.0, 11.0) } else { 11.0 };
+            let icon_slot = if cfg.compact_tabs { workspace_icon_size + 6.0 } else { 24.0 };
             let workspace_width = if cfg.workspaces_enabled {
                 // Leave room for tabs and the add button; long genres are ellipsized.
-                (ui_style::text_width(ui, &workspace_label, 11.0) + 22.0
-                    + if show_icon && !workspace_label.is_empty() { 24.0 } else { 0.0 })
+                (ui_style::text_width(ui, &workspace_label, workspace_font_size) + 22.0
+                    + if show_icon && !workspace_label.is_empty() { icon_slot } else { 0.0 })
                     .max(WORKSPACE_WIDTH).min((width * 0.5).clamp(WORKSPACE_WIDTH, 240.0))
             } else { 0.0 };
             let workspace_left = cfg.workspace_button_position == crate::config::WorkspaceButtonPosition::Left;
@@ -98,7 +101,7 @@ pub(crate) fn show(
             if workspace_width > 0.0 {
                 let start = if workspace_left { 0.0 } else { tabs_right };
                 let workspace_rect = egui::Rect::from_min_max(
-                    egui::pos2(start + 3.0, 3.0), egui::pos2(start + workspace_width - 3.0, height - 3.0));
+                    egui::pos2(start + 3.0, settings.top()), egui::pos2(start + workspace_width - 3.0, settings.bottom()));
                 let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
                 let description = if genre.is_empty() { format!("Workspace {}", workspace + 1) }
                     else { format!("Workspace {} · {}", workspace + 1, genre) };
@@ -111,12 +114,12 @@ pub(crate) fn show(
                 let mut label_rect = workspace_rect.shrink2(egui::vec2(8.0, 0.0));
                 if show_icon {
                     let center = if workspace_label.is_empty() { workspace_rect.center() }
-                        else { egui::pos2(workspace_rect.left() + 14.0, workspace_rect.center().y) };
-                    ui_style::workspace_icon(p, cfg.workspace_icons[workspace], center, text_color);
-                    label_rect.min.x += 24.0;
+                        else { egui::pos2(workspace_rect.left() + if cfg.compact_tabs { 4.0 + workspace_icon_size * 0.5 } else { 14.0 }, workspace_rect.center().y) };
+                    ui_style::workspace_icon_sized(p, cfg.workspace_icons[workspace], center, workspace_icon_size, text_color);
+                    label_rect.min.x += icon_slot;
                 }
                 if !workspace_label.is_empty() {
-                    ui_style::text_centered(ui, label_rect, &workspace_label, text_color, 11.0, false);
+                    ui_style::text_centered(ui, label_rect, &workspace_label, text_color, workspace_font_size, false);
                 }
                 geometry.workspace_clicked = response.clicked();
                 geometry.workspace = workspace_rect;
@@ -331,6 +334,59 @@ mod tests {
                 }
                 assert!(geometry.settings_clicked, "gear click did not invoke settings");
                 assert_eq!(button.right(), width - 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_workspace_glyphs_and_labels_fit_beside_settings() {
+        use crate::config::{WorkspaceButtonDisplay as D, WorkspaceIcon};
+        for height in [12.0, 14.0, 18.0, 22.0, 28.0] {
+            for glyph in WorkspaceIcon::ALL {
+                for display in [D::Icon, D::IconAndName] {
+                    let ctx = egui::Context::default();
+                    let mut cfg = crate::config::Config::default();
+                    cfg.compact_tabs = true;
+                    cfg.workspaces_enabled = true;
+                    cfg.workspace_icons[0] = glyph;
+                    cfg.workspace_button_display = display;
+                    cfg.workspace_genres[0] = "Dev".into();
+                    let mut geometry = Geometry::default();
+                    for frame in 0..3 {
+                        let mut output = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 480.0))),
+                            ..Default::default()
+                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg));
+                        output.textures_delta.clear();
+                        if frame < 2 { continue; }
+                        let button = geometry.workspace;
+                        let gear = settings_button_rect(360.0, height);
+                        assert_eq!(button.y_range(), gear.y_range());
+                        assert!(button.right() < gear.left());
+                        let content: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                            let bounds = shape.shape.visual_bounding_rect();
+                            (bounds.is_positive() && bounds.center().x > button.left()
+                                && bounds.center().x < button.right()).then_some(bounds)
+                        }).collect();
+                        assert!(content.len() >= 3, "workspace glyph missing: {glyph:?}");
+                        for bounds in content {
+                            assert!(button.contains_rect(bounds), "{glyph:?} / {display:?} at {height}: {bounds:?} outside {button:?}");
+                        }
+                    }
+                    let pos = geometry.workspace.center();
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 480.0))),
+                        events: vec![egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: true, modifiers: egui::Modifiers::NONE },
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: false, modifiers: egui::Modifiers::NONE }],
+                        ..Default::default()
+                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg));
+                    output.textures_delta.clear();
+                    assert!(geometry.workspace_clicked);
+                    assert!(!geometry.settings_clicked);
+                }
             }
         }
     }
