@@ -2429,11 +2429,16 @@ pub fn config_window(
     if !*open { return ev; }
     let colors = TermStyle::new(ui, rgb_c32(cfg.col[2]), rgb_c32(cfg.col[1]));
     let top = st.panel_top;
-    let height = (ui.max_rect().bottom() - top).max(180.0);
+    // Size and constrain the outer window to the space below the tab strip.
+    // Constraining against the whole screen lets an oversized panel move
+    // upward over the strip. Its anchor and size must use the same bounds.
+    let bounds = ui.ctx().content_rect().with_min_y(top);
+    let height = bounds.height().max(180.0);
     egui::Window::new("Settings")
         .id(egui::Id::unique("config_panel"))
         .title_bar(false)
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, top))
+        .constrain_to(bounds)
+        .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::ZERO)
         .resizable([true, false])
         .default_width(448.0)
         .min_width(412.0)
@@ -2494,8 +2499,11 @@ pub fn config_window(
             ui.add_space(12.0);
             egui::ScrollArea::vertical()
                 .id_salt(("settings_body", st.settings_page as u8))
+                .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
-                .max_height((ui.available_height() - 86.0).max(40.0))
+                // Include the footer's inter-widget spacing so content cannot
+                // grow the fixed-height window and push it over the tab bar.
+                .max_height((ui.available_height() - 90.0).max(0.0))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 12.0;
                     match st.settings_page {
@@ -3781,6 +3789,35 @@ mod regression {
                     }
                 }
                 full.textures_delta.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn settings_surface_stays_below_the_tab_bar_after_resize() {
+        let ctx = Context::default();
+        let mut st = UiState::default();
+        let mut cfg = crate::config::Config::default();
+        for top in [12.0, 19.0, 28.0, 42.0] {
+            st.panel_top = top;
+            for height in [850.0, 540.0, 420.0] {
+                for (page, _) in SETTINGS_PAGES {
+                    st.settings_page = *page;
+                    for frame in 0..3 {
+                        let mut full = ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, height))),
+                            ..Default::default()
+                        }, |ui| { config_window(ui, &mut true, &mut cfg, &mut st, &[]); });
+                        full.textures_delta.clear();
+                        if frame < 2 { continue; }
+                        let surface = full.shapes.iter().filter_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect) if rect.rect.width() >= 400.0 && rect.rect.height() >= 300.0 => Some(rect.rect),
+                            _ => None,
+                        }).next().expect("settings surface missing");
+                        assert!(surface.top() >= top, "{page:?}: settings {surface:?} overlaps the {top}px tab bar");
+                        assert!(surface.bottom() <= height, "settings extends below the window: {surface:?}");
+                    }
+                }
             }
         }
     }
