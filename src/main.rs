@@ -2603,27 +2603,14 @@ impl App {
                     if show_strip {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
                             &tab_faces, self.wins[self.cur].active,
-                            egui.ui_state.menu_open && egui.ui_state.menu_app, self.wins[self.cur].workspace,
+                            egui.ui_state.panel_is(egui_ui::RightPanel::Settings), self.wins[self.cur].workspace,
                             egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces), &self.config);
-                        if strip_geometry.menu_clicked {
+                        if strip_geometry.settings_clicked {
                             let st = &mut egui.ui_state;
-                            if st.menu_open && st.menu_app {
-                                st.menu_open = false;
-                                egui_ui::release_focus(&ctx);
-                            } else {
-                                st.menu_items = vec![
-                                    ("New window".into(), "new_window".into(), true),
-                                    ("Settings…".into(), "show_config".into(), true),
-                                    ("Keyboard shortcuts".into(), "show_shortcuts".into(), true),
-                                    ("About mypixels".into(), "show_about".into(), true),
-                                ];
-                                st.menu_seps = vec![1, 2];
-                                st.menu_pos = [3.0, self.tab_h / ctx.pixels_per_point()];
-                                st.menu_app = true;
-                                st.menu_open = true;
-                                st.menu_out = None;
-                                st.menu_age = 0;
-                            }
+                            st.menu_open = false;
+                            st.workspace_edit = self.wins[self.cur].workspace;
+                            st.toggle_panel(egui_ui::RightPanel::Settings);
+                            egui_ui::release_focus(&ctx);
                             ctx.request_repaint();
                         }
                     }

@@ -2,12 +2,14 @@
 //! native drag-to-reorder and cross-window drops keep using physical positions.
 use crate::ui_style::{self, Icon};
 
-const MENU_WIDTH: f32 = 42.0;
+const SETTINGS_WIDTH: f32 = 32.0;
 /// Minimum width of the workspace indicator at either end of the tab strip.
 const WORKSPACE_WIDTH: f32 = 32.0;
 
-pub(crate) fn menu_button_rect(height: f32) -> egui::Rect {
-    egui::Rect::from_min_max(egui::pos2(3.0, 3.0), egui::pos2(MENU_WIDTH - 3.0, height - 3.0))
+fn settings_button_rect(width: f32, height: f32) -> egui::Rect {
+    let inset = if height < 24.0 { 1.0 } else { 3.0 };
+    egui::Rect::from_min_max(egui::pos2(width - SETTINGS_WIDTH + 3.0, inset),
+        egui::pos2(width - 3.0, height - inset))
 }
 
 pub(crate) struct TabFace {
@@ -21,7 +23,7 @@ pub(crate) struct TabFace {
 }
 
 pub(crate) struct Geometry {
-    pub menu_clicked: bool,
+    pub settings_clicked: bool,
     pub workspace_clicked: bool,
     /// Where the indicator is, for anything that needs to point at it.
     pub workspace: egui::Rect,
@@ -32,7 +34,7 @@ pub(crate) struct Geometry {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Self { menu_clicked: false, workspace_clicked: false, workspace: egui::Rect::NOTHING,
+        Self { settings_clicked: false, workspace_clicked: false, workspace: egui::Rect::NOTHING,
             tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
     }
 }
@@ -43,7 +45,7 @@ pub(crate) fn show(
     font: egui::FontId,
     tabs: &[TabFace],
     active: usize,
-    menu_open: bool,
+    settings_open: bool,
     workspace: usize,
     workspace_open: bool,
     cfg: &crate::config::Config,
@@ -78,25 +80,23 @@ pub(crate) fn show(
                     .max(WORKSPACE_WIDTH).min((width * 0.5).clamp(WORKSPACE_WIDTH, 240.0))
             } else { 0.0 };
             let workspace_left = cfg.workspace_button_position == crate::config::WorkspaceButtonPosition::Left;
-            let tabs_left = MENU_WIDTH + if workspace_left { workspace_width } else { 0.0 };
-            let tabs_right = width - if workspace_left { 0.0 } else { workspace_width };
-            let menu = menu_button_rect(height);
-            let response = ui.interact(menu, egui::Id::unique("app_menu_button"), egui::Sense::click());
-            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "mypixels menu"));
-            if menu_open || response.hovered() {
-                colors.surface(p, menu, 4.0, menu_open, response.hovered());
+            let settings_left = width - SETTINGS_WIDTH;
+            let tabs_left = if workspace_left { workspace_width } else { 0.0 };
+            let tabs_right = settings_left - if workspace_left { 0.0 } else { workspace_width };
+            let settings = settings_button_rect(width, height);
+            let response = ui.interact(settings, egui::Id::unique("settings_button"), egui::Sense::click());
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+            let hot = response.hovered() || response.has_focus();
+            if settings_open || hot {
+                colors.surface(p, settings, 4.0, settings_open, hot);
             }
-            let color = if menu_open || response.hovered() { colors.accent } else { colors.muted };
-            ui_style::icon(p, Icon::Terminal, egui::pos2(15.0, height * 0.5), color);
-            let center = egui::pos2(30.0, height * 0.5);
-            p.add(egui::Shape::line(vec![center + egui::vec2(-3.0, -1.5), center + egui::vec2(0.0, 1.5),
-                center + egui::vec2(3.0, -1.5)], egui::Stroke::new(1.0, color)));
-            geometry.menu_clicked = response.clicked();
-            response.on_hover_text("mypixels menu").on_hover_cursor(egui::CursorIcon::PointingHand);
-            // Separate the menu from the next strip control.
-            p.vline(MENU_WIDTH - 1.0, 0.0..=height, egui::Stroke::new(1.0, colors.border));
+            let color = if settings_open || hot { colors.accent } else { colors.muted };
+            ui_style::settings_icon(p, settings.center(), (height - 4.0).clamp(6.0, 18.0), color);
+            geometry.settings_clicked = response.clicked();
+            response.on_hover_text("Settings").on_hover_cursor(egui::CursorIcon::PointingHand);
+            p.vline(settings_left, 0.0..=height, egui::Stroke::new(1.0, colors.border));
             if workspace_width > 0.0 {
-                let start = if workspace_left { MENU_WIDTH } else { tabs_right };
+                let start = if workspace_left { 0.0 } else { tabs_right };
                 let workspace_rect = egui::Rect::from_min_max(
                     egui::pos2(start + 3.0, 3.0), egui::pos2(start + workspace_width - 3.0, height - 3.0));
                 let response = ui.interact(workspace_rect, egui::Id::unique("workspace_button"), egui::Sense::click());
@@ -295,6 +295,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_stays_at_the_right_and_fits_small_compact_tabs() {
+        for height in [12.0, 14.0, 18.0, 28.0, 42.0] {
+            for width in [360.0, 1280.0] {
+                let ctx = egui::Context::default();
+                let mut cfg = crate::config::Config::default();
+                cfg.compact_tabs = height < 28.0;
+                let tabs = [TabFace { id: 0, preview: None, title: "Terminal".into(),
+                    tooltip: String::new(), group: None, entangled: false, attention: 0.0 }];
+                let button = settings_button_rect(width, height);
+                let mut geometry = Geometry::default();
+                for frame in 0..4 {
+                    let pos = button.center();
+                    let events = if frame == 3 {
+                        vec![egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: true, modifiers: egui::Modifiers::NONE },
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: false, modifiers: egui::Modifiers::NONE }]
+                    } else { vec![] };
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                        events, ..Default::default()
+                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &tabs, 0, false, 0, false, &cfg));
+                    output.textures_delta.clear();
+                    if frame == 0 { continue; }
+                    assert!(!geometry.workspace.intersects(button));
+                    assert!(!geometry.add.intersects(button));
+                    assert!(geometry.tabs.iter().all(|tab| !tab.intersects(button)));
+                    // The gear's outer path and center hole both fit in the hit area.
+                    let gear: Vec<_> = output.shapes.iter().filter(|shape| matches!(&shape.shape,
+                        egui::Shape::Path(path) if path.closed && path.points.len() == 32)).collect();
+                    assert_eq!(gear.len(), 1);
+                    assert!(button.contains_rect(gear[0].shape.visual_bounding_rect()));
+                }
+                assert!(geometry.settings_clicked, "gear click did not invoke settings");
+                assert_eq!(button.right(), width - 3.0);
+            }
+        }
+    }
+
+    #[test]
     fn workspace_button_can_move_live_without_hiding_tabs_or_stealing_their_hits() {
         use crate::config::WorkspaceButtonPosition::{Left, Right};
         for width in [360.0, 1280.0] {
@@ -328,10 +369,10 @@ mod tests {
                         assert!(geometry.add.right() <= width);
                         assert!(!button.intersects(selected) && !button.intersects(geometry.add));
                         if position == Left {
-                            assert_eq!(button.left(), MENU_WIDTH + 3.0);
+                            assert_eq!(button.left(), 3.0);
                             assert!(selected.left() >= button.right());
                         } else {
-                            assert_eq!(button.right(), width - 3.0);
+                            assert_eq!(button.right(), width - SETTINGS_WIDTH - 3.0);
                             assert!(geometry.add.right() <= button.left());
                         }
                         let pos = button.center();
@@ -345,7 +386,7 @@ mod tests {
                         }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg));
                         full.textures_delta.clear();
                         assert!(geometry.workspace_clicked, "workspace button lost its hit target after moving");
-                        assert!(!geometry.menu_clicked);
+                        assert!(!geometry.settings_clicked);
                     }
                 }
             }
@@ -470,9 +511,9 @@ mod tests {
             full.textures_delta.clear();
             let mark = geometry.workspace;
             assert!(mark.is_positive(), "the indicator has no hit area");
-            assert_eq!(mark.right(), width - 3.0, "the indicator is not at the right edge");
-            assert_eq!(mark.left(), width - WORKSPACE_WIDTH + 3.0);
-            assert!(geometry.tabs[0].left() >= MENU_WIDTH, "the first tab overlaps the menu");
+            assert_eq!(mark.right(), width - SETTINGS_WIDTH - 3.0, "the indicator is not at the right edge");
+            assert_eq!(mark.left(), width - SETTINGS_WIDTH - WORKSPACE_WIDTH + 3.0);
+            assert!(geometry.tabs[0].left() >= 0.0, "the first tab extends beyond the strip");
             assert!(geometry.tabs.iter().all(|tab| tab.right() <= mark.left()), "tabs overlap the indicator");
             assert!(geometry.add.right() <= mark.left(), "the add button overlaps the indicator");
 
@@ -568,7 +609,7 @@ mod tests {
                                 "workspace background does not match its color");
                         }
                     }
-                    assert_eq!(geometry.workspace.right(), width - 3.0);
+                    assert_eq!(geometry.workspace.right(), width - SETTINGS_WIDTH - 3.0);
                     assert!(geometry.workspace.width() <= width * 0.5);
                     assert!(geometry.add.right() <= geometry.workspace.left());
                     assert!(geometry.tabs[0].right() <= geometry.workspace.left());

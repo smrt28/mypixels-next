@@ -430,10 +430,7 @@ pub fn ctx_menu(ui: &egui::Ui, st: &mut UiState, cfg: &crate::config::Config) {
         && ctx.input(|i| {
             i.key_pressed(egui::Key::Escape)
                 || (st.menu_age >= 2 && i.pointer.any_pressed()
-                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(4.0).contains(p)
-                        // The anchor toggles on release; closing on press
-                        // would make that release reopen the application menu.
-                        && !(st.menu_app && crate::tab_bar::menu_button_rect(st.panel_top).contains(p))))
+                    && i.pointer.interact_pos().is_some_and(|p| !area.expand(4.0).contains(p)))
         })
     {
         out = Some(None);
@@ -2713,7 +2710,7 @@ fn workspace_settings(ui: &mut egui::Ui, cfg: &mut crate::config::Config, st: &m
                     .popup_style((**ui.style()).clone().into()).selected_text(cfg.workspace_button_position.label())
                     .show_ui(ui, |ui| { for position in [WorkspaceButtonPosition::Left, WorkspaceButtonPosition::Right] {
                         ev.apply |= ui.selectable_value(&mut cfg.workspace_button_position, position, position.label()).changed();
-                    }}).response.on_hover_text("Left: next to the menu. Right: at the end of the tab strip.");
+                    }}).response.on_hover_text("Left: at the start of the tab strip. Right: next to settings.");
             });
         });
         ui.label(egui::RichText::new("Button display and position apply to all workspaces.").small().color(colors.muted));

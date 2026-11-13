@@ -398,6 +398,20 @@ pub(crate) fn workspace_icon(p: &egui::Painter, glyph: crate::config::WorkspaceI
     }
 }
 
+/// A toothed gear that stays inside the available tab-strip height.
+pub(crate) fn settings_icon(p: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let scale = size / 18.0;
+    let stroke = egui::Stroke::new((1.4 * scale).max(1.0), color);
+    let points = (0..8).flat_map(|tooth| {
+        [(0.0, 6.0), (0.2, 8.0), (0.6, 8.0), (0.8, 6.0)].map(|(offset, radius)| {
+            let angle = (tooth as f32 + offset) * std::f32::consts::TAU / 8.0;
+            center + egui::vec2(angle.cos(), angle.sin()) * radius * scale
+        })
+    }).collect();
+    p.add(egui::Shape::closed_line(points, stroke));
+    p.circle_stroke(center, 2.5 * scale, stroke);
+}
+
 /// Small vector icons avoid missing-glyph boxes in the bundled egui font.
 pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.4, color);
@@ -426,15 +440,7 @@ pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egu
             line(&[(-5.0, -4.0), (-1.0, 0.0), (-5.0, 4.0)]);
             line(&[(1.0, 4.0), (5.0, 4.0)]);
         }
-        Icon::Settings => {
-            p.circle_stroke(center, 5.5, stroke);
-            p.circle_stroke(center, 2.0, stroke);
-            for i in 0..8 {
-                let angle = i as f32 * std::f32::consts::TAU / 8.0;
-                let d = egui::vec2(angle.cos(), angle.sin());
-                p.line_segment([center + d * 5.5, center + d * 8.5], stroke);
-            }
-        }
+        Icon::Settings => settings_icon(p, center, 18.0, color),
         Icon::Dismiss => {
             line(&[(-5.0, -5.0), (5.0, 5.0)]);
             line(&[(-5.0, 5.0), (5.0, -5.0)]);

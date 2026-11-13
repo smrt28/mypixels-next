@@ -1,4 +1,4 @@
-"""Compact egui tab strip: application menu, tabs, overflow and detach.
+"""Compact egui tab strip: settings gear, tabs, overflow and detach.
 
 Run: xvfb-run -a python3 tests/tab_bar_smoke.py
 """
@@ -29,6 +29,9 @@ foreground_color: '#dce4e7'
 accent_color: '#00dbe6'
 workspace_color_1: '#00dbe6'
 ''')
+if os.environ.get('MYPIXELS_COMPACT_TABS') == '1':
+    with config.open('a') as out:
+        out.write('compact_tabs: true\n')
 fixture = work / 'fixture.py'
 fixture.write_text(r'''
 import os, sys, tty
@@ -117,42 +120,23 @@ try:
     time.sleep(.3)
     strip = float(re.search(r'strip = ([0-9.]+)px', log_path.read_text()).group(1))
     assert strip <= 32, f'tab strip grew too tall: {strip}'
-    terminal = shot('before-menu')
-    menu_probe = (300, round(strip + 22))
-    click(20, strip / 2)
-    assert shot('application-menu').getpixel(menu_probe) != terminal.getpixel(menu_probe), 'application menu missing'
+    terminal = shot('before-settings')
+    gear_x = terminal.width - 16
+    probe = (terminal.width - 8, terminal.height // 2)
+    click(gear_x, strip / 2)
+    assert shot('gear-settings').getpixel(probe) != terminal.getpixel(probe), 'gear did not open settings'
     key('x')
     key('Escape')
-    assert (work / 'input-0').read_bytes() == b'', 'menu keys leaked into the terminal'
-    assert shot('menu-escaped').getpixel(menu_probe) == terminal.getpixel(menu_probe), 'Escape did not dismiss the menu'
-    click(20, strip / 2)
-    click(20, strip / 2)
-    assert shot('menu-toggled').getpixel(menu_probe) == terminal.getpixel(menu_probe), 'second click did not close the menu'
-    # Moving and right-clicking within the dismissed popup's former bounds
-    # must reach the terminal controller even before egui drops its old layer.
+    assert (work / 'input-0').read_bytes() == b'', 'settings keys leaked into the terminal'
+    assert shot('settings-escaped').getpixel(probe) == terminal.getpixel(probe), 'Escape did not close settings'
+    click(gear_x, strip / 2)
+    click(gear_x, strip / 2)
+    assert shot('settings-toggled').getpixel(probe) == terminal.getpixel(probe), 'second gear click did not close settings'
     click(100, 80, 3)
     probe = (120, 100)
-    assert shot('context-after-app-menu').getpixel(probe) != terminal.getpixel(probe), 'stale app menu swallowed right-click'
+    assert shot('context-after-settings').getpixel(probe) != terminal.getpixel(probe), 'settings swallowed right-click'
     key('Escape')
     assert (work / 'input-0').read_bytes() == b'', 'context-menu Escape leaked into the terminal'
-    click(20, strip / 2)
-    click(350, 200)
-    assert shot('menu-click-away').getpixel(menu_probe) == terminal.getpixel(menu_probe), 'click-away did not dismiss the menu'
-    for offset, name in [(114, 'keyboard-shortcuts'), (148, 'about-mypixels')]:
-        click(20, strip / 2)
-        click(80, strip + offset)
-        info = shot(name)
-        center = (info.width // 2, info.height // 2)
-        assert info.getpixel(center) != terminal.getpixel(center), f'{name} did not open'
-        key('x')
-        key('Escape')
-        assert (work / 'input-0').read_bytes() == b'', f'{name} keys leaked into the terminal'
-        assert shot(name + '-closed').getpixel(center) == terminal.getpixel(center), f'{name} did not close'
-    click(20, strip / 2)
-    click(80, strip + 68)
-    probe = (terminal.width - 8, terminal.height // 2)
-    assert shot('menu-settings').getpixel(probe) != terminal.getpixel(probe), 'menu did not open settings'
-    key('alt+shift+c')
     left, right, top, bottom = selected()
     click(right + 18, strip / 2)  # Add immediately follows the last tab.
     wait(lambda: len(spy()[0]) == 2, 'add button did not create a tab')
@@ -214,10 +198,9 @@ try:
     # An unmanaged X server does not raise a focused window. The detached
     # window can otherwise intercept clicks intended for the original one.
     run('xdotool', 'windowraise', wid)
-    click(20, strip / 2)
-    click(80, strip + 22)
-    wait(lambda: len(windows()) == 3, 'menu did not create a new window')
-    print('PASS: application menu, settings, shortcuts/about, dismissal and keyboard ownership; compact tabs, add/select/close/cancel, reorder, 20-tab overflow, middle close, native detach, new window; artifacts:', work, flush=True)
+    key('ctrl+shift+n')
+    wait(lambda: len(windows()) == 3, 'shortcut did not create a new window')
+    print('PASS: settings gear, dismissal and keyboard ownership; compact tabs, add/select/close/cancel, reorder, 20-tab overflow, middle close, native detach, new window; artifacts:', work, flush=True)
 finally:
     app.terminate()
     try: app.wait(timeout=3)

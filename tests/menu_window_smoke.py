@@ -1,4 +1,4 @@
-"""Open real application-menu windows; verify rendering, input, and workspaces.
+"""Open real windows with the keyboard shortcut; verify rendering, input, and workspaces.
 
 Run after cargo build on an isolated graphical display:
 python3 tests/menu_window_smoke.py [--x11]
@@ -103,34 +103,30 @@ def shot(name):
     wait(lambda: path.exists() and path.stat().st_size > 0, 'screenshot missing')
 
 
-def menu_new_window(source, total, tab_id):
+def new_window(source, total, tab_id):
     if '--x11' in sys.argv:
         # Xvfb has no window manager to focus newly mapped windows. Focus only
-        # the test's own source window before injecting its menu gesture.
+        # the test's own source window before injecting its shortcut.
         windows = sp.run(['xdotool', 'search', '--onlyvisible', '--pid', str(app.pid)],
                          env=env, check=True, stdout=sp.PIPE).stdout.splitlines()
         window = sorted(windows, key=int)[source - 1].decode()
         sp.run(['xdotool', 'windowfocus', '--sync', window], env=env, check=True)
         time.sleep(.2)
-    send(f'click:20,{strip / 2}', source)
-    wait(lambda: spy(source)[4], 'application menu did not open')
-    shot(f'menu-from-window-{source}-creating-{total}')
-    send(f'click:80,{strip + 22}', source)
-    wait(lambda: (work / f'input-{tab_id}').exists(), 'menu did not create a terminal')
+    send('ctrl+shift+n', source)
+    wait(lambda: (work / f'input-{tab_id}').exists(), 'shortcut did not create a terminal')
     expect(total, [tab_id], 0, 0, total)
     shot(f'new-window-{total}-tab-{tab_id}')
 
 
 try:
     wait(lambda: (work / 'input-0').exists(), 'initial terminal missing')
-    strip = float(re.search(r'strip = ([0-9.]+)px', log_path.read_text())[1])
-    menu_new_window(1, 2, 1)
+    new_window(1, 2, 1)
     send('text:new-window-input', 2)
     wait(lambda: (work / 'input-1').read_bytes() == b'new-window-input', 'new window input malfunctioned')
     send('text:original-window-input', 1)
     wait(lambda: (work / 'input-0').read_bytes() == b'original-window-input', 'original window input changed')
-    # Select the menu in the older window while another window is active.
-    menu_new_window(1, 3, 2)
+    # Open from the older window while another window is active.
+    new_window(1, 3, 2)
     send('alt+5', 3)
     wait(lambda: (work / 'input-6').exists(), 'new window numbered tabs failed')
     expect(3, [2, 3, 4, 5, 6], 4, 0, 3)
@@ -146,12 +142,12 @@ try:
     send('ctrl+alt+x', 1)
     expect(1, [1], 0, 0, 2)
     expect(2, [2, 3, 4, 5, 6], 4, 0, 2)
-    menu_new_window(1, 3, 8)
+    new_window(1, 3, 8)
     send('text:after-close-input', 3)
     wait(lambda: (work / 'input-8').read_bytes() == b'after-close-input', 'window after closure malfunctioned')
     shot('final-window-input')
     assert 'panicked at' not in log_path.read_text()
-    print('Menu-created window checks passed. Artifacts:', work)
+    print('Shortcut-created window checks passed. Artifacts:', work)
 finally:
     app.terminate()
     try:
