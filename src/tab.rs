@@ -628,19 +628,19 @@ mod tests {
     }
 
     #[test]
-    fn block_copy_preserves_blank_cells_rows_and_tab_layout() {
+    fn block_copy_trims_right_edge_and_preserves_rows_and_tab_layout() {
         let mut term = terminal();
         for (start, end) in [
             (point(0, 3), point(2, 8)), (point(2, 8), point(0, 3)),
             (point(0, 8), point(2, 3)), (point(2, 3), point(0, 8)),
         ] {
             select(&mut term, SelectionType::Block, start, end, Side::Left);
-            assert_eq!(term.selection_to_string().as_deref(), Some("ha bet\nrt    \nrd row"));
+            assert_eq!(term.selection_to_string().as_deref(), Some("ha bet\nrt\nrd row"));
         }
         let mut parser: Processor = Processor::default();
         parser.advance(&mut term, b"\x1b[2J\x1b[HA\tB");
         select(&mut term, SelectionType::Block, point(0, 0), point(1, 15), Side::Right);
-        assert_eq!(term.selection_to_string().as_deref(), Some("A       B       \n                "));
+        assert_eq!(term.selection_to_string().as_deref(), Some("A       B\n"));
     }
 
     #[test]
@@ -649,12 +649,46 @@ mod tests {
         let mut parser: Processor = Processor::default();
         parser.advance(&mut term, b"\x1b[2J\x1b[HabcdefghijklmnopQRST");
         select(&mut term, SelectionType::Block, point(0, 0), point(1, 15), Side::Left);
-        assert_eq!(term.selection_to_string().as_deref(), Some("abcdefghijklmnop\nQRST            "));
+        assert_eq!(term.selection_to_string().as_deref(), Some("abcdefghijklmnop\nQRST"));
         select(&mut term, SelectionType::Block, point(0, 1), point(1, 1), Side::Left);
         assert_eq!(term.selection_to_string().as_deref(), Some("b\nR"));
         parser.advance(&mut term, "\x1b[2J\x1b[H界e\u{301}\r\nč".as_bytes());
         select(&mut term, SelectionType::Block, point(0, 0), point(1, 4), Side::Left);
-        assert_eq!(term.selection_to_string().as_deref(), Some("界e\u{301}  \nč    "));
+        assert_eq!(term.selection_to_string().as_deref(), Some("界e\u{301}\nč"));
+    }
+
+    #[test]
+    fn block_copy_preserves_indentation_empty_rows_and_selection_range() {
+        let mut term = terminal();
+        let mut parser: Processor = Processor::default();
+        parser.advance(&mut term, b"\x1b[2J\x1b[H\r\n    a  b   x\r\n     \r\n      c    y\r\n");
+        for (start, end) in [
+            (point(0, 2), point(4, 9)), (point(4, 9), point(0, 2)),
+            (point(0, 9), point(4, 2)), (point(4, 2), point(0, 9)),
+        ] {
+            select(&mut term, SelectionType::Block, start, end, Side::Left);
+            let before = term.selection.as_ref().unwrap().to_range(&term).unwrap();
+            assert_eq!(term.selection_to_string().as_deref(), Some("\n  a  b\n\n    c\n"));
+            let after = term.selection.as_ref().unwrap().to_range(&term).unwrap();
+            assert_eq!(after.start, before.start);
+            assert_eq!(after.end, before.end);
+            assert_eq!(after.start, point(0, 2));
+            assert_eq!(after.end, point(4, 9));
+        }
+        // A rectangle made entirely of blank cells still has all its rows.
+        select(&mut term, SelectionType::Block, point(4, 2), point(5, 9), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("\n"));
+    }
+
+    #[test]
+    fn linear_and_word_copy_preserve_selected_trailing_spaces() {
+        let mut term = terminal();
+        let mut parser: Processor = Processor::default();
+        parser.advance(&mut term, b"\x1b[2J\x1b[H  a  b   x");
+        select(&mut term, SelectionType::Simple, point(0, 0), point(0, 8), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("  a  b   "));
+        select(&mut term, SelectionType::Semantic, point(0, 6), point(0, 6), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("b "));
     }
 
     #[test]

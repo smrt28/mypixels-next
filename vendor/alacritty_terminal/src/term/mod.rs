@@ -581,11 +581,12 @@ impl<T> Term<T> {
                     if line != start.line {
                         res.push('\n');
                     }
-                    // Keep blank cells and expand tabs so every copied row
-                    // preserves the rectangle's physical width.
-                    res += &self.line_to_string(
+                    // Expand tabs and keep indentation, trimming only spaces
+                    // at the right edge of each copied row.
+                    let text = self.line_to_string(
                         line, start.column..end.column, line == end.line || start.column.0 != 0, true,
                     );
+                    res += text.trim_end_matches(' ');
                 }
             },
             Some(Selection { ty: SelectionType::Lines, .. }) => {
