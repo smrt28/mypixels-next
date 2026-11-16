@@ -307,7 +307,7 @@ impl Selection {
     }
 
     fn range_semantic<T>(term: &Term<T>, mut start: Point, mut end: Point) -> SelectionRange {
-        if start == end {
+        if start == end && term.semantic_escape_chars().contains(term.grid()[start].c) {
             if let Some(matching) = term.bracket_search(start) {
                 if (matching.line == start.line && matching.column < start.column)
                     || (matching.line < start.line)

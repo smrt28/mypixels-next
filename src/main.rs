@@ -936,7 +936,7 @@ impl App {
             Some(c) => c,
             None => (self.program.clone(), self.args.clone()),
         };
-        Tab::new(
+        let tab = Tab::new(
             id,
             &self.wins[self.cur].dims,
             window_size,
@@ -950,7 +950,9 @@ impl App {
             // `mypixels` typed in it joins that window, not window 1. 1-based
             // because 0 in the environment means "standalone, stay out".
             if self._session.is_some() { self.wins[self.cur].session_id } else { 0 },
-        )
+        );
+        tab.term.lock().set_semantic_escape_chars(&self.config.word_delimiters);
+        tab
     }
 
     /// Numbered shortcuts append missing tabs, preserving existing numbering
@@ -1776,6 +1778,9 @@ impl App {
     }
 
     fn apply_config(&mut self, font_changed: bool, spacing_changed: bool) {
+        for tab in self.all_tabs() {
+            tab.term.lock().set_semantic_escape_chars(&self.config.word_delimiters);
+        }
         self.apply_transparency();
         if !self.config.tab_overview_on_alt {
             *self.switcher_alt_at.lock().unwrap() = None;

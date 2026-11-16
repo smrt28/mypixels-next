@@ -979,8 +979,8 @@ impl<T> Term<T> {
         &self.config.semantic_escape_chars
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_semantic_escape_chars(&mut self, semantic_escape_chars: &str) {
+    /// Update word-selection delimiters without resetting other terminal state.
+    pub fn set_semantic_escape_chars(&mut self, semantic_escape_chars: &str) {
         self.config.semantic_escape_chars = semantic_escape_chars.into();
     }
 

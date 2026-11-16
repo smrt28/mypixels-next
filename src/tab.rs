@@ -628,6 +628,46 @@ mod tests {
     }
 
     #[test]
+    fn word_delimiters_control_double_click_and_word_drag() {
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(32, 6), VoidListener);
+        let mut parser: Processor = Processor::default();
+        parser.advance(&mut term, b"/home/user/foo.txt\r\naa[bb]cc zz\r\nfoo::bar");
+        for (delimiters, expected) in [(" \t", "/home/user/foo.txt"), (" /\t", "foo.txt"), (" /.\t", "foo")] {
+            term.set_semantic_escape_chars(delimiters);
+            for side in [Side::Left, Side::Right] {
+                select(&mut term, SelectionType::Semantic, point(0, 12), point(0, 12), side);
+                assert_eq!(term.selection_to_string().as_deref(), Some(expected));
+            }
+        }
+        term.set_semantic_escape_chars(" /\t");
+        for (start, end) in [(point(0, 7), point(0, 12)), (point(0, 12), point(0, 7))] {
+            select(&mut term, SelectionType::Semantic, start, start, Side::Left);
+            extend_selection(term.selection.as_mut().unwrap(), end, Side::Right);
+            assert_eq!(term.selection_to_string().as_deref(), Some("user/foo.txt"));
+        }
+        // Removing brackets from the delimiters makes them ordinary word characters.
+        term.set_semantic_escape_chars(" ");
+        select(&mut term, SelectionType::Semantic, point(1, 2), point(1, 2), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("aa[bb]cc"));
+        // Default delimiter brackets keep the existing bracket-pair shortcut.
+        term.set_semantic_escape_chars(&crate::config::Config::default().word_delimiters);
+        select(&mut term, SelectionType::Semantic, point(1, 2), point(1, 2), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("[bb]"));
+        // Even whitespace and punctuation are word characters when omitted.
+        term.set_semantic_escape_chars("");
+        select(&mut term, SelectionType::Semantic, point(1, 8), point(1, 8), Side::Left);
+        assert_eq!(term.selection_to_string().as_deref(), Some("aa[bb]cc zz"));
+        for ty in [SelectionType::Simple, SelectionType::Block] {
+            select(&mut term, ty, point(2, 0), point(2, 4), Side::Left);
+            let before = term.selection_to_string();
+            term.set_semantic_escape_chars(":");
+            assert_eq!(term.selection_to_string(), before);
+            assert_eq!(before.as_deref(), Some("foo::"));
+            term.set_semantic_escape_chars("");
+        }
+    }
+
+    #[test]
     fn block_copy_trims_right_edge_and_preserves_rows_and_tab_layout() {
         let mut term = terminal();
         for (start, end) in [

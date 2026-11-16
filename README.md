@@ -174,6 +174,15 @@ Features
   the existing cursor ring on Win/Super and other bare modifier presses.
   The YAML settings are `visual_bell: true` and `cursor_highlight: true`.
 
+* `word_delimiters` in the YAML config defines the characters separating words
+  for double-click selection and Shift+double-click dragging. The default is
+  whitespace plus `` ,│`|:"'()[]{}<> ``; `/`, `.`, and `-` remain part of words,
+  so double-clicking inside `/home/user/foo.txt` selects the whole path.
+  For path components instead, use `word_delimiters: " /\t\r\n"`.
+  The string replaces the full delimiter set; `word_delimiters: ""` removes
+  all delimiters. Normal and rectangular selections are unaffected. Changes
+  apply to existing and new tabs after reloading the configuration.
+
 * Font sizes in Settings → Appearance → Fonts accept up to two decimal places,
   such as `11.2` or `11.25` pt. Click the size to type a value; the +/− buttons
   step by one point. Config values also accept decimals, e.g. `term_font: 'Cascadia Code 11.2'`.

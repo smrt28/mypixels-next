@@ -185,6 +185,8 @@ pub struct Config {
     /// Vec<Cell>), so raising this is a real RAM decision; the command
     /// output pool (`history_bytes`) is what keeps deep history cheap.
     pub scrollback_lines: usize,
+    /// Characters separating words for double-click selection and word dragging.
+    pub word_delimiters: String,
     /// Global budget for the command-output pool (all tabs, LRU-evicted
     /// oldest closed block first). 32 MB typical-use is never approached.
     pub history_bytes: usize,
@@ -361,6 +363,7 @@ impl Default for Config {
             line_spacing: 0.0,
             tablist_font: "Liberation Mono 7".to_string(),
             scrollback_lines: 5000,
+            word_delimiters: format!("{}\r\n", alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS),
             history_bytes: 32 * 1024 * 1024,
             history_block_bytes: 8 * 1024 * 1024,
             col: [
@@ -604,6 +607,7 @@ impl Config {
             ("tablist_font".into(), str_(&self.tablist_font)),
             ("term_transparency".into(), self.term_transparency.to_string()),
             ("scrollback_lines".into(), self.scrollback_lines.to_string()),
+            ("word_delimiters".into(), serde_json::to_string(&self.word_delimiters).unwrap()),
             ("history_bytes".into(), self.history_bytes.to_string()),
             ("history_block_bytes".into(), self.history_block_bytes.to_string()),
             ("background_color".into(), rgb(&self.background_color)),
@@ -974,6 +978,11 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                 },
                 "tab_append" => {
                     cfg.tab_append = val.as_str().map(String::from);
+                },
+                "word_delimiters" => {
+                    if let Some(s) = val.as_str() {
+                        cfg.word_delimiters = s.to_owned();
+                    }
                 },
                 "scrollback_lines" => {
                     if let Some(n) = val.as_u64() {
@@ -1399,6 +1408,27 @@ pub fn binding_conflict(bindings: &[(String, Vec<Binding>)], action: &str, b: &B
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn word_delimiters_load_and_save_exactly() {
+        let base = std::path::Path::new(".");
+        let defaults = Config::default();
+        assert!(defaults.word_delimiters.contains(' '));
+        assert!(defaults.word_delimiters.contains('\t'));
+        assert!(!defaults.word_delimiters.contains('/'));
+        assert!(!defaults.word_delimiters.contains('.'));
+        for delimiters in [defaults.word_delimiters.as_str(), "", " /\t\n\r", "'\"\\:[]é"] {
+            let yaml = format!("word_delimiters: {}\n", serde_json::to_string(delimiters).unwrap());
+            let cfg = Config::from_text(&yaml, base).unwrap();
+            assert_eq!(cfg.word_delimiters, delimiters);
+            let saved = replace_top_level_values("# keep\n", &cfg.ui_keys());
+            assert!(saved.starts_with("# keep\n"));
+            assert_eq!(Config::from_text(&saved, base).unwrap().word_delimiters, delimiters);
+        }
+        for yaml in ["", "word_delimiters: 42", "word_delimiters: null", "word_delimiters: []"] {
+            assert_eq!(Config::from_text(yaml, base).unwrap().word_delimiters, defaults.word_delimiters);
+        }
+    }
+
     #[test]
     fn visual_feedback_defaults_and_independent_toggles_survive_save() {
         let base = std::path::Path::new(".");
