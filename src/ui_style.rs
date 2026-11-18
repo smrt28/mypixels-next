@@ -429,6 +429,21 @@ pub(crate) fn settings_icon(p: &egui::Painter, center: egui::Pos2, size: f32, co
     p.circle_stroke(center, 2.5 * scale, stroke);
 }
 
+/// A padlock with an open shackle when selection locking is disabled.
+pub(crate) fn selection_lock_icon(p: &egui::Painter, center: egui::Pos2, size: f32,
+    locked: bool, color: egui::Color32) {
+    let scale = size / 18.0;
+    let stroke = egui::Stroke::new((1.4 * scale).max(1.0), color);
+    let pt = |x, y| center + egui::vec2(x, y) * scale;
+    p.rect_stroke(egui::Rect::from_min_max(pt(-5.5, -1.0), pt(5.5, 7.0)),
+        1.5 * scale, stroke, egui::StrokeKind::Inside);
+    let offset = if locked { 0.0 } else { 3.5 };
+    p.add(egui::Shape::line(vec![pt(-3.5 + offset, -1.0), pt(-3.5 + offset, -5.0),
+        pt(-2.0 + offset, -7.0), pt(2.0 + offset, -7.0), pt(3.5 + offset, -5.0),
+        pt(3.5 + offset, if locked { -1.0 } else { -3.0 })], stroke));
+    p.line_segment([pt(0.0, 2.0), pt(0.0, 4.5)], stroke);
+}
+
 /// Small vector icons avoid missing-glyph boxes in the bundled egui font.
 pub(crate) fn icon(p: &egui::Painter, icon: Icon, center: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.4, color);

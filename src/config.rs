@@ -204,6 +204,8 @@ pub struct Config {
     pub tab_overview_on_alt: bool,
     pub show_tab_titles: bool,
     pub compact_tabs: bool,
+    /// Show the terminal selection lock button beside the settings gear.
+    pub show_selection_lock: bool,
     /// Ten independent tab sets per window. Off by default.
     pub workspaces_enabled: bool,
     /// Which end of the tab strip holds the workspace button.
@@ -382,6 +384,7 @@ impl Default for Config {
             tab_overview_on_alt: true,
             show_tab_titles: true,
             compact_tabs: false,
+            show_selection_lock: true,
             workspaces_enabled: false,
             workspace_button_position: WorkspaceButtonPosition::Right,
             workspace_button_display: WorkspaceButtonDisplay::Name,
@@ -628,6 +631,7 @@ impl Config {
             ("cursor_highlight".into(), self.cursor_highlight.to_string()),
             ("show_tab_titles".into(), self.show_tab_titles.to_string()),
             ("compact_tabs".into(), self.compact_tabs.to_string()),
+            ("show_selection_lock".into(), self.show_selection_lock.to_string()),
             ("workspaces_enabled".into(), self.workspaces_enabled.to_string()),
             ("workspace_button_position".into(), str_(self.workspace_button_position.as_str())),
             ("workspace_button_display".into(), str_(self.workspace_button_display.as_str())),
@@ -1060,6 +1064,9 @@ pub(crate) fn merge(cfg: &mut Config, v: &serde_yaml::Value) {
                     if let Some(b) = val.as_bool() {
                         cfg.default_maximize = b;
                     }
+                },
+                "show_selection_lock" => {
+                    if let Some(b) = val.as_bool() { cfg.show_selection_lock = b; }
                 },
                 "compact_tabs" => {
                     if let Some(b) = val.as_bool() { cfg.compact_tabs = b; }
@@ -1643,15 +1650,18 @@ mod tests {
         assert!(defaults.tab_overview_on_alt);
         assert!(defaults.show_tab_titles);
         assert!(!defaults.compact_tabs);
-        let cfg = Config::from_text("wal_palette: ''\ntab_overview_on_alt: false\nshow_tab_titles: false\ncompact_tabs: true\n", std::path::Path::new(".")).unwrap();
+        assert!(defaults.show_selection_lock);
+        let cfg = Config::from_text("wal_palette: ''\ntab_overview_on_alt: false\nshow_tab_titles: false\ncompact_tabs: true\nshow_selection_lock: false\n", std::path::Path::new(".")).unwrap();
         assert!(!cfg.tab_overview_on_alt);
         assert!(!cfg.show_tab_titles);
         assert!(cfg.compact_tabs);
+        assert!(!cfg.show_selection_lock);
         let saved = replace_top_level_values("", &cfg.ui_keys());
         let restored = Config::from_text(&saved, std::path::Path::new(".")).unwrap();
         assert!(!restored.tab_overview_on_alt);
         assert!(!restored.show_tab_titles);
         assert!(restored.compact_tabs);
+        assert!(!restored.show_selection_lock);
     }
 
     #[test]

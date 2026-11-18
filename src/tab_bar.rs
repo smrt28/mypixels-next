@@ -24,6 +24,8 @@ pub(crate) struct TabFace {
 
 pub(crate) struct Geometry {
     pub settings_clicked: bool,
+    pub selection_lock_clicked: bool,
+    pub selection_lock: egui::Rect,
     pub workspace_clicked: bool,
     /// Where the indicator is, for anything that needs to point at it.
     pub workspace: egui::Rect,
@@ -34,7 +36,8 @@ pub(crate) struct Geometry {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Self { settings_clicked: false, workspace_clicked: false, workspace: egui::Rect::NOTHING,
+        Self { settings_clicked: false, selection_lock_clicked: false, selection_lock: egui::Rect::NOTHING,
+            workspace_clicked: false, workspace: egui::Rect::NOTHING,
             tabs: Vec::new(), close: Vec::new(), add: egui::Rect::NOTHING }
     }
 }
@@ -49,6 +52,7 @@ pub(crate) fn show(
     workspace: usize,
     workspace_open: bool,
     cfg: &crate::config::Config,
+    selection_locked: bool,
 ) -> Geometry {
     let chrome = ui_style::TabStyle::new(root, cfg, workspace);
     let colors = chrome.base;
@@ -81,11 +85,14 @@ pub(crate) fn show(
                 (ui_style::text_width(ui, &workspace_label, workspace_font_size) + 22.0
                     + if show_icon && !workspace_label.is_empty() { icon_slot } else { 0.0 })
                     .max(WORKSPACE_WIDTH).min((width * 0.5).clamp(WORKSPACE_WIDTH, 240.0))
+                    .min((width - SETTINGS_WIDTH * if cfg.show_selection_lock { 2.0 } else { 1.0 }
+                        - 140.0).max(WORKSPACE_WIDTH))
             } else { 0.0 };
             let workspace_left = cfg.workspace_button_position == crate::config::WorkspaceButtonPosition::Left;
             let settings_left = width - SETTINGS_WIDTH;
+            let controls_left = settings_left - if cfg.show_selection_lock { SETTINGS_WIDTH } else { 0.0 };
             let tabs_left = if workspace_left { workspace_width } else { 0.0 };
-            let tabs_right = settings_left - if workspace_left { 0.0 } else { workspace_width };
+            let tabs_right = controls_left - if workspace_left { 0.0 } else { workspace_width };
             let settings = settings_button_rect(width, height);
             let response = ui.interact(settings, egui::Id::unique("settings_button"), egui::Sense::click());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
@@ -98,6 +105,24 @@ pub(crate) fn show(
             geometry.settings_clicked = response.clicked();
             response.on_hover_text("Settings").on_hover_cursor(egui::CursorIcon::PointingHand);
             p.vline(settings_left, 0.0..=height, egui::Stroke::new(1.0, colors.border));
+            if cfg.show_selection_lock {
+                let lock = settings.translate(egui::vec2(-SETTINGS_WIDTH, 0.0));
+                let response = ui.interact(lock, egui::Id::unique("selection_lock_button"), egui::Sense::click());
+                response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true,
+                    selection_locked, "Selection lock"));
+                let hot = response.hovered() || response.has_focus();
+                if hot {
+                    colors.surface(p, lock, 4.0, false, true);
+                }
+                let color = if hot { colors.fg } else { colors.muted };
+                ui_style::selection_lock_icon(p, lock.center(), (height - 4.0).clamp(6.0, 18.0), selection_locked, color);
+                geometry.selection_lock_clicked = response.clicked();
+                geometry.selection_lock = lock;
+                response.on_hover_text(if selection_locked {
+                    "Selection lock on · select terminal text without holding Shift · Ctrl selects a block"
+                } else { "Selection lock off · click to select terminal text without holding Shift" })
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
             if workspace_width > 0.0 {
                 let start = if workspace_left { 0.0 } else { tabs_right };
                 let workspace_rect = egui::Rect::from_min_max(
@@ -298,6 +323,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selection_lock_fits_and_clicks_in_compact_and_normal_strips() {
+        for height in [12.0, 14.0, 18.0, 28.0, 42.0] {
+            for visible in [true, false] {
+                let ctx = egui::Context::default();
+                let mut cfg = crate::config::Config::default();
+                cfg.compact_tabs = height < 28.0;
+                cfg.show_selection_lock = visible;
+                let width = 360.0;
+                let settings = settings_button_rect(width, height);
+                let lock = settings.translate(egui::vec2(-SETTINGS_WIDTH, 0.0));
+                let pos = lock.center();
+                let mut geometry = Geometry::default();
+                for frame in 0..4 {
+                    let events = if frame == 3 {
+                        vec![egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: true, modifiers: egui::Modifiers::NONE },
+                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                                pressed: false, modifiers: egui::Modifiers::NONE }]
+                    } else { vec![] };
+                    let mut out = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
+                        events, ..Default::default()
+                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg, true));
+                    out.textures_delta.clear();
+                }
+                assert_eq!(geometry.selection_lock_clicked, visible);
+                assert!(!geometry.settings_clicked);
+                if visible {
+                    assert_eq!(geometry.selection_lock, lock);
+                    assert!(lock.top() >= 0.0 && lock.bottom() <= height);
+                    assert!(!lock.intersects(settings));
+                    assert!(geometry.add.right() <= lock.left());
+                } else {
+                    assert!(!geometry.selection_lock.is_positive());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn settings_stays_at_the_right_and_fits_small_compact_tabs() {
         for height in [12.0, 14.0, 18.0, 28.0, 42.0] {
             for width in [360.0, 1280.0] {
@@ -320,7 +386,7 @@ mod tests {
                     let mut output = ctx.run_ui(egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                         events, ..Default::default()
-                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &tabs, 0, false, 0, false, &cfg));
+                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &tabs, 0, false, 0, false, &cfg, false));
                     output.textures_delta.clear();
                     if frame == 0 { continue; }
                     assert!(!geometry.workspace.intersects(button));
@@ -356,7 +422,7 @@ mod tests {
                         let mut output = ctx.run_ui(egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 480.0))),
                             ..Default::default()
-                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg));
+                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg, false));
                         output.textures_delta.clear();
                         if frame < 2 { continue; }
                         let button = geometry.workspace;
@@ -382,7 +448,7 @@ mod tests {
                             egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
                                 pressed: false, modifiers: egui::Modifiers::NONE }],
                         ..Default::default()
-                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg));
+                    }, |ui| geometry = show(ui, height, egui::FontId::monospace(10.0), &[], 0, false, 0, false, &cfg, false));
                     output.textures_delta.clear();
                     assert!(geometry.workspace_clicked);
                     assert!(!geometry.settings_clicked);
@@ -414,7 +480,7 @@ mod tests {
                             let mut full = ctx.run_ui(egui::RawInput {
                                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                                 ..Default::default()
-                            }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg));
+                            }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg, false));
                             full.textures_delta.clear();
                         }
                         let button = geometry.workspace;
@@ -428,7 +494,7 @@ mod tests {
                             assert_eq!(button.left(), 3.0);
                             assert!(selected.left() >= button.right());
                         } else {
-                            assert_eq!(button.right(), width - SETTINGS_WIDTH - 3.0);
+                            assert_eq!(button.right(), width - 2.0 * SETTINGS_WIDTH - 3.0);
                             assert!(geometry.add.right() <= button.left());
                         }
                         let pos = button.center();
@@ -439,7 +505,7 @@ mod tests {
                         let mut full = ctx.run_ui(egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                             events, ..Default::default()
-                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg));
+                        }, |ui| geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 2, false, &cfg, false));
                         full.textures_delta.clear();
                         assert!(geometry.workspace_clicked, "workspace button lost its hit target after moving");
                         assert!(!geometry.settings_clicked);
@@ -471,7 +537,7 @@ mod tests {
                             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                             ..Default::default()
                         }, |ui| {
-                            geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 0, false, &cfg);
+                            geometry = show(ui, height, egui::FontId::monospace(14.0), &tabs, 39, false, 0, false, &cfg, false);
                         });
                         full.textures_delta.clear();
                     }
@@ -523,7 +589,7 @@ mod tests {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                         ..Default::default()
                     }, |ui| {
-                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, false, 0, false, &cfg);
+                        geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 9, false, 0, false, &cfg, false);
                     });
                     if !show_titles {
                         assert!(!full.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
@@ -562,13 +628,13 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                 ..Default::default()
             }, |ui| {
-                geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg);
+                geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg, false);
             });
             full.textures_delta.clear();
             let mark = geometry.workspace;
             assert!(mark.is_positive(), "the indicator has no hit area");
-            assert_eq!(mark.right(), width - SETTINGS_WIDTH - 3.0, "the indicator is not at the right edge");
-            assert_eq!(mark.left(), width - SETTINGS_WIDTH - WORKSPACE_WIDTH + 3.0);
+            assert_eq!(mark.right(), width - 2.0 * SETTINGS_WIDTH - 3.0, "the indicator is not at the right edge");
+            assert_eq!(mark.left(), width - 2.0 * SETTINGS_WIDTH - WORKSPACE_WIDTH + 3.0);
             assert!(geometry.tabs[0].left() >= 0.0, "the first tab extends beyond the strip");
             assert!(geometry.tabs.iter().all(|tab| tab.right() <= mark.left()), "tabs overlap the indicator");
             assert!(geometry.add.right() <= mark.left(), "the add button overlaps the indicator");
@@ -580,7 +646,7 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                 ..Default::default()
             }, |ui| {
-                off = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg);
+                off = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg, false);
             });
             out.textures_delta.clear();
             assert!(!off.workspace.is_positive(), "a hidden indicator still claims a rect");
@@ -607,7 +673,7 @@ mod tests {
                     let mut output = ctx.run_ui(egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 480.0))),
                         ..Default::default()
-                    }, |ui| geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg));
+                    }, |ui| geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg, false));
                     output.textures_delta.clear();
                     if frame < 2 { continue; }
                     let label = mode.text(3, "Development");
@@ -651,7 +717,7 @@ mod tests {
                             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0))),
                             ..Default::default()
                         }, |ui| {
-                            geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg);
+                            geometry = show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, 0, false, 2, false, &cfg, false);
                         });
                         output.textures_delta.clear();
                         if frame == 2 {
@@ -665,7 +731,7 @@ mod tests {
                                 "workspace background does not match its color");
                         }
                     }
-                    assert_eq!(geometry.workspace.right(), width - SETTINGS_WIDTH - 3.0);
+                    assert_eq!(geometry.workspace.right(), width - 2.0 * SETTINGS_WIDTH - 3.0);
                     assert!(geometry.workspace.width() <= width * 0.5);
                     assert!(geometry.add.right() <= geometry.workspace.left());
                     assert!(geometry.tabs[0].right() <= geometry.workspace.left());
@@ -705,7 +771,7 @@ mod tests {
                         },
                         |ui| {
                             geometry =
-                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, false, 0, false, &cfg);
+                                show(ui, 28.0, egui::FontId::monospace(14.0), &tabs, active, false, 0, false, &cfg, false);
                         },
                     );
                     output.textures_delta.clear();

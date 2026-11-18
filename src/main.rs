@@ -331,6 +331,8 @@ struct Win {
     pointer: (f32, f32),
     mouse_button: Option<MouseButton>,
     mouse_last: Option<(u16, u16)>,
+    /// Window-local toggle; new windows always start with normal mouse handling.
+    selection_locked: bool,
     drag: Option<(Point, Side)>,
     click: Option<(u8, u32, (f32, f32), std::time::Instant)>,
     wheel_pixels: f32,
@@ -2608,7 +2610,13 @@ impl App {
                         strip_geometry = tab_bar::show(ui, self.tab_h / ctx.pixels_per_point(), tab_font.clone(),
                             &tab_faces, self.wins[self.cur].active,
                             egui.ui_state.panel_is(egui_ui::RightPanel::Settings), self.wins[self.cur].workspace,
-                            egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces), &self.config);
+                            egui.ui_state.panel_is(egui_ui::RightPanel::Workspaces), &self.config,
+                            self.wins[self.cur].selection_locked);
+                        if strip_geometry.selection_lock_clicked {
+                            self.wins[self.cur].selection_locked = !self.wins[self.cur].selection_locked;
+                            egui_ui::release_focus(&ctx);
+                            ctx.request_repaint();
+                        }
                         if strip_geometry.settings_clicked {
                             let st = &mut egui.ui_state;
                             st.menu_open = false;
@@ -3699,7 +3707,7 @@ impl App {
     }
 
     fn mouse_mode(&self) -> Option<TermMode> {
-        if self.modifiers.shift_key() {
+        if self.selection_modifiers().shift_key() {
             return None;
         }
         let term = self.wins[self.cur].tabs.get(self.wins[self.cur].active)?.term.lock();
@@ -3708,6 +3716,11 @@ impl App {
             || mode.contains(TermMode::MOUSE_DRAG)
             || mode.contains(TermMode::MOUSE_MOTION);
         any.then_some(mode)
+    }
+
+    fn selection_modifiers(&self) -> ModifiersState {
+        selection_modifiers(self.modifiers,
+            self.config.show_selection_lock && self.wins[self.cur].selection_locked)
     }
 
     /// Viewport cell under the pointer in protocol coordinates (1-based), or
@@ -5502,6 +5515,7 @@ impl App {
                 pointer: (0.0, 0.0),
                 mouse_button: None,
                 mouse_last: None,
+                selection_locked: false,
                 drag: None,
                 click: None,
                 wheel_pixels: 0.0,
@@ -6774,7 +6788,7 @@ impl ApplicationHandler for App {
                         if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) { tab.clear_selection(); }
                         self.add_tab();
                         window.request_redraw();
-                    } else if self.modifiers.control_key() && !self.modifiers.shift_key()
+                    } else if self.modifiers.control_key() && !self.selection_modifiers().shift_key()
                         && self.url_at(at.0, at.1).is_some()
                     {
                         // Ctrl+click opens links. Shift gestures belong to text
@@ -6795,7 +6809,7 @@ impl ApplicationHandler for App {
                         // Shift bypasses terminal mouse reporting without changing
                         // linear/word selection. Ctrl+Shift requests a block;
                         // retain the existing Alt gesture as well.
-                        let ty = selection_type(self.modifiers, count);
+                        let ty = selection_type(self.selection_modifiers(), count);
                         let cur_active = self.wins[self.cur].active;
                         if let Some(tab) = self.wins[self.cur].tabs.get_mut(cur_active) {
                             tab.begin_selection(pt, side, ty);
@@ -6902,7 +6916,7 @@ impl ApplicationHandler for App {
                     let empty_click = self.wins[self.cur].tabs.get(self.wins[self.cur].active)
                         .is_some_and(|tab| tab.term.lock().selection.as_ref()
                             .is_some_and(|sel| sel.ty == SelectionType::Simple && sel.is_empty()));
-                    if empty_click && self.modifiers.shift_key() && !self.modifiers.control_key() {
+                    if empty_click && self.selection_modifiers().shift_key() && !self.modifiers.control_key() {
                         let (px, py) = self.wins[self.cur].pointer;
                         if let Some(url) = self.url_at(px, py) {
                             self.copy_text(clipboard::Kind::Clipboard, url);
@@ -7376,6 +7390,10 @@ Use --new-tab to add a tab instead. If no session answers, start a new instance.
     log::info!("exited");
 }
 
+fn selection_modifiers(modifiers: ModifiersState, locked: bool) -> ModifiersState {
+    if locked { modifiers | ModifiersState::SHIFT } else { modifiers }
+}
+
 fn selection_type(modifiers: ModifiersState, count: u32) -> SelectionType {
     match count {
         _ if modifiers.alt_key() || (modifiers.control_key() && modifiers.shift_key()) => SelectionType::Block,
@@ -7567,6 +7585,22 @@ mod tests {
         move_tab_to_position(&mut tabs, &mut active, 9);
         assert_eq!(active, 9);
         assert_eq!(tabs, [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 9, 10]);
+    }
+
+    #[test]
+    fn selection_lock_behaves_like_shift_without_changing_keyboard_modifiers() {
+        for modifiers in [ModifiersState::empty(), ModifiersState::SHIFT,
+            ModifiersState::CONTROL, ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ModifiersState::ALT] {
+            assert_eq!(selection_modifiers(modifiers, false), modifiers);
+            let locked = selection_modifiers(modifiers, true);
+            assert!(locked.shift_key(), "locked selection must bypass mouse reporting");
+            for count in 1..=3 {
+                assert_eq!(selection_type(locked, count),
+                    selection_type(modifiers | ModifiersState::SHIFT, count));
+            }
+        }
+        assert_eq!(selection_type(selection_modifiers(ModifiersState::CONTROL, true), 1), SelectionType::Block);
     }
 
     #[test]

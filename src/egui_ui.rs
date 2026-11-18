@@ -2766,6 +2766,7 @@ fn tabs_page(ui: &mut egui::Ui, cfg: &mut crate::config::Config, ev: &mut Config
     section(ui, "Tab bar", colors, |ui| {
         form_grid("tabs").show(ui, |ui| {
             checkbox_row(ui, "Compact tabs", &mut cfg.compact_tabs, ev);
+            checkbox_row(ui, "Selection lock", &mut cfg.show_selection_lock, ev);
             checkbox_row(ui, "Show tab titles", &mut cfg.show_tab_titles, ev);
             checkbox_row(ui, "Strip on top", &mut cfg.tablist_top, ev);
             checkbox_row(ui, "Hide strip", &mut cfg.tablist_hide, ev);
@@ -3738,7 +3739,7 @@ mod regression {
     const PAGE_MARKS: [(SettingsPage, &[&str]); 6] = [
         (SettingsPage::Appearance, &["Theme", "Terminal brightness", "Terminal font", "Animation speed", "Button position", "Tab strip", "Group colors", "Button display"]),
         (SettingsPage::Window, &["Default width", "Default height", "Transparency", "Start maximized", "Close window dialog"]),
-        (SettingsPage::Tabs, &["Compact tabs", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
+        (SettingsPage::Tabs, &["Compact tabs", "Selection lock", "Multiline tabs", "Title length", "New tab position", "Graveyard keeps"]),
         (SettingsPage::Navigation, &["Tab switcher enabled", "Delay (ms)", "Preview scale", "Backdrop dim"]),
         (SettingsPage::Terminal, &["Git revision", "Scrollback lines", "Visual bell", "Cursor highlight"]),
         (SettingsPage::Keys, &["Copy", "Search this tab", "Text bigger"]),

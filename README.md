@@ -261,6 +261,11 @@ Features
   Ctrl+Alt+Z new tab, Ctrl+Alt+X close tab, Ctrl+Shift+R reloads the
   config, Ctrl+Shift+C/V copy and paste (the GTK bindings),
   Shift+Insert pastes the primary selection.
+* Selection lock beside the settings gear makes terminal mouse selections
+  behave as if Shift is held, including bypassing mouse reporting in TUIs.
+  Ctrl selects a block while locked. Each window starts unlocked; hide the
+  button under Settings → Tabs → Tab bar → Selection lock
+  (`show_selection_lock: false`, which also disables the lock).
 * Kitty graphics protocol - PNG images (`icat`) render as textured
   quads in the grid and scrollback.
 * Kitty keyboard protocol - full disambiguation, with real key
