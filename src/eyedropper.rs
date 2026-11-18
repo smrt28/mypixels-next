@@ -41,11 +41,10 @@ impl Picker {
 }
 
 async fn pick(mut cancelled: oneshot::Receiver<()>) -> PickResult {
-    // Hyprland's portal fallback runs plain `slurp -p`, whose default white
-    // backdrop can still be fading out when grim samples it. We must control
-    // the selector's colors ourselves, rather than correct a tinted result.
-    if transparent_selection_desktop() {
-        if let (Some(slurp), Some(grim)) = (find_tool("slurp"), find_tool("grim")) {
+    // Prefer a transparent selector wherever the compositor supports both
+    // helpers. Desktop names do not determine which protocols are available.
+    if let (Some(slurp), Some(grim)) = (find_tool("slurp"), find_tool("grim")) {
+        if transparent_selection_supported() {
             return pick_transparent(&slurp, &grim, &mut cancelled);
         }
     }
@@ -57,10 +56,32 @@ async fn pick(mut cancelled: oneshot::Receiver<()>) -> PickResult {
     result.map_err(|e: zbus::Error| format!("Screen color picker unavailable: {e}"))
 }
 
-fn transparent_selection_desktop() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':')
-            .any(|desktop| desktop.eq_ignore_ascii_case("Hyprland"))
+fn transparent_selection_supported() -> bool {
+    use wayland_client::{Connection, Dispatch, QueueHandle, globals::{registry_queue_init, GlobalListContents},
+        protocol::wl_registry};
+    struct Probe;
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Probe {
+        fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event,
+            _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() { return false; }
+    let Ok(conn) = Connection::connect_to_env() else { return false; };
+    let Ok((globals, _queue)) = registry_queue_init::<Probe>(&conn) else { return false; };
+    globals.contents().with_list(|list| selection_protocols_supported(
+        list.iter().map(|global| (global.interface.as_str(), global.version))))
+}
+
+fn selection_protocols_supported<'a>(globals: impl IntoIterator<Item = (&'a str, u32)>) -> bool {
+    let (mut selection, mut capture) = (false, false);
+    for (interface, version) in globals {
+        if version == 0 { continue; }
+        match interface {
+            "zwlr_layer_shell_v1" => selection = true,
+            "zwlr_screencopy_manager_v1" => capture = true,
+            _ => (),
+        }
+    }
+    selection && capture
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {
@@ -195,6 +216,18 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn direct_selection_requires_both_compositor_protocols() {
+        let layer_shell = ("zwlr_layer_shell_v1", 1);
+        let screencopy = ("zwlr_screencopy_manager_v1", 3);
+        assert!(selection_protocols_supported([layer_shell, screencopy]));
+        // Selection alone (or capture alone) must leave the portal available.
+        assert!(!selection_protocols_supported([layer_shell]));
+        assert!(!selection_protocols_supported([screencopy]));
+        assert!(!selection_protocols_supported([("wl_compositor", 6), ("wl_shm", 1)]));
+        assert!(!selection_protocols_supported([layer_shell, (screencopy.0, 0)]));
+    }
 
     fn png_image(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
