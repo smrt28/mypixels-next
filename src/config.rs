@@ -534,9 +534,15 @@ impl Config {
         }
     }
 
+    /// Preserve the current colors while detaching from preset and file updates.
+    pub fn use_custom_colors(&mut self) {
+        self.theme = "default".into();
+        self.theme_files.clear();
+    }
+
     /// Persist the fields the configuration UI edits, in place: each
     /// top-level key's value line is replaced, anything else (comments,
-    /// bindings, palettes, keys the UI does not touch) stays byte for
+    /// bindings, keys the UI does not touch) stays byte for
     /// byte. Keys the file does not have yet are appended.
     ///
     /// Optionally rewrite the `bindings:` block too. Bindings are
@@ -553,6 +559,11 @@ impl Config {
         }
         let text = std::fs::read_to_string(path).unwrap_or_default();
         let out = replace_top_level_values(&text, &Self::ui_keys(self));
+        let out = if let Some(palette) = self.palette {
+            let value = palette.iter().map(|c| format!("'#{:02x}{:02x}{:02x}'", c.0, c.1, c.2))
+                .collect::<Vec<_>>().join(", ");
+            replace_top_level_block(&out, "palette", &format!("palette: [{value}]\n"))
+        } else { out };
         let out = if include_bindings {
             replace_top_level_block(&out, "bindings", &self.bindings_yaml())
         } else {
@@ -624,6 +635,12 @@ impl Config {
             ("bg_tint_color".into(), rgb(&self.bg_tint_color)),
             ("tablist_background".into(), rgb(&self.tablist_background)),
             ("add_button_color".into(), rgb(&self.add_button_color)),
+            ("tab_color_bg".into(), rgb(&self.tab_color_bg)),
+            ("tab_color_bg_selected".into(), rgb(&self.tab_color_bg_selected)),
+            ("tab_color_fg".into(), rgb(&self.tab_color_fg)),
+            ("tab_color_fg_selected".into(), rgb(&self.tab_color_fg_selected)),
+            ("tab_color_entangle".into(), rgb(&self.tab_color_entangle)),
+            ("tab_color_idx".into(), rgb(&self.tab_color_idx)),
             ("tab_title_max_length".into(), self.tab_title_max_length.to_string()),
             ("tab_title_short_current".into(), self.tab_title_short_current.to_string()),
             ("tab_overview_on_alt".into(), self.tab_overview_on_alt.to_string()),
@@ -668,6 +685,10 @@ impl Config {
         }
         if !self.theme.is_empty() {
             keys.push(("theme".into(), str_(&self.theme)));
+        }
+        if self.theme == "default" {
+            // Explicitly disable pywal so it cannot replace manually edited colors.
+            keys.push(("wal_palette".into(), "''".into()));
         }
         keys
     }
@@ -1724,7 +1745,7 @@ mod tests {
         let restored = Config::from_text(&saved, base).unwrap();
         assert_eq!(restored.workspace_colors, cfg.workspace_colors);
         assert!(saved.contains("# keep comment"));
-        assert!(!saved.contains("tab_color_bg:"));
+        assert!(saved.contains("tab_color_bg:"));
         assert!(saved.contains("workspace_color_10: '#aabbcc'"));
         // Global theme changes preserve workspace identities.
         crate::theme::apply_name(&mut cfg, "catppuccin-latte").unwrap();
@@ -2029,6 +2050,40 @@ mod tests {
         let text = "  col_0: nested\ncol_0: '#111111'\ncol_1: '#222222'\n";
         let out = replace_top_level_values(text, &[("col_0".into(), "'#333333'".into())]);
         assert_eq!(out, "  col_0: nested\ncol_0: '#333333'\ncol_1: '#222222'\n");
+    }
+
+    #[test]
+    fn custom_colors_survive_save_and_reload_from_a_preset() {
+        let dir = std::env::temp_dir().join(format!("mypixels-custom-colors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yml");
+        let original = "# keep comment\ntheme: dracula\nwal_palette: ignored.yml\npalette:\n  - '#123456'\n  - '#abcdef'\nbindings:\n  new_tab: CONTROL+SHIFT+t\n";
+        std::fs::write(&path, original).unwrap();
+        let mut cfg = Config::from_text("theme: dracula\n", &dir).unwrap();
+        cfg.palette.as_mut().unwrap()[5] = Rgb(1, 2, 3);
+        cfg.col[3] = Rgb(4, 5, 6);
+        cfg.tab_color_bg = Rgb(7, 8, 9);
+        cfg.tab_color_bg_selected = Rgb(10, 11, 12);
+        cfg.tab_color_fg = Rgb(13, 14, 15);
+        cfg.tab_color_fg_selected = Rgb(16, 17, 18);
+        cfg.tab_color_entangle = Rgb(19, 20, 21);
+        cfg.tab_color_idx = Rgb(22, 23, 24);
+        cfg.use_custom_colors();
+        cfg.save_to_with(&path, false).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let restored = Config::from_text(&saved, &dir).unwrap();
+        assert_eq!(restored.palette, cfg.palette);
+        assert_eq!(restored.col, cfg.col);
+        assert_eq!(restored.tab_color_bg, cfg.tab_color_bg);
+        assert_eq!(restored.tab_color_bg_selected, cfg.tab_color_bg_selected);
+        assert_eq!(restored.tab_color_fg, cfg.tab_color_fg);
+        assert_eq!(restored.tab_color_fg_selected, cfg.tab_color_fg_selected);
+        assert_eq!(restored.tab_color_entangle, cfg.tab_color_entangle);
+        assert_eq!(restored.tab_color_idx, cfg.tab_color_idx);
+        assert!(restored.theme_files.is_empty());
+        assert!(saved.starts_with("# keep comment\n"));
+        assert!(saved.contains("bindings:\n  new_tab: CONTROL+SHIFT+t\n"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

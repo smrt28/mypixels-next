@@ -2546,45 +2546,7 @@ fn appearance_page(
     ev: &mut ConfigEvents,
     colors: &TermStyle,
 ) {
-    section(ui, "Theme & colors", colors, |ui| {
-        if !st.theme_fetched {
-            st.theme_choice = crate::theme::available();
-            st.theme_fetched = true;
-        }
-        form_grid("colors-terminal").show(ui, |ui| {
-            row(ui, "Theme", |ui| {
-                let written = if cfg.theme.is_empty() { "default".to_string() } else { cfg.theme.clone() };
-                let mut names = st.theme_choice.clone();
-                if !names.contains(&written) { names.push(written.clone()); }
-                let mut chosen = written.clone();
-                egui::ComboBox::from_id_salt("theme_preset").popup_style((**ui.style()).clone().into())
-                    .width(170.0).selected_text(&written)
-                    .show_ui(ui, |ui| {
-                        for name in &names { ui.selectable_value(&mut chosen, name.clone(), name); }
-                    });
-                if chosen != written {
-                    cfg.theme = chosen.clone();
-                    // A preset rewrites the color fields, so the rows below
-                    // change under the user. That is the point: the preset stays
-                    // above them, and a manual override is applied after it.
-                    if let Err(e) = crate::theme::apply_name(cfg, &chosen) { log::warn!("theme {chosen}: {e}"); }
-                    ev.apply = true;
-                }
-            });
-            color_row(ui, "Background", &mut cfg.background_color, ev);
-            color_row(ui, "Foreground", &mut cfg.foreground_color, ev);
-            color_row(ui, "Selection", &mut cfg.selection_color, ev);
-            color_row(ui, "Cursor", &mut cfg.cursor_color, ev);
-            color_row(ui, "Accent", &mut cfg.accent_color, ev);
-            color_row(ui, "Background tint", &mut cfg.bg_tint_color, ev);
-            row(ui, "Terminal brightness", |ui| {
-                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.terminal_brightness)
-                    .speed(1.0).range(-100.0..=100.0).suffix("%").fixed_decimals(0))
-                    .on_hover_text("0% keeps the original terminal colors; negative values darken them, positive values brighten them.")
-                    .changed();
-            });
-        });
-    });
+    let mut colors_edited = false;
     workspace_settings(ui, cfg, st, ev, colors);
     section(ui, "Fonts", colors, |ui| {
         form_grid("fonts").show(ui, |ui| {
@@ -2612,24 +2574,96 @@ fn appearance_page(
     });
     section(ui, "Tab colors", colors, |ui| {
         form_grid("colors-tabs").show(ui, |ui| {
-            color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
-            color_row(ui, "Add button", &mut cfg.add_button_color, ev);
+            colors_edited |= color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
+            colors_edited |= color_row(ui, "Add button", &mut cfg.add_button_color, ev);
         });
         // Manual tab groups have a separate palette from workspace identities.
         ui.add_space(8.0);
         ui.label("Group colors");
         ui.label(egui::RichText::new("The palette a tab is tagged with.").small().color(colors.muted));
         ui.add_space(4.0);
+        let mut changed = false;
         ui.horizontal(|ui| {
             for (i, color) in cfg.col.iter_mut().enumerate() {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(format!("{}", i + 1)).small().color(colors.muted));
-                    ev.apply |= color_cell(ui, color);
+                    changed |= color_cell(ui, color);
                 });
             }
         });
-
+        if changed { cfg.use_custom_colors(); ev.apply = true; }
     });
+    section(ui, "Theme & colors", colors, |ui| {
+        if !st.theme_fetched {
+            st.theme_choice = crate::theme::available();
+            st.theme_fetched = true;
+        }
+        form_grid("colors-terminal").show(ui, |ui| {
+            row(ui, "Theme", |ui| {
+                let written = if cfg.theme.is_empty() { "default".to_string() } else { cfg.theme.clone() };
+                let mut names = st.theme_choice.clone();
+                if !names.contains(&written) { names.push(written.clone()); }
+                let mut chosen = written.clone();
+                egui::ComboBox::from_id_salt("theme_preset").popup_style((**ui.style()).clone().into())
+                    .width(170.0).selected_text(if written == "default" { "Custom colors" } else { &written })
+                    .show_ui(ui, |ui| {
+                        for name in &names { ui.selectable_value(&mut chosen, name.clone(), if name == "default" { "Custom colors" } else { name }); }
+                    });
+                if chosen != written {
+                    cfg.theme = chosen.clone();
+                    // A preset rewrites the color fields, so the rows below
+                    // change under the user. That is the point: the preset stays
+                    // above them, and a manual override is applied after it.
+                    if let Err(e) = crate::theme::apply_name(cfg, &chosen) { log::warn!("theme {chosen}: {e}"); }
+                    ev.apply = true;
+                }
+            });
+            colors_edited |= color_row(ui, "Background", &mut cfg.background_color, ev);
+            colors_edited |= color_row(ui, "Foreground", &mut cfg.foreground_color, ev);
+            colors_edited |= color_row(ui, "Selection", &mut cfg.selection_color, ev);
+            colors_edited |= color_row(ui, "Cursor", &mut cfg.cursor_color, ev);
+            colors_edited |= color_row(ui, "Accent", &mut cfg.accent_color, ev);
+            colors_edited |= color_row(ui, "Background tint", &mut cfg.bg_tint_color, ev);
+            colors_edited |= color_row(ui, "Tab background", &mut cfg.tab_color_bg, ev);
+            colors_edited |= color_row(ui, "Active tab background", &mut cfg.tab_color_bg_selected, ev);
+            colors_edited |= color_row(ui, "Tab text", &mut cfg.tab_color_fg, ev);
+            colors_edited |= color_row(ui, "Active tab text", &mut cfg.tab_color_fg_selected, ev);
+            colors_edited |= color_row(ui, "Entangled tab", &mut cfg.tab_color_entangle, ev);
+            colors_edited |= color_row(ui, "Tab index", &mut cfg.tab_color_idx, ev);
+            row(ui, "Terminal brightness", |ui| {
+                ev.apply |= ui.add(egui::DragValue::new(&mut cfg.terminal_brightness)
+                    .speed(1.0).range(-100.0..=100.0).suffix("%").fixed_decimals(0))
+                    .on_hover_text("0% keeps the original terminal colors; negative values darken them, positive values brighten them.")
+                    .changed();
+            });
+        });
+        ui.add_space(8.0);
+        ui.label("ANSI terminal colors");
+        ui.label(egui::RichText::new("Editing colors switches the theme to custom colors.")
+            .small().color(colors.muted));
+        let mut palette = cfg.palette.unwrap_or_else(|| crate::PALETTE.map(|c| {
+            crate::config::Rgb((c[0] * 255.0).round() as u8,
+                (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8)
+        }));
+        let mut changed = false;
+        egui::Grid::new("ansi-colors").num_columns(4).spacing(egui::vec2(10.0, 8.0)).show(ui, |ui| {
+            for (i, color) in palette.iter_mut().enumerate() {
+                ui.vertical(|ui| {
+                    ui.set_width(76.0);
+                    let name = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"][i % 8];
+                    ui.label(egui::RichText::new(if i < 8 { name.to_string() } else { format!("Bright {name}") }).small());
+                    changed |= color_cell(ui, color);
+                });
+                if i % 4 == 3 { ui.end_row(); }
+            }
+        });
+        if changed {
+            cfg.palette = Some(palette);
+            cfg.use_custom_colors();
+            ev.apply = true;
+        }
+    });
+    if colors_edited { cfg.use_custom_colors(); }
 }
 
 /// A single workspace editor keeps identity choices together, as in the mockup.
@@ -3448,14 +3482,17 @@ fn compose_value(
     })
 }
 
-fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mut ConfigEvents) {
+fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mut ConfigEvents) -> bool {
+    let mut changed = false;
     row(ui, label, |ui| {
         ui.horizontal(|ui| {
-            if color_cell(ui, c) { ev.apply = true; }
+            changed = color_cell(ui, c);
+            ev.apply |= changed;
             ui.label(egui::RichText::new(format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2))
                 .monospace().color(ui.visuals().weak_text_color()));
         });
     });
+    changed
 }
 
 /// The color button alone (the control side of an aligned row).
@@ -3726,7 +3763,7 @@ mod regression {
         for label in ["Manage workspace names, colors, and icons.", "Number", "Name", "Color", "Icon", "Button display"] {
             assert!(labels.iter().any(|text| text == label), "missing {label}");
         }
-        for retired in ["Tab", "Tab (active)", "Tab text", "Tab text (active)"] {
+        for retired in ["Tab", "Tab (active)", "Tab text (active)"] {
             assert!(!labels.iter().any(|label| label == retired));
         }
     }
@@ -3765,10 +3802,25 @@ mod regression {
     }
 
     #[test]
+    fn theme_colors_are_last_and_expose_tab_and_ansi_colors() {
+        let labels = page_labels(&Context::default(), SettingsPage::Appearance, (1100.0, 3200.0));
+        let position = |name| labels.iter().position(|label| label == name).unwrap_or_else(|| panic!("missing {name}"));
+        let theme = position("Theme & colors");
+        for section in ["Workspaces", "Fonts", "Motion", "Tab colors"] {
+            assert!(position(section) < theme, "{section} must come before theme colors");
+        }
+        for name in ["Tab background", "Active tab background", "Tab text", "Active tab text",
+            "Entangled tab", "Tab index", "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
+            "Bright Black", "Bright Red", "Bright Green", "Bright Yellow", "Bright Blue", "Bright Magenta", "Bright Cyan", "Bright White"] {
+            assert!(position(name) > theme);
+        }
+    }
+
+    #[test]
     fn every_category_is_selectable_and_owns_its_controls() {
         let ctx = Context::default();
         for (page, marks) in PAGE_MARKS {
-            let labels = page_labels(&ctx, page, (1100.0, 2200.0));
+            let labels = page_labels(&ctx, page, (1100.0, 3200.0));
             for mark in marks {
                 assert!(labels.iter().any(|l| l == *mark), "{page:?} lost its {mark:?} control");
             }

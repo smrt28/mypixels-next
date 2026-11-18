@@ -812,13 +812,18 @@ impl TabStyle {
         let background = base.bg.lerp_to_gamma(color, 0.18);
         let selected_background = base.bg.lerp_to_gamma(color, 0.42);
         let foreground = contrasting_text(color.lerp_to_gamma(base.fg, 0.75), background);
+        // Workspace identity takes priority; global tab colors configure the
+        // strip when workspaces are disabled.
+        let tab_color = |value, default, fallback| {
+            if cfg.workspaces_enabled { fallback } else { resolve(value, default, fallback) }
+        };
         Self {
-            foreground,
-            selected_foreground: contrasting_text(color.lerp_to_gamma(base.fg, 0.85), selected_background),
-            background,
-            selected_background,
-            entangle: color,
-            index: foreground,
+            foreground: tab_color(cfg.tab_color_fg, defaults.tab_color_fg, foreground),
+            selected_foreground: tab_color(cfg.tab_color_fg_selected, defaults.tab_color_fg_selected, contrasting_text(color.lerp_to_gamma(base.fg, 0.85), selected_background)),
+            background: tab_color(cfg.tab_color_bg, defaults.tab_color_bg, background),
+            selected_background: tab_color(cfg.tab_color_bg_selected, defaults.tab_color_bg_selected, selected_background),
+            entangle: tab_color(cfg.tab_color_entangle, defaults.tab_color_entangle, color),
+            index: tab_color(cfg.tab_color_idx, defaults.tab_color_idx, foreground),
             add: resolve(cfg.add_button_color, defaults.add_button_color, base.muted),
             base,
         }
@@ -918,6 +923,24 @@ mod motion_tests {
         crate::theme::apply_name(&mut cfg, "hispixel").unwrap();
         assert_eq!(cfg.tablist_background, crate::config::Config::default().tablist_background);
         assert_eq!(workspace_style(&cfg, 0, false).base.bg, egui::Color32::from_rgb(48, 48, 48));
+    }
+
+    #[test]
+    fn global_tab_colors_apply_when_workspaces_are_disabled() {
+        let mut cfg = crate::config::Config::default();
+        cfg.tab_color_bg = crate::config::Rgb(1, 2, 3);
+        cfg.tab_color_bg_selected = crate::config::Rgb(4, 5, 6);
+        cfg.tab_color_fg = crate::config::Rgb(7, 8, 9);
+        cfg.tab_color_fg_selected = crate::config::Rgb(10, 11, 12);
+        cfg.tab_color_entangle = crate::config::Rgb(13, 14, 15);
+        cfg.tab_color_idx = crate::config::Rgb(16, 17, 18);
+        let style = workspace_style(&cfg, 0, false);
+        assert_eq!(style.background, rgb_c32(cfg.tab_color_bg));
+        assert_eq!(style.selected_background, rgb_c32(cfg.tab_color_bg_selected));
+        assert_eq!(style.foreground, rgb_c32(cfg.tab_color_fg));
+        assert_eq!(style.selected_foreground, rgb_c32(cfg.tab_color_fg_selected));
+        assert_eq!(style.entangle, rgb_c32(cfg.tab_color_entangle));
+        assert_eq!(style.index, rgb_c32(cfg.tab_color_idx));
     }
 
     #[test]
