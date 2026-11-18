@@ -256,6 +256,8 @@ Features
 * Tab colorization - mark a tab with a colour so it can be easily
   found (Alt+Shift+{ / }).
 * All keyboard - Alt+Left/Right/Up/Down/Home/End move between tabs,
+  Ctrl+Alt+1…9/0 move the active tab to position 1…10 in the current
+  workspace (or to the end if fewer tabs are open),
   Ctrl+Alt+Z new tab, Ctrl+Alt+X close tab, Ctrl+Shift+R reloads the
   config, Ctrl+Shift+C/V copy and paste (the GTK bindings),
   Shift+Insert pastes the primary selection.

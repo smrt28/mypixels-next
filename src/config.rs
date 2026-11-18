@@ -323,6 +323,7 @@ impl Default for Config {
         bind("show_config", &["MOD1+SHIFT+c"]);
         for (i, d) in (0..10).zip(["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_0"]) {
             bind(&format!("goto_tab_{i}"), &[&format!("MOD1+{d}")]);
+            bind(&format!("move_tab_{i}"), &[&format!("CONTROL+MOD1+{d}")]);
         }
 
         for (i, digit) in ["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "_0"].iter().enumerate() {
@@ -1537,6 +1538,26 @@ mod tests {
         assert_eq!(by_position, Key::Character("3".into()));
         assert_eq!(find_action(&cfg.bindings, &by_position, mods, false),
             Some("goto_workspace_2".into()));
+    }
+
+    #[test]
+    fn numbered_tab_move_defaults_are_distinct_and_configurable() {
+        let cfg = Config::default();
+        for (i, digit) in "1234567890".chars().enumerate() {
+            let action = format!("move_tab_{i}");
+            let key = Key::Character(digit.to_string().into());
+            let mods = ModifiersState::CONTROL | ModifiersState::ALT;
+            assert_eq!(find_action(&cfg.bindings, &key, mods, false), Some(action.clone()));
+            assert_eq!(find_action(&cfg.bindings, &key, ModifiersState::ALT, false),
+                Some(format!("goto_tab_{i}")));
+            assert_eq!(binding_conflict(&cfg.bindings, &action, &cfg.bindings_for(&action)[0]), None);
+        }
+        let cfg = Config::from_text(
+            "wal_palette: ''\nbindings:\n  move_tab_0: CONTROL+SHIFT+_1\n  move_tab_9: []\n",
+            std::path::Path::new(".")).unwrap();
+        assert_eq!(find_action(&cfg.bindings, &Key::Character("1".into()),
+            ModifiersState::CONTROL | ModifiersState::SHIFT, false), Some("move_tab_0".into()));
+        assert!(cfg.bindings_for("move_tab_9").is_empty());
     }
 
     #[test]

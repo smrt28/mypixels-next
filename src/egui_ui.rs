@@ -2910,7 +2910,7 @@ fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) 
 
 /// The actions the Keys page names, grouped. Numbered tabs and workspaces are
 /// generated (they are ranges), so they are not here; `action_label` knows
-/// both prefixes, so a generated action still reads well everywhere.
+/// their prefixes, so a generated action still reads well everywhere.
 const KEY_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ("Tabs", &[
         ("new_tab", "New tab"), ("new_window", "New window"), ("close_tab", "Close tab"),
@@ -2960,6 +2960,9 @@ pub fn action_label(action: &str) -> String {
     if let Some(i) = action.strip_prefix("goto_tab_").and_then(|n| n.parse::<usize>().ok()) {
         return format!("Go to tab {}", if i == 9 { 10 } else { i + 1 });
     }
+    if let Some(i) = action.strip_prefix("move_tab_").and_then(|n| n.parse::<usize>().ok()) {
+        return format!("Move tab to position {}", i + 1);
+    }
     if let Some(i) = action.strip_prefix("goto_workspace_").and_then(|n| n.parse::<usize>().ok()) {
         return format!("Go to workspace {}", i + 1);
     }
@@ -2977,13 +2980,16 @@ fn key_groups(cfg: &crate::config::Config) -> Vec<(&'static str, Vec<(String, St
     groups.insert(2, ("Numbered tabs", (0..10)
         .map(|i| (format!("goto_tab_{i}"), format!("Go to tab {}", if i == 9 { 10 } else { i + 1 })))
         .collect()));
+    groups.insert(3, ("Move tab to position", (0..10)
+        .map(|i| (format!("move_tab_{i}"), format!("Move tab to position {}", i + 1)))
+        .collect()));
     // Listed whether or not the feature is on: the chords are real either way,
     // and hiding them here would drop ten rows into "Other".
     let mut ws_rows: Vec<(String, String)> =
         vec![("show_workspaces".to_string(), "Workspaces panel".to_string())];
     ws_rows.extend((0..crate::config::WORKSPACES)
         .map(|i| (format!("goto_workspace_{i}"), format!("Go to workspace {}", i + 1))));
-    groups.insert(3, ("Workspaces", ws_rows));
+    groups.insert(4, ("Workspaces", ws_rows));
     let named: std::collections::HashSet<&str> = groups.iter()
         .flat_map(|(_, rows)| rows.iter().map(|a| a.0.as_str())).collect();
     let other: Vec<(String, String)> = cfg.bindings.iter()

@@ -5047,6 +5047,12 @@ impl App {
                     self.wins[self.cur].active = n - 1;
                 }
             },
+            "move_tab_0" | "move_tab_1" | "move_tab_2" | "move_tab_3" | "move_tab_4"
+            | "move_tab_5" | "move_tab_6" | "move_tab_7" | "move_tab_8" | "move_tab_9" => {
+                let target = action.chars().last().unwrap().to_digit(10).unwrap() as usize;
+                let win = &mut self.wins[self.cur];
+                move_tab_to_position(&mut win.tabs, &mut win.active, target);
+            },
             "toggle_entangle" => {
                 let cur_active = self.wins[self.cur].active;
                 if let Some(t) = self.wins[self.cur].tabs.get_mut(cur_active) {
@@ -6104,6 +6110,20 @@ fn new_tab_index(position: &str, len: usize, active: usize) -> usize {
         "first" => 0,
         // An empty window has active = 0 but no tab to insert after.
         _ => (active + 1).min(len),
+    }
+}
+
+/// Move the active tab without changing the relative order of the other tabs.
+/// Positions beyond the current tab count mean the end of the strip.
+fn move_tab_to_position<T>(tabs: &mut Vec<T>, active: &mut usize, target: usize) {
+    if tabs.is_empty() {
+        return;
+    }
+    let target = target.min(tabs.len() - 1);
+    if *active != target {
+        let tab = tabs.remove(*active);
+        tabs.insert(target, tab);
+        *active = target;
     }
 }
 
@@ -7517,6 +7537,37 @@ mod mouse_report_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbered_tab_moves_preserve_identity_and_other_tabs_order() {
+        for (from, target, expected, expected_active) in [
+            (3, 0, vec![3, 0, 1, 2, 4], 0),
+            (0, 3, vec![1, 2, 3, 0, 4], 3),
+            (2, 2, vec![0, 1, 2, 3, 4], 2),
+            (1, 9, vec![0, 2, 3, 4, 1], 4),
+        ] {
+            let mut tabs = vec![0, 1, 2, 3, 4];
+            let mut active = from;
+            move_tab_to_position(&mut tabs, &mut active, target);
+            assert_eq!(tabs, expected);
+            assert_eq!(active, expected_active);
+            assert_eq!(tabs[active], from);
+        }
+        let mut tabs: Vec<usize> = Vec::new();
+        let mut active = 0;
+        move_tab_to_position(&mut tabs, &mut active, 9);
+        assert!(tabs.is_empty());
+        tabs.push(42);
+        move_tab_to_position(&mut tabs, &mut active, 9);
+        assert_eq!(tabs, [42]);
+        assert_eq!(active, 0);
+
+        let mut tabs: Vec<_> = (0..12).collect();
+        active = 11;
+        move_tab_to_position(&mut tabs, &mut active, 9);
+        assert_eq!(active, 9);
+        assert_eq!(tabs, [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 9, 10]);
+    }
 
     #[test]
     fn selection_gestures_preserve_click_units_with_shift() {
