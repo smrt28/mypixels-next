@@ -9,6 +9,7 @@ mod config;
 mod cursor;
 mod damage;
 mod egui_ui;
+mod eyedropper;
 mod ui_style;
 mod tab_bar;
 mod fonts;

@@ -210,6 +210,12 @@ Features
   (`terminal_brightness: -100` through `100`). `0` preserves the palette;
   negative percentages darken terminal colors and positive percentages brighten
   them. The theme and interface colors stay intact.
+* Every Settings color popup offers **Eyedropper…**: click it, then choose a
+  pixel anywhere on the screen, including text in another terminal. Esc cancels.
+  On Hyprland, `slurp` and `grim` provide a transparent selector that preserves
+  the original screen colors. Other desktops use the XDG Screenshot portal's
+  `PickColor` support. The chosen color
+  previews immediately; Save keeps it and Cancel restores the saved settings.
 * Animation speed in Settings → Appearance → Motion. `1×` keeps the default
   timing, `0.25×`–`4×` changes UI transition speed, and `0` turns animations off.
   Changes preview live; Save persists `animation_speed` in the configuration.

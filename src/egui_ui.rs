@@ -45,11 +45,60 @@ pub struct ConfigEvents {
     pub apply: bool,
     pub save: bool,
     pub revert: bool,
+    pick_color: Option<ColorTarget>,
+}
+
+/// Name the destination rather than retaining a widget ID or the currently
+/// selected workspace: a desktop pick completes asynchronously.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorTarget {
+    Background, Foreground, Selection, Cursor, Accent, BackgroundTint,
+    TabStrip, AddButton, TabBackground, ActiveTabBackground, TabText,
+    ActiveTabText, EntangledTab, TabIndex,
+    Group(usize), Workspace(usize), Ansi(usize),
+}
+
+impl ColorTarget {
+    fn apply(self, cfg: &mut crate::config::Config, color: crate::config::Rgb) {
+        let slot = match self {
+            Self::Background => &mut cfg.background_color,
+            Self::Foreground => &mut cfg.foreground_color,
+            Self::Selection => &mut cfg.selection_color,
+            Self::Cursor => &mut cfg.cursor_color,
+            Self::Accent => &mut cfg.accent_color,
+            Self::BackgroundTint => &mut cfg.bg_tint_color,
+            Self::TabStrip => &mut cfg.tablist_background,
+            Self::AddButton => &mut cfg.add_button_color,
+            Self::TabBackground => &mut cfg.tab_color_bg,
+            Self::ActiveTabBackground => &mut cfg.tab_color_bg_selected,
+            Self::TabText => &mut cfg.tab_color_fg,
+            Self::ActiveTabText => &mut cfg.tab_color_fg_selected,
+            Self::EntangledTab => &mut cfg.tab_color_entangle,
+            Self::TabIndex => &mut cfg.tab_color_idx,
+            Self::Group(i) => &mut cfg.col[i],
+            Self::Workspace(i) => &mut cfg.workspace_colors[i],
+            Self::Ansi(i) => &mut cfg.palette.get_or_insert_with(default_ansi_colors)[i],
+        };
+        *slot = color;
+        if !matches!(self, Self::Workspace(_)) { cfg.use_custom_colors(); }
+    }
+}
+
+fn default_ansi_colors() -> [crate::config::Rgb; 16] {
+    crate::PALETTE.map(|c| crate::config::Rgb((c[0] * 255.0).round() as u8,
+        (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8))
+}
+
+struct ScreenColorPick {
+    target: ColorTarget,
+    picker: crate::eyedropper::Picker,
 }
 
 /// Ephemeral UI state that must survive across frames.
 #[derive(Default)]
 pub struct UiState {
+    screen_color_pick: Option<ScreenColorPick>,
+    screen_color_error: Option<String>,
     /// Frames the context menu has been on screen. The right-press that
     /// *opened* the menu is still in the input state of the first frame
     /// that draws it - dismissal must not see its own opening.
@@ -279,6 +328,8 @@ impl UiState {
     }
 
     pub fn toggle_panel(&mut self, panel: RightPanel) {
+        self.screen_color_pick = None;
+        self.screen_color_error = None;
         self.right_panel = if self.panel_is(panel) { RightPanel::Closed } else { panel };
         self.font_popup = None;
         if self.right_panel != RightPanel::History {
@@ -288,6 +339,8 @@ impl UiState {
 
     pub fn close_panel(&mut self, panel: RightPanel) {
         if self.panel_is(panel) {
+            self.screen_color_pick = None;
+            self.screen_color_error = None;
             self.right_panel = RightPanel::Closed;
             self.font_popup = None;
             self.history_preview = None;
@@ -2426,8 +2479,29 @@ pub fn config_window(
     st: &mut UiState,
     choices: &[crate::fonts::FontChoice],
 ) -> ConfigEvents {
-    let mut ev = ConfigEvents { copy_revision: false, apply: false, save: false, revert: false };
-    if !*open { return ev; }
+    let mut ev = ConfigEvents { copy_revision: false, apply: false, save: false, revert: false, pick_color: None };
+    if !*open {
+        st.screen_color_pick = None;
+        st.screen_color_error = None;
+        return ev;
+    }
+    if let Some(pick) = &st.screen_color_pick {
+        match pick.picker.result.try_recv() {
+            Ok(result) => {
+                match result {
+                    Ok(Some(color)) => { pick.target.apply(cfg, color); ev.apply = true; }
+                    Ok(None) => (),
+                    Err(error) => st.screen_color_error = Some(error),
+                }
+                st.screen_color_pick = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                st.screen_color_error = Some("Screen color picker disconnected. Try again.".into());
+                st.screen_color_pick = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => (),
+        }
+    }
     let colors = TermStyle::new(ui, rgb_c32(cfg.col[2]), rgb_c32(cfg.col[1]));
     let top = st.panel_top;
     // Size and constrain the outer window to the space below the tab strip.
@@ -2518,7 +2592,12 @@ pub fn config_window(
                 });
             ui.add_space(12.0);
             ui.separator();
-            ui.label(egui::RichText::new("Changes preview instantly.").small().color(colors.muted));
+            let status = st.screen_color_error.as_deref().unwrap_or(if st.screen_color_pick.is_some() {
+                "Choose a screen pixel. Esc cancels."
+            } else { "Changes preview instantly." });
+            ui.add(egui::Label::new(egui::RichText::new(status).small().color(
+                if st.screen_color_error.is_some() { ui.visuals().error_fg_color } else { colors.muted }))
+                .truncate()).on_hover_text(status);
             let (save, cancel) = actions(ui, ui.available_width(), "Save", "Cancel");
             if save || cancel {
                 ev.save = save;
@@ -2527,7 +2606,20 @@ pub fn config_window(
                 *open = false;
             }
         });
-    if !*open { st.font_popup = None; }
+    if !*open {
+        st.font_popup = None;
+        st.screen_color_pick = None;
+        st.screen_color_error = None;
+    } else if let Some(target) = ev.pick_color.take() {
+        st.screen_color_pick = None;
+        st.screen_color_error = None;
+        let ctx = ui.ctx().clone();
+        match crate::eyedropper::Picker::start(move || ctx.request_repaint()) {
+            Ok(picker) => st.screen_color_pick = Some(ScreenColorPick { target, picker }),
+            Err(error) => st.screen_color_error = Some(error),
+        }
+        ui.ctx().request_repaint();
+    }
     ev
 }
 
@@ -2574,8 +2666,8 @@ fn appearance_page(
     });
     section(ui, "Tab colors", colors, |ui| {
         form_grid("colors-tabs").show(ui, |ui| {
-            colors_edited |= color_row(ui, "Tab strip", &mut cfg.tablist_background, ev);
-            colors_edited |= color_row(ui, "Add button", &mut cfg.add_button_color, ev);
+            colors_edited |= color_row(ui, "Tab strip", &mut cfg.tablist_background, ColorTarget::TabStrip, ev);
+            colors_edited |= color_row(ui, "Add button", &mut cfg.add_button_color, ColorTarget::AddButton, ev);
         });
         // Manual tab groups have a separate palette from workspace identities.
         ui.add_space(8.0);
@@ -2587,7 +2679,7 @@ fn appearance_page(
             for (i, color) in cfg.col.iter_mut().enumerate() {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(format!("{}", i + 1)).small().color(colors.muted));
-                    changed |= color_cell(ui, color);
+                    changed |= color_cell(ui, color, ColorTarget::Group(i), ev);
                 });
             }
         });
@@ -2618,18 +2710,18 @@ fn appearance_page(
                     ev.apply = true;
                 }
             });
-            colors_edited |= color_row(ui, "Background", &mut cfg.background_color, ev);
-            colors_edited |= color_row(ui, "Foreground", &mut cfg.foreground_color, ev);
-            colors_edited |= color_row(ui, "Selection", &mut cfg.selection_color, ev);
-            colors_edited |= color_row(ui, "Cursor", &mut cfg.cursor_color, ev);
-            colors_edited |= color_row(ui, "Accent", &mut cfg.accent_color, ev);
-            colors_edited |= color_row(ui, "Background tint", &mut cfg.bg_tint_color, ev);
-            colors_edited |= color_row(ui, "Tab background", &mut cfg.tab_color_bg, ev);
-            colors_edited |= color_row(ui, "Active tab background", &mut cfg.tab_color_bg_selected, ev);
-            colors_edited |= color_row(ui, "Tab text", &mut cfg.tab_color_fg, ev);
-            colors_edited |= color_row(ui, "Active tab text", &mut cfg.tab_color_fg_selected, ev);
-            colors_edited |= color_row(ui, "Entangled tab", &mut cfg.tab_color_entangle, ev);
-            colors_edited |= color_row(ui, "Tab index", &mut cfg.tab_color_idx, ev);
+            colors_edited |= color_row(ui, "Background", &mut cfg.background_color, ColorTarget::Background, ev);
+            colors_edited |= color_row(ui, "Foreground", &mut cfg.foreground_color, ColorTarget::Foreground, ev);
+            colors_edited |= color_row(ui, "Selection", &mut cfg.selection_color, ColorTarget::Selection, ev);
+            colors_edited |= color_row(ui, "Cursor", &mut cfg.cursor_color, ColorTarget::Cursor, ev);
+            colors_edited |= color_row(ui, "Accent", &mut cfg.accent_color, ColorTarget::Accent, ev);
+            colors_edited |= color_row(ui, "Background tint", &mut cfg.bg_tint_color, ColorTarget::BackgroundTint, ev);
+            colors_edited |= color_row(ui, "Tab background", &mut cfg.tab_color_bg, ColorTarget::TabBackground, ev);
+            colors_edited |= color_row(ui, "Active tab background", &mut cfg.tab_color_bg_selected, ColorTarget::ActiveTabBackground, ev);
+            colors_edited |= color_row(ui, "Tab text", &mut cfg.tab_color_fg, ColorTarget::TabText, ev);
+            colors_edited |= color_row(ui, "Active tab text", &mut cfg.tab_color_fg_selected, ColorTarget::ActiveTabText, ev);
+            colors_edited |= color_row(ui, "Entangled tab", &mut cfg.tab_color_entangle, ColorTarget::EntangledTab, ev);
+            colors_edited |= color_row(ui, "Tab index", &mut cfg.tab_color_idx, ColorTarget::TabIndex, ev);
             row(ui, "Terminal brightness", |ui| {
                 ev.apply |= ui.add(egui::DragValue::new(&mut cfg.terminal_brightness)
                     .speed(1.0).range(-100.0..=100.0).suffix("%").fixed_decimals(0))
@@ -2641,10 +2733,7 @@ fn appearance_page(
         ui.label("ANSI terminal colors");
         ui.label(egui::RichText::new("Editing colors switches the theme to custom colors.")
             .small().color(colors.muted));
-        let mut palette = cfg.palette.unwrap_or_else(|| crate::PALETTE.map(|c| {
-            crate::config::Rgb((c[0] * 255.0).round() as u8,
-                (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8)
-        }));
+        let mut palette = cfg.palette.unwrap_or_else(default_ansi_colors);
         let mut changed = false;
         egui::Grid::new("ansi-colors").num_columns(4).spacing(egui::vec2(10.0, 8.0)).show(ui, |ui| {
             for (i, color) in palette.iter_mut().enumerate() {
@@ -2652,7 +2741,7 @@ fn appearance_page(
                     ui.set_width(76.0);
                     let name = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"][i % 8];
                     ui.label(egui::RichText::new(if i < 8 { name.to_string() } else { format!("Bright {name}") }).small());
-                    changed |= color_cell(ui, color);
+                    changed |= color_cell(ui, color, ColorTarget::Ansi(i), ev);
                 });
                 if i % 4 == 3 { ui.end_row(); }
             }
@@ -2722,7 +2811,7 @@ fn workspace_settings(ui: &mut egui::Ui, cfg: &mut crate::config::Config, st: &m
         });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Custom color").small().color(colors.muted));
-            ev.apply |= color_cell(ui, &mut cfg.workspace_colors[index]);
+            ev.apply |= color_cell(ui, &mut cfg.workspace_colors[index], ColorTarget::Workspace(index), ev);
         });
         ui.label("Icon");
         let cell_width = ((ui.available_width() - 32.0) / 5.0).max(30.0);
@@ -3482,11 +3571,11 @@ fn compose_value(
     })
 }
 
-fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mut ConfigEvents) -> bool {
+fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, target: ColorTarget, ev: &mut ConfigEvents) -> bool {
     let mut changed = false;
     row(ui, label, |ui| {
         ui.horizontal(|ui| {
-            changed = color_cell(ui, c);
+            changed = color_cell(ui, c, target, ev);
             ev.apply |= changed;
             ui.label(egui::RichText::new(format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2))
                 .monospace().color(ui.visuals().weak_text_color()));
@@ -3496,7 +3585,7 @@ fn color_row(ui: &mut egui::Ui, label: &str, c: &mut crate::config::Rgb, ev: &mu
 }
 
 /// The color button alone (the control side of an aligned row).
-fn color_cell(ui: &mut egui::Ui, c: &mut crate::config::Rgb) -> bool {
+fn color_cell(ui: &mut egui::Ui, c: &mut crate::config::Rgb, target: ColorTarget, ev: &mut ConfigEvents) -> bool {
     let mut color = rgb_c32(*c);
     let response = ui.add_sized([30.0, 28.0], egui::Button::new("").fill(color)
         .stroke(ui.visuals().widgets.inactive.bg_stroke).corner_radius(5.0))
@@ -3508,6 +3597,13 @@ fn color_cell(ui: &mut egui::Ui, c: &mut crate::config::Rgb) -> bool {
         .show(|ui| {
             ui.spacing_mut().slider_width = 275.0;
             changed = egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque);
+            ui.separator();
+            if ui.button("Eyedropper…")
+                .on_hover_text("Choose a pixel anywhere on the screen, including other windows.")
+                .clicked() {
+                ev.pick_color = Some(target);
+                ui.close();
+            }
         });
     if changed { *c = crate::config::Rgb(color.r(), color.g(), color.b()); }
     changed
@@ -3523,6 +3619,88 @@ fn checkbox_row(ui: &mut egui::Ui, label: &str, v: &mut bool, ev: &mut ConfigEve
 #[cfg(test)]
 mod regression {
     use super::*;
+
+    #[test]
+    fn eyedropper_button_requests_the_original_color_without_editing_it() {
+        let ctx = Context::default();
+        let original = crate::config::Rgb(12, 34, 56);
+        let mut color = original;
+        let target = ColorTarget::Workspace(7);
+        let mut ev = ConfigEvents { copy_revision: false, apply: false, save: false, revert: false, pick_color: None };
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 650.0))),
+                events, ..Default::default()
+            }, |ui| { color_cell(ui, &mut color, target, &mut ev); });
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let mut shapes = frame(vec![]);
+        let swatch = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(r) if r.fill == rgb_c32(original) => Some(r.rect.center()), _ => None,
+        }).unwrap();
+        let press = |pos| vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }];
+        let release = |pos| vec![egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }];
+        frame(press(swatch));
+        frame(release(swatch));
+        for _ in 0..2 { shapes = frame(vec![]); }
+        let button = shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text() == "Eyedropper…" => Some(t.pos + t.galley.size() / 2.0),
+            _ => None,
+        }).expect("color popup must offer the screen picker");
+        frame(press(button));
+        frame(release(button));
+        assert_eq!(ev.pick_color, Some(target));
+        assert!(!ev.apply);
+        assert_eq!(color, original);
+        assert!(!egui::Popup::is_any_open(&ctx));
+    }
+
+    #[test]
+    fn eyedropper_completion_follows_its_target_and_closed_settings_discard_it() {
+        let ctx = Context::default();
+        let selected = crate::config::Rgb(51, 102, 153);
+        let mut cfg = crate::config::Config::from_text("theme: dracula\n", std::path::Path::new(".")).unwrap();
+        let original = cfg.clone();
+        let mut st = UiState { workspace_edit: 1, settings_page: SettingsPage::Window, ..Default::default() };
+        fn frame(ctx: &Context, cfg: &mut crate::config::Config, st: &mut UiState, mut open: bool) -> ConfigEvents {
+            let mut result = None;
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 850.0))),
+                ..Default::default()
+            }, |ui| { result = Some(config_window(ui, &mut open, cfg, st, &[])); });
+            output.textures_delta.clear();
+            result.unwrap()
+        }
+        // A workspace or category switch during the request cannot redirect it.
+        st.screen_color_pick = Some(ScreenColorPick { target: ColorTarget::Workspace(7),
+            picker: crate::eyedropper::Picker::completed(Ok(Some(selected))) });
+        assert!(frame(&ctx, &mut cfg, &mut st, true).apply);
+        assert_eq!(cfg.workspace_colors[7], selected);
+        assert_eq!(cfg.workspace_colors[1], original.workspace_colors[1]);
+        assert_eq!(cfg.theme, original.theme);
+        // Indexed colors become custom and remain independent of the old preset.
+        st.screen_color_pick = Some(ScreenColorPick { target: ColorTarget::Ansi(12),
+            picker: crate::eyedropper::Picker::completed(Ok(Some(selected))) });
+        assert!(frame(&ctx, &mut cfg, &mut st, true).apply);
+        assert_eq!(cfg.palette.unwrap()[12], selected);
+        assert_eq!(cfg.palette.unwrap()[11], original.palette.unwrap()[11]);
+        assert_eq!(cfg.theme, "default");
+        for result in [Ok(None), Err("Picker unavailable".into())] {
+            st.screen_color_pick = Some(ScreenColorPick { target: ColorTarget::Foreground,
+                picker: crate::eyedropper::Picker::completed(result) });
+            assert!(!frame(&ctx, &mut cfg, &mut st, true).apply);
+            assert_eq!(cfg.foreground_color, original.foreground_color);
+        }
+        st.screen_color_pick = Some(ScreenColorPick { target: ColorTarget::Foreground,
+            picker: crate::eyedropper::Picker::completed(Ok(Some(selected))) });
+        assert!(!frame(&ctx, &mut cfg, &mut st, false).apply);
+        assert_eq!(cfg.foreground_color, original.foreground_color);
+        assert!(st.screen_color_pick.is_none());
+        assert!(st.screen_color_error.is_none());
+    }
 
     #[test]
     fn every_shipped_keybinding_is_listed_and_named() {
@@ -3705,7 +3883,7 @@ mod regression {
             }, |ui| {
                 let colors = TermStyle::new(ui, egui::Color32::GREEN, egui::Color32::RED);
                 colors.apply_controls(ui);
-                workspace_settings(ui, cfg, st, &mut ConfigEvents { copy_revision: false, apply: false, save: false, revert: false }, &colors);
+                workspace_settings(ui, cfg, st, &mut ConfigEvents { copy_revision: false, apply: false, save: false, revert: false, pick_color: None }, &colors);
             });
             output.textures_delta.clear();
             output.shapes
